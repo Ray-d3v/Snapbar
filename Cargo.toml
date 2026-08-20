@@ -15,7 +15,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4d1935b8
 [target.'cfg(target_os = "windows")'.dependencies]
 arboard = "3.6.1"
 image = { version = "0.25", default-features = false }
-uiautomation = "0.25.0"
+uiautomation = { version = "0.25", default-features = false }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-capture = "2.0.1"
 xcap = { version = "0.9.8", features = ["wgc"] }
 
 [profile.release]
