@@ -1,0 +1,24 @@
+[package]
+name = "snapbar"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "One-click Microsoft Teams shared-screen capture for Windows"
+repository = "https://github.com/Ray-d3v/Snapbar"
+publish = false
+
+[dependencies]
+anyhow = "1"
+gpui = "0.2.2"
+gpui_platform = "0.1.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+arboard = "3.6.1"
+image = { version = "0.25", default-features = false }
+xcap = { version = "0.9.8", features = ["wgc"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
