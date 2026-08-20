@@ -1,6 +1,6 @@
 use crate::{
     assets::Assets,
-    capture::{CaptureTarget, CropMode, capture_to_clipboard, discover_teams_targets},
+    capture::{CaptureEngine, CaptureTarget, discover_teams_targets, show_capture_flash},
 };
 use gpui::{
     App, Bounds, ClickEvent, Context, MouseButton, Window, WindowBackgroundAppearance,
@@ -25,12 +25,13 @@ enum CaptureState {
 struct Snapbar {
     targets: Vec<CaptureTarget>,
     selected_target: usize,
-    crop_mode: CropMode,
+    capture_engine: Option<CaptureEngine>,
     position_locked: bool,
     menu_open: bool,
     capture_state: CaptureState,
     capture_count: u64,
     capture_generation: u64,
+    last_latency_ms: Option<u128>,
     last_error: Option<String>,
 }
 
@@ -39,12 +40,13 @@ impl Snapbar {
         let mut snapbar = Self {
             targets: Vec::new(),
             selected_target: 0,
-            crop_mode: CropMode::FullWindow,
+            capture_engine: None,
             position_locked: false,
             menu_open: false,
             capture_state: CaptureState::NoTarget,
             capture_count: 0,
             capture_generation: 0,
+            last_latency_ms: None,
             last_error: None,
         };
         snapbar.refresh_targets(false);
@@ -57,6 +59,8 @@ impl Snapbar {
 
     fn refresh_targets(&mut self, select_next: bool) {
         let previous_id = self.current_target().map(|target| target.id);
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        self.capture_engine = None;
 
         match discover_teams_targets() {
             Ok(targets) if targets.is_empty() => {
@@ -75,12 +79,33 @@ impl Snapbar {
                     previous_index
                 };
                 self.targets = targets;
-                self.capture_state = CaptureState::Idle;
-                self.last_error = None;
+                self.restart_capture_engine();
             }
             Err(error) => {
                 self.targets.clear();
                 self.selected_target = 0;
+                self.capture_state = CaptureState::Error;
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn restart_capture_engine(&mut self) {
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        self.capture_engine = None;
+        let Some(target_id) = self.current_target().map(|target| target.id) else {
+            self.capture_state = CaptureState::NoTarget;
+            self.last_error = Some("Teamsウィンドウを検出できません".to_string());
+            return;
+        };
+
+        match CaptureEngine::start(target_id) {
+            Ok(engine) => {
+                self.capture_engine = Some(engine);
+                self.capture_state = CaptureState::Idle;
+                self.last_error = None;
+            }
+            Err(error) => {
                 self.capture_state = CaptureState::Error;
                 self.last_error = Some(error.to_string());
             }
@@ -98,14 +123,7 @@ impl Snapbar {
     }
 
     fn on_crop_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.crop_mode = self.crop_mode.toggled();
-        if self.capture_state != CaptureState::Capturing {
-            self.capture_state = if self.targets.is_empty() {
-                CaptureState::NoTarget
-            } else {
-                CaptureState::Idle
-            };
-        }
+        self.restart_capture_engine();
         cx.notify();
     }
 
@@ -130,24 +148,23 @@ impl Snapbar {
             return;
         }
 
-        if self.current_target().is_none() {
+        if self.capture_engine.is_none() {
             self.refresh_targets(false);
         }
-        let Some(target) = self.current_target().cloned() else {
+        let Some(engine) = self.capture_engine.clone() else {
             cx.notify();
             return;
         };
 
         self.capture_generation = self.capture_generation.wrapping_add(1);
         let generation = self.capture_generation;
-        let crop_mode = self.crop_mode;
         self.capture_state = CaptureState::Capturing;
         self.last_error = None;
         cx.notify();
 
         let task = cx
             .background_executor()
-            .spawn(async move { capture_to_clipboard(target.id, crop_mode) });
+            .spawn(async move { engine.copy_latest_to_clipboard() });
 
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
@@ -157,9 +174,12 @@ impl Snapbar {
                 }
 
                 match result {
-                    Ok(()) => {
+                    Ok(receipt) => {
+                        show_capture_flash(receipt.screen_rect);
+                        let _ = receipt.frame_age;
                         this.capture_count = this.capture_count.saturating_add(1);
                         this.capture_state = CaptureState::Copied;
+                        this.last_latency_ms = Some(receipt.latency.as_millis());
                         this.last_error = None;
                     }
                     Err(error) => {
@@ -187,7 +207,16 @@ impl Snapbar {
         } else {
             &target.title
         };
-        format!("対象: {}  ·  {}枚", truncate(name, 28), self.capture_count)
+        let latency = self
+            .last_latency_ms
+            .map(|value| format!(" · {value}ms"))
+            .unwrap_or_default();
+        format!(
+            "対象: {} · {}枚{}",
+            truncate(name, 24),
+            self.capture_count,
+            latency
+        )
     }
 }
 
@@ -230,7 +259,6 @@ impl Render for Snapbar {
             .on_click(cx.listener(Self::on_target_clicked))
             .child(svg().path("icons/window.svg").size(px(18.0)));
 
-        let crop_active = self.crop_mode == CropMode::TeamsContentPreset;
         let crop_button = div()
             .id("crop-button")
             .flex()
@@ -239,12 +267,7 @@ impl Render for Snapbar {
             .size(px(34.0))
             .rounded_full()
             .cursor_pointer()
-            .text_color(if crop_active {
-                active_icon_color
-            } else {
-                icon_color
-            })
-            .when(crop_active, |button| button.bg(rgb(0x1b1b1e)))
+            .text_color(icon_color)
             .hover(|button| button.bg(rgb(0x242428)))
             .active(|button| button.opacity(0.72))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
