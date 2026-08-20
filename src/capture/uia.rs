@@ -64,7 +64,7 @@ impl WindowGeometry {
         let window_right = window_left + i64::from(self.screen_width);
         let window_bottom = window_top + i64::from(self.screen_height);
 
-        let left = i64::from(rect.get_left()).maxhwindow_left);
+        let left = i64::from(rect.get_left()).max(window_left);
         let top = i64::from(rect.get_top()).max(window_top);
         let right = i64::from(rect.get_right()).min(window_right);
         let bottom = i64::from(rect.get_bottom()).min(window_bottom);
@@ -234,6 +234,8 @@ mod tests {
             .map_ui_rect(UiRect::new(-1760, 210, -560, 810))
             .expect("UIA rectangle should overlap the captured window");
 
-        assert_eq!(mapped, PixelRect::new(240, 135, 1800, 900));
+        assert_eq!(mapped, PixelRect::new(
+          240, 135, 1800, 900
+        ));
     }
 }
