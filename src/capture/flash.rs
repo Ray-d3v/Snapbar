@@ -59,10 +59,10 @@ pub(super) fn current_screen_rect(
         return None;
     }
 
-    let left = window_rect.left
-        + scale_floor(content_rect.x, window_width as u32, source_width) as i32;
-    let top = window_rect.top
-        + scale_floor(content_rect.y, window_height as u32, source_height) as i32;
+    let left =
+        window_rect.left + scale_floor(content_rect.x, window_width as u32, source_width) as i32;
+    let top =
+        window_rect.top + scale_floor(content_rect.y, window_height as u32, source_height) as i32;
     let right = window_rect.left
         + scale_ceil(
             content_rect.x.saturating_add(content_rect.width),
@@ -138,8 +138,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
 }
 
 fn scale_floor(value: u32, target: u32, source: u32) -> u32 {
-    ((u64::from(value) * u64::from(target)) / u64::from(source))
-        .min(u64::from(target)) as u32
+    ((u64::from(value) * u64::from(target)) / u64::from(source)).min(u64::from(target)) as u32
 }
 
 fn scale_ceil(value: u32, target: u32, source: u32) -> u32 {
