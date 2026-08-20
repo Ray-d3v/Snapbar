@@ -33,7 +33,7 @@ struct Candidate {
     score: i32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct WindowDescriptor<'a> {
     app_name: &'a str,
     title: &'a str,
@@ -120,7 +120,11 @@ fn score_window(window: &WindowDescriptor<'_>) -> i32 {
     let app = window.app_name.to_lowercase();
     let title = window.title.to_lowercase();
     let app_is_teams = app.contains("teams") || app.contains("ms-teams");
-    let title_is_teams = title.contains("microsoft teams") || title.contains("teams");
+    let title_is_teams = title == "microsoft teams"
+        || title.ends_with(" | microsoft teams")
+        || title.ends_with(" - microsoft teams")
+        || title.starts_with("microsoft teams |")
+        || title.starts_with("microsoft teams -");
 
     if !app_is_teams && !title_is_teams {
         return 0;
@@ -178,12 +182,8 @@ fn apply_crop(image: RgbaImage, mode: CropMode) -> RgbaImage {
     }
 
     let side = ((width as f32 * 0.004).round() as u32).min(8);
-    let top = ((height as f32 * 0.035).round() as u32)
-        .max(24)
-        .min(48);
-    let bottom = ((height as f32 * 0.018).round() as u32)
-        .max(8)
-        .min(28);
+    let top = ((height as f32 * 0.035).round() as u32).max(24).min(48);
+    let bottom = ((height as f32 * 0.018).round() as u32).max(8).min(28);
 
     let cropped_width = width.saturating_sub(side.saturating_mul(2));
     let cropped_height = height.saturating_sub(top.saturating_add(bottom));
