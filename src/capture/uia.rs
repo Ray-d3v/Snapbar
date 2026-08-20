@@ -201,7 +201,8 @@ fn scale_floor(value: u64, target: u32, source: u32) -> u32 {
 }
 
 fn scale_ceil(value: u64, target: u32, source: u32) -> u32 {
-    (((value * u64::from(target)) + u64::from(source) - 1) / u64::from(source))
+    (value * u64::from(target))
+        .div_ceil(u64::from(source))
         .min(u64::from(target)) as u32
 }
 
