@@ -87,32 +87,17 @@ impl Snapbar {
         }
     }
 
-    fn on_target_clicked(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_target_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_targets(true);
         cx.notify();
     }
 
-    fn on_refresh_clicked(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_targets(false);
         cx.notify();
     }
 
-    fn on_crop_clicked(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_crop_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.crop_mode = self.crop_mode.toggled();
         if self.capture_state != CaptureState::Capturing {
             self.capture_state = if self.targets.is_empty() {
@@ -124,22 +109,12 @@ impl Snapbar {
         cx.notify();
     }
 
-    fn on_lock_clicked(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_lock_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.position_locked = !self.position_locked;
         cx.notify();
     }
 
-    fn on_more_clicked(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_more_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.menu_open = !self.menu_open;
         let height = if self.menu_open {
             EXPANDED_HEIGHT
@@ -150,12 +125,7 @@ impl Snapbar {
         cx.notify();
     }
 
-    fn on_capture_clicked(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_capture_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.capture_state == CaptureState::Capturing {
             return;
         }
@@ -217,11 +187,7 @@ impl Snapbar {
         } else {
             &target.title
         };
-        format!(
-            "対象: {}  ·  {}枚",
-            truncate(name, 28),
-            self.capture_count
-        )
+        format!("対象: {}  ·  {}枚", truncate(name, 28), self.capture_count)
     }
 }
 
@@ -337,41 +303,11 @@ impl Render for Snapbar {
             .gap(px(2.5))
             .w(px(38.0))
             .h(px(28.0))
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(8.0))
-                    .rounded_full()
-                    .bg(status_color),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(14.0))
-                    .rounded_full()
-                    .bg(status_color),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(19.0))
-                    .rounded_full()
-                    .bg(status_color),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(14.0))
-                    .rounded_full()
-                    .bg(status_color),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(8.0))
-                    .rounded_full()
-                    .bg(status_color),
-            );
+            .child(div().w(px(2.0)).h(px(8.0)).rounded_full().bg(status_color))
+            .child(div().w(px(2.0)).h(px(14.0)).rounded_full().bg(status_color))
+            .child(div().w(px(2.0)).h(px(19.0)).rounded_full().bg(status_color))
+            .child(div().w(px(2.0)).h(px(14.0)).rounded_full().bg(status_color))
+            .child(div().w(px(2.0)).h(px(8.0)).rounded_full().bg(status_color));
 
         let capture_button = div()
             .id("capture-button")
@@ -414,13 +350,7 @@ impl Render for Snapbar {
             .child(crop_button)
             .child(lock_button)
             .child(more_button)
-            .child(
-                div()
-                    .mx(px(4.0))
-                    .w(px(1.0))
-                    .h(px(24.0))
-                    .bg(rgb(0x343438)),
-            )
+            .child(div().mx(px(4.0)).w(px(1.0)).h(px(24.0)).bg(rgb(0x343438)))
             .child(status_indicator)
             .child(capture_button);
 
@@ -506,11 +436,7 @@ pub fn run() {
         })
         .detach();
 
-        let bounds = Bounds::centered(
-            None,
-            size(px(WINDOW_WIDTH), px(COLLAPSED_HEIGHT)),
-            cx,
-        );
+        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(COLLAPSED_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
