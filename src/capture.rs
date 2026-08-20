@@ -1,13 +1,24 @@
 use std::{borrow::Cow, thread, time::Duration};
 
+mod content_detector;
+mod uia;
+
+use self::{
+    content_detector::select_content_rect,
+    uia::{WindowGeometry, detect_content_candidates},
+};
 use anyhow::{Context as _, Result, anyhow};
 use arboard::{Clipboard, ImageData};
 use image::{RgbaImage, imageops};
 use xcap::Window;
 
+/// Compatibility state for the existing crop button. Both modes always detect and
+/// crop to the shared-content region; neither mode permits full-window output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropMode {
+    /// Standard automatic detection: UI Automation plus conservative visual fallback.
     FullWindow,
+    /// Strict automatic detection: require a UI Automation candidate.
     TeamsContentPreset,
 }
 
@@ -112,8 +123,29 @@ pub fn capture_to_clipboard(target_id: u32, crop_mode: CropMode) -> Result<()> {
     let image = target
         .capture_image()
         .context("Teamsウィンドウのキャプチャに失敗しました")?;
-    let image = apply_crop(image, crop_mode);
-    copy_to_clipboard(image)
+    let geometry = WindowGeometry::from_window(&target, &image)?;
+    let semantic_candidates = detect_content_candidates(geometry).unwrap_or_default();
+    let allow_visual_fallback = crop_mode == CropMode::FullWindow;
+    let content_rect = select_content_rect(
+        &image,
+        &semantic_candidates,
+        allow_visual_fallback,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "共有コンテンツ領域を安全に特定できなかったため、ウィンドウ全体はコピーしませんでした"
+        )
+    })?;
+    let cropped = imageops::crop_imm(
+        &image,
+        content_rect.x,
+        content_rect.y,
+        content_rect.width,
+        content_rect.height,
+    )
+    .to_image();
+
+    copy_to_clipboard(cropped)
 }
 
 fn score_window(window: &WindowDescriptor<'_>) -> i32 {
@@ -168,30 +200,6 @@ fn score_window(window: &WindowDescriptor<'_>) -> i32 {
     }
 
     score + 20_i32.saturating_sub(window.z_index.min(20) as i32)
-}
-
-fn apply_crop(image: RgbaImage, mode: CropMode) -> RgbaImage {
-    if mode == CropMode::FullWindow {
-        return image;
-    }
-
-    let width = image.width();
-    let height = image.height();
-    if width < 640 || height < 360 {
-        return image;
-    }
-
-    let side = ((width as f32 * 0.004).round() as u32).min(8);
-    let top = ((height as f32 * 0.035).round() as u32).clamp(24, 48);
-    let bottom = ((height as f32 * 0.018).round() as u32).clamp(8, 28);
-
-    let cropped_width = width.saturating_sub(side.saturating_mul(2));
-    let cropped_height = height.saturating_sub(top.saturating_add(bottom));
-    if cropped_width < 320 || cropped_height < 180 {
-        return image;
-    }
-
-    imageops::crop_imm(&image, side, top, cropped_width, cropped_height).to_image()
 }
 
 fn copy_to_clipboard(image: RgbaImage) -> Result<()> {
