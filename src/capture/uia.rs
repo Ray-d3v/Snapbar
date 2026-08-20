@@ -6,7 +6,10 @@ use uiautomation::types::{Point, Rect as UiRect};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 use xcap::Window;
 
-use super::content_detector::{ContentCandidate, PixelRect};
+use super::{
+    ScreenRect,
+    content_detector::{ContentCandidate, PixelRect},
+};
 
 mod scoring;
 
@@ -27,13 +30,15 @@ pub(super) struct WindowGeometry {
 
 impl WindowGeometry {
     pub(super) fn from_window(window: &Window, image: &RgbaImage) -> Result<Self> {
+        let image_width = image.width();
+        let image_height = image.height();
         let screen_width = window
             .width()
             .context("Teamsウィンドウの幅を取得できませんでした")?;
         let screen_height = window
             .height()
             .context("Teamsウィンドウの高さを取得できませんでした")?;
-        if screen_width == 0 || screen_height == 0 || image.width() == 0 || image.height() == 0 {
+        if screen_width == 0 || screen_height == 0 || image_width == 0 || image_height == 0 {
             return Err(anyhow!("Teamsウィンドウのサイズが不正です"));
         }
 
@@ -46,8 +51,54 @@ impl WindowGeometry {
                 .context("TeamsウィンドウのY座標を取得できませんでした")?,
             screen_width,
             screen_height,
-            image_width: image.width(),
-            image_height: image.height(),
+            image_width,
+            image_height,
+        })
+    }
+
+    pub(super) fn map_pixel_rect_to_screen(self, rect: PixelRect) -> Option<ScreenRect> {
+        if rect.width == 0
+            || rect.height == 0
+            || rect.x.saturating_add(rect.width) > self.image_width
+            || rect.y.saturating_add(rect.height) > self.image_height
+        {
+            return None;
+        }
+
+        let left = i64::from(self.screen_left)
+            + i64::from(scale_floor(
+                u64::from(rect.x),
+                self.screen_width,
+                self.image_width,
+            ));
+        let top = i64::from(self.screen_top)
+            + i64::from(scale_floor(
+                u64::from(rect.y),
+                self.screen_height,
+                self.image_height,
+            ));
+        let right = i64::from(self.screen_left)
+            + i64::from(scale_ceil(
+                u64::from(rect.x.saturating_add(rect.width)),
+                self.screen_width,
+                self.image_width,
+            ));
+        let bottom = i64::from(self.screen_top)
+            + i64::from(scale_ceil(
+                u64::from(rect.y.saturating_add(rect.height)),
+                self.screen_height,
+                self.image_height,
+            ));
+
+        if right <= left || bottom <= top {
+            return None;
+        }
+
+        Some(ScreenRect {
+            x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            width: (right - left).min(i64::from(u32::MAX)) as u32,
+            height: (bottom - top).min(i64::from(u32::MAX)) as u32,
         })
     }
 
@@ -209,7 +260,7 @@ fn scale_ceil(value: u64, target: u32, source: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::WindowGeometry;
-    use crate::capture::content_detector::PixelRect;
+    use crate::capture::{ScreenRect, content_detector::PixelRect};
     use uiautomation::types::Rect as UiRect;
 
     #[test]
@@ -227,5 +278,27 @@ mod tests {
             .expect("UIA rectangle should overlap the captured window");
 
         assert_eq!(mapped, PixelRect::new(240, 135, 1800, 900));
+    }
+
+    #[test]
+    fn pixel_rect_maps_back_to_negative_monitor_coordinates() {
+        let geometry = WindowGeometry {
+            screen_left: -1920,
+            screen_top: 120,
+            screen_width: 1600,
+            screen_height: 900,
+            image_width: 2400,
+            image_height: 1350,
+        };
+
+        assert_eq!(
+            geometry.map_pixel_rect_to_screen(PixelRect::new(240, 135, 1800, 900)),
+            Some(ScreenRect {
+                x: -1760,
+                y: 210,
+                width: 1200,
+                height: 600,
+            })
+        );
     }
 }
