@@ -6,7 +6,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
@@ -36,9 +36,69 @@ jobs:
       - name: Build release executable
         run: cargo build --release
 
-      - name: Upload Windows executable
+      - name: Locate Inno Setup
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --yes --no-progress
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            throw "Inno Setup compiler was not found."
+          }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $version = "0.1.0-beta.$env:GITHUB_RUN_NUMBER"
+          & $env:ISCC "/DAppVersion=$version" "installer\Snapbar.iss"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path "dist\Snapbar-Setup-x64.exe")) {
+            throw "Installer was not generated."
+          }
+
+      - name: Upload portable executable
         uses: actions/upload-artifact@v4
         with:
           name: Snapbar-windows-x64
           path: target/release/snapbar.exe
           if-no-files-found: error
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Snapbar-installer-windows-x64
+          path: dist/Snapbar-Setup-x64.exe
+          if-no-files-found: error
+
+      - name: Publish beta release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.1.0-beta.$env:GITHUB_RUN_NUMBER"
+          $notes = @"
+          Windows 11向けのSnapbarベータビルドです。
+
+          - Snapbar-Setup-x64.exe: ユーザー単位インストーラー
+          - Snapbar-portable-x64.exe: ポータブル実行ファイル
+
+          現在はコード署名していないため、Windows SmartScreenの警告が表示される場合があります。
+          "@
+          gh release create $tag `
+            "dist/Snapbar-Setup-x64.exe#Snapbar-Setup-x64.exe" `
+            "target/release/snapbar.exe#Snapbar-portable-x64.exe" `
+            --target $env:GITHUB_SHA `
+            --title "Snapbar $tag" `
+            --notes $notes `
+            --prerelease
