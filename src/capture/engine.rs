@@ -43,7 +43,11 @@ struct EngineInner {
 
 impl Drop for EngineInner {
     fn drop(&mut self) {
-        let control = self.control.lock().ok().and_then(|mut control| control.take());
+        let control = self
+            .control
+            .lock()
+            .ok()
+            .and_then(|mut control| control.take());
         if let Some(control) = control {
             let _ = thread::Builder::new()
                 .name("snapbar-capture-stop".to_string())
@@ -207,12 +211,10 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         let periodic_redetect = self
             .last_detection
             .is_none_or(|last| now.duration_since(last) >= FULL_REDETECTION_INTERVAL);
-        let dirty_layout_change = current_rect
-            .is_some_and(|rect| dirty_regions_suggest_layout_change(frame, rect));
-        let needs_detection = size_changed
-            || periodic_redetect
-            || dirty_layout_change
-            || current_rect.is_none();
+        let dirty_layout_change =
+            current_rect.is_some_and(|rect| dirty_regions_suggest_layout_change(frame, rect));
+        let needs_detection =
+            size_changed || periodic_redetect || dirty_layout_change || current_rect.is_none();
 
         if !needs_detection
             && self
@@ -316,11 +318,12 @@ impl FrameHandler {
             frame.height(),
         )
         .or_else(|| {
-            self.shared
-                .state
-                .lock()
-                .ok()
-                .and_then(|state| state.latest.as_ref().map(|frame| frame.fallback_screen_rect))
+            self.shared.state.lock().ok().and_then(|state| {
+                state
+                    .latest
+                    .as_ref()
+                    .map(|frame| frame.fallback_screen_rect)
+            })
         })
         .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
         let mut buffer = frame
@@ -431,10 +434,10 @@ fn dirty_region_to_rect(
     }
     let x = region.x.max(0) as u32;
     let y = region.y.max(0) as u32;
-    let right = (i64::from(region.x) + i64::from(region.width))
-        .clamp(0, i64::from(frame_width)) as u32;
-    let bottom = (i64::from(region.y) + i64::from(region.height))
-        .clamp(0, i64::from(frame_height)) as u32;
+    let right =
+        (i64::from(region.x) + i64::from(region.width)).clamp(0, i64::from(frame_width)) as u32;
+    let bottom =
+        (i64::from(region.y) + i64::from(region.height)).clamp(0, i64::from(frame_height)) as u32;
     (right > x && bottom > y).then_some(PixelRect::new(x, y, right - x, bottom - y))
 }
 
