@@ -9,8 +9,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-gpui = "0.2.2"
-gpui_platform = "0.1.0"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "4d1935b8d00320841da476ec38c7b7747abf6f09", default-features = false, features = ["windows-manifest"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4d1935b8d00320841da476ec38c7b7747abf6f09" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 arboard = "3.6.1"
