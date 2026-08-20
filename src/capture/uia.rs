@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result, anyhow};
 use image::RgbaImage;
-use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 use uiautomation::types::{Point, Rect as UiRect};
+use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 use xcap::Window;
 
 use super::content_detector::{ContentCandidate, PixelRect};
@@ -134,13 +134,7 @@ pub(super) fn detect_content_candidates(geometry: WindowGeometry) -> Result<Vec<
             let Ok(element) = automation.element_from_point(point) else {
                 continue;
             };
-            collect_element_ancestors(
-                element,
-                &walker,
-                geometry,
-                MAX_ANCESTORS,
-                &mut accumulators,
-            );
+            collect_element_ancestors(element, &walker, geometry, MAX_ANCESTORS, &mut accumulators);
         }
     }
 
@@ -168,9 +162,7 @@ fn collect_element_ancestors(
         if let Ok(ui_rect) = current.get_bounding_rectangle() {
             if let Some(rect) = geometry.map_ui_rect(ui_rect) {
                 let key = candidate_key(rect);
-                if is_uia_candidate_rect(rect, geometry)
-                    && seen_for_point.insert(key)
-                {
+                if is_uia_candidate_rect(rect, geometry) && seen_for_point.insert(key) {
                     if let Some(existing) = accumulators.get_mut(&key) {
                         existing.hits = existing.hits.saturating_add(1);
                         existing.nearest_leaf_distance =
@@ -205,8 +197,7 @@ fn add_fraction(origin: i32, size: u32, fraction: f64) -> i32 {
 }
 
 fn scale_floor(value: u64, target: u32, source: u32) -> u32 {
-    ((value * u64::from(target)) / u64::from(source))
-        .min(u64::from(target)) as u32
+    ((value * u64::from(target)) / u64::from(source)).min(u64::from(target)) as u32
 }
 
 fn scale_ceil(value: u64, target: u32, source: u32) -> u32 {
@@ -234,8 +225,6 @@ mod tests {
             .map_ui_rect(UiRect::new(-1760, 210, -560, 810))
             .expect("UIA rectangle should overlap the captured window");
 
-        assert_eq!(mapped, PixelRect::new(
-          240, 135, 1800, 900
-        ));
+        assert_eq!(mapped, PixelRect::new(240, 135, 1800, 900));
     }
 }
