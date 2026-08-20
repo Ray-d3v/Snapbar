@@ -43,8 +43,7 @@ impl PixelRect {
         let right = self.right().min(other.right());
         let bottom = self.bottom().min(other.bottom());
 
-        (right > left && bottom > top)
-            .then_some(Self::new(left, top, right - left, bottom - top))
+        (right > left && bottom > top).then_some(Self::new(left, top, right - left, bottom - top))
     }
 
     fn overlap_over_smaller(self, other: Self) -> f32 {
@@ -191,7 +190,8 @@ mod tests {
                 height * 72 / 100,
             );
             let image = mock_teams_window(width, height, expected);
-            let detected = select_content_rect(&image, &[], true).expect("content should be detected");
+            let detected =
+                select_content_rect(&image, &[], true).expect("content should be detected");
             let tolerance_x = (width / 80).max(4);
             let tolerance_y = (height / 80).max(4);
 

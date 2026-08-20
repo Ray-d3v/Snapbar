@@ -16,16 +16,15 @@ pub(super) fn candidate_to_content_candidate(
     let area_ratio = candidate.rect_area() as f32 / image_area as f32;
     let width_ratio = candidate.rect.width as f32 / geometry.image_width as f32;
     let height_ratio = candidate.rect.height as f32 / geometry.image_height as f32;
-    let center_x = (candidate.rect.x as f32 + candidate.rect.width as f32 / 2.0)
-        / geometry.image_width as f32;
+    let center_x =
+        (candidate.rect.x as f32 + candidate.rect.width as f32 / 2.0) / geometry.image_width as f32;
     let center_y = (candidate.rect.y as f32 + candidate.rect.height as f32 / 2.0)
         / geometry.image_height as f32;
     let normalized_dx = (center_x - 0.5).abs() * 2.0;
     let normalized_dy = (center_y - 0.5).abs() * 2.0;
     let centrality = 1.0
-        - ((normalized_dx * normalized_dx + normalized_dy * normalized_dy).sqrt()
-            / 2.0_f32.sqrt())
-        .clamp(0.0, 1.0);
+        - ((normalized_dx * normalized_dx + normalized_dy * normalized_dy).sqrt() / 2.0_f32.sqrt())
+            .clamp(0.0, 1.0);
     let strong_hint = contains_any(&candidate.text, STRONG_CONTENT_HINTS);
     let weak_hint = contains_any(&candidate.text, WEAK_CONTENT_HINTS);
     let negative_hint = contains_any(&candidate.text, NEGATIVE_CONTENT_HINTS);
@@ -166,7 +165,12 @@ fn touching_edge_count(rect: PixelRect, geometry: WindowGeometry) -> u8 {
     if rect.y <= tolerance_y {
         count += 1;
     }
-    if rect.x.saturating_add(rect.width).saturating_add(tolerance_x) >= geometry.image_width {
+    if rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(tolerance_x)
+        >= geometry.image_width
+    {
         count += 1;
     }
     if rect

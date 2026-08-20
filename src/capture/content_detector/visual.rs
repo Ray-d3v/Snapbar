@@ -34,7 +34,11 @@ pub(super) fn detect_visual_candidate(image: &RgbaImage) -> Option<ContentCandid
         }
     }
 
-    let active = erode(&dilate(&active, small_width, small_height), small_width, small_height);
+    let active = erode(
+        &dilate(&active, small_width, small_height),
+        small_width,
+        small_height,
+    );
     let components = connected_components(&active, small_width, small_height);
     let mut best: Option<ContentCandidate> = None;
 
@@ -69,10 +73,10 @@ pub(super) fn detect_visual_candidate(image: &RgbaImage) -> Option<ContentCandid
         let center_y = (component.min_y + component.max_y + 1) as f32 / 2.0;
         let normalized_dx = ((center_x / small_width as f32) - 0.5).abs() * 2.0;
         let normalized_dy = ((center_y / small_height as f32) - 0.5).abs() * 2.0;
-        let centrality = 1.0 - ((normalized_dx * normalized_dx + normalized_dy * normalized_dy)
-            .sqrt()
-            / 2.0_f32.sqrt())
-        .clamp(0.0, 1.0);
+        let centrality = 1.0
+            - ((normalized_dx * normalized_dx + normalized_dy * normalized_dy).sqrt()
+                / 2.0_f32.sqrt())
+            .clamp(0.0, 1.0);
         let confidence = 0.42
             + fill_ratio.min(1.0) * 0.24
             + centrality * 0.18
@@ -218,7 +222,8 @@ pub(super) fn refine_uniform_margins(image: &RgbaImage, rect: PixelRect) -> Pixe
         rect.x,
         rect.y.saturating_add(top_trim),
         rect.width,
-        rect.height.saturating_sub(top_trim.saturating_add(bottom_trim)),
+        rect.height
+            .saturating_sub(top_trim.saturating_add(bottom_trim)),
     );
 
     let left_trim = background_column_run(
@@ -441,4 +446,3 @@ fn scale_ceil(value: u32, target: u32, source: u32) -> u32 {
 fn index(x: u32, y: u32, width: u32) -> usize {
     (y * width + x) as usize
 }
-
