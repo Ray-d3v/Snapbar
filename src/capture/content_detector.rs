@@ -162,7 +162,7 @@ fn is_plausible_rect(rect: PixelRect, image_width: u32, image_height: u32) -> bo
     let image_area = u64::from(image_width) * u64::from(image_height);
     let area_ratio = rect.area() as f32 / image_area as f32;
     let aspect_ratio = rect.width as f32 / rect.height as f32;
-    area_ratio >= 0.07 && area_ratio <= 0.995 && (0.30..=6.5).contains(&aspect_ratio)
+    (0.07..=0.995).contains(&area_ratio) && (0.30..=6.5).contains(&aspect_ratio)
 }
 
 #[cfg(test)]
