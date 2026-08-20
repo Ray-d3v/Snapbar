@@ -51,8 +51,7 @@ pub(super) fn detect_visual_candidate(image: &RgbaImage) -> Option<ContentCandid
         let fill_ratio = component.pixel_count as f32 / area as f32;
         let aspect_ratio = width as f32 / height as f32;
 
-        if area_ratio < 0.12
-            || area_ratio > 0.86
+        if !(0.12..=0.86).contains(&area_ratio)
             || fill_ratio < 0.72
             || !(0.35..=6.0).contains(&aspect_ratio)
         {
@@ -289,9 +288,11 @@ fn background_row_run(
     } else {
         rect.bottom() - 1 - run
     };
-    (!line_matches_background(image, boundary_y, rect.x, rect.width, true, background))
-        .then_some(run)
-        .unwrap_or(0)
+    if !line_matches_background(image, boundary_y, rect.x, rect.width, true, background) {
+        run
+    } else {
+        0
+    }
 }
 
 fn background_column_run(
@@ -327,9 +328,11 @@ fn background_column_run(
     } else {
         rect.right() - 1 - run
     };
-    (!line_matches_background(image, boundary_x, rect.y, rect.height, false, background))
-        .then_some(run)
-        .unwrap_or(0)
+    if !line_matches_background(image, boundary_x, rect.y, rect.height, false, background) {
+        run
+    } else {
+        0
+    }
 }
 
 fn line_matches_background(
@@ -439,7 +442,8 @@ fn scale_floor(value: u32, target: u32, source: u32) -> u32 {
 }
 
 fn scale_ceil(value: u32, target: u32, source: u32) -> u32 {
-    (((u64::from(value) * u64::from(target)) + u64::from(source) - 1) / u64::from(source))
+    (u64::from(value) * u64::from(target))
+        .div_ceil(u64::from(source))
         .min(u64::from(target)) as u32
 }
 
