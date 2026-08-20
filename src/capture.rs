@@ -201,14 +201,13 @@ fn copy_to_clipboard(image: RgbaImage) -> Result<()> {
     let mut last_error = None;
 
     for attempt in 0..3 {
-        let result = (|| -> arboard::Result<()> {
-            let mut clipboard = Clipboard::new()?;
+        let result = Clipboard::new().and_then(|mut clipboard| {
             clipboard.set_image(ImageData {
                 width,
                 height,
                 bytes: Cow::Borrowed(&bytes),
             })
-        })();
+        });
 
         match result {
             Ok(()) => return Ok(()),
