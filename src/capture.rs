@@ -1,34 +1,28 @@
 use std::{borrow::Cow, thread, time::Duration};
 
 mod content_detector;
+mod engine;
+mod flash;
 mod uia;
 
-use self::{
-    content_detector::select_content_rect,
-    uia::{WindowGeometry, detect_content_candidates},
-};
+pub use self::{engine::CaptureEngine, flash::show_capture_flash};
 use anyhow::{Context as _, Result, anyhow};
 use arboard::{Clipboard, ImageData};
-use image::{RgbaImage, imageops};
 use xcap::Window;
 
-/// Compatibility state for the existing crop button. Both modes always detect and
-/// crop to the shared-content region; neither mode permits full-window output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CropMode {
-    /// Standard automatic detection: UI Automation plus conservative visual fallback.
-    FullWindow,
-    /// Strict automatic detection: require a UI Automation candidate.
-    TeamsContentPreset,
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
-impl CropMode {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::FullWindow => Self::TeamsContentPreset,
-            Self::TeamsContentPreset => Self::FullWindow,
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureReceipt {
+    pub screen_rect: ScreenRect,
+    pub latency: Duration,
+    pub frame_age: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,45 +103,6 @@ pub fn discover_teams_targets() -> Result<Vec<CaptureTarget>> {
         .collect())
 }
 
-pub fn capture_to_clipboard(target_id: u32, crop_mode: CropMode) -> Result<()> {
-    let target = Window::all()
-        .context("ウィンドウ一覧を再取得できませんでした")?
-        .into_iter()
-        .find(|window| window.id().ok() == Some(target_id))
-        .ok_or_else(|| anyhow!("選択中のTeamsウィンドウが見つかりません"))?;
-
-    if target.is_minimized().unwrap_or(false) {
-        return Err(anyhow!("選択中のTeamsウィンドウが最小化されています"));
-    }
-
-    let image = target
-        .capture_image()
-        .context("Teamsウィンドウのキャプチャに失敗しました")?;
-    let geometry = WindowGeometry::from_window(&target, &image)?;
-    let semantic_candidates = detect_content_candidates(geometry).unwrap_or_default();
-    let allow_visual_fallback = crop_mode == CropMode::FullWindow;
-    let content_rect = select_content_rect(
-        &image,
-        &semantic_candidates,
-        allow_visual_fallback,
-    )
-    .ok_or_else(|| {
-        anyhow!(
-            "共有コンテンツ領域を安全に特定できなかったため、ウィンドウ全体はコピーしませんでした"
-        )
-    })?;
-    let cropped = imageops::crop_imm(
-        &image,
-        content_rect.x,
-        content_rect.y,
-        content_rect.width,
-        content_rect.height,
-    )
-    .to_image();
-
-    copy_to_clipboard(cropped)
-}
-
 fn score_window(window: &WindowDescriptor<'_>) -> i32 {
     let app = window.app_name.to_lowercase();
     let title = window.title.to_lowercase();
@@ -202,18 +157,19 @@ fn score_window(window: &WindowDescriptor<'_>) -> i32 {
     score + 20_i32.saturating_sub(window.z_index.min(20) as i32)
 }
 
-fn copy_to_clipboard(image: RgbaImage) -> Result<()> {
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let bytes = image.into_raw();
-    let mut last_error = None;
+pub(super) fn copy_rgba_to_clipboard(width: u32, height: u32, bytes: &[u8]) -> Result<()> {
+    let expected_len = width as usize * height as usize * 4;
+    if bytes.len() != expected_len {
+        return Err(anyhow!("共有画面フレームのバッファサイズが不正です"));
+    }
 
+    let mut last_error = None;
     for attempt in 0..3 {
         let result = Clipboard::new().and_then(|mut clipboard| {
             clipboard.set_image(ImageData {
-                width,
-                height,
-                bytes: Cow::Borrowed(&bytes),
+                width: width as usize,
+                height: height as usize,
+                bytes: Cow::Borrowed(bytes),
             })
         });
 
