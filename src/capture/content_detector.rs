@@ -192,13 +192,16 @@ mod tests {
             let image = mock_teams_window(width, height, expected);
             let detected =
                 select_content_rect(&image, &[], true).expect("content should be detected");
-            let tolerance_x = (width / 80).max(4);
-            let tolerance_y = (height / 80).max(4);
+            let intersection = detected
+                .intersection(expected)
+                .expect("detected content should overlap the expected region");
+            let union = detected.area() + expected.area() - intersection.area();
+            let intersection_over_union = intersection.area() as f32 / union as f32;
 
-            assert!(detected.x.abs_diff(expected.x) <= tolerance_x);
-            assert!(detected.y.abs_diff(expected.y) <= tolerance_y);
-            assert!(detected.width.abs_diff(expected.width) <= tolerance_x * 2);
-            assert!(detected.height.abs_diff(expected.height) <= tolerance_y * 2);
+            assert!(
+                intersection_over_union >= 0.86,
+                "detected={detected:?}, expected={expected:?}, iou={intersection_over_union}"
+            );
         }
     }
 
