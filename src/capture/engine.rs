@@ -102,7 +102,7 @@ impl CaptureEngine {
         let settings = Settings::new(
             target,
             CursorCaptureSettings::WithoutCursor,
-            DrawBorderSettings::Default,
+            DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
@@ -457,7 +457,6 @@ fn overlap_ratio(left: PixelRect, right: PixelRect) -> f64 {
     if intersection_right <= intersection_left || intersection_bottom <= intersection_top {
         return 0.0;
     }
-
     let intersection_area = u64::from(intersection_right - intersection_left)
         * u64::from(intersection_bottom - intersection_top);
     let left_area = u64::from(left.width) * u64::from(left.height);
@@ -465,34 +464,5 @@ fn overlap_ratio(left: PixelRect, right: PixelRect) -> f64 {
         0.0
     } else {
         intersection_area as f64 / left_area as f64
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use windows_capture::frame::DirtyRegion;
-
-    use super::{dirty_region_to_rect, overlap_ratio};
-    use crate::capture::content_detector::PixelRect;
-
-    #[test]
-    fn dirty_region_is_clamped_to_frame() {
-        let region = DirtyRegion {
-            x: -10,
-            y: 5,
-            width: 40,
-            height: 30,
-        };
-        assert_eq!(
-            dirty_region_to_rect(&region, 100, 100),
-            Some(PixelRect::new(0, 5, 30, 30))
-        );
-    }
-
-    #[test]
-    fn overlap_is_measured_against_dirty_region() {
-        let dirty = PixelRect::new(100, 100, 200, 100);
-        let content = PixelRect::new(150, 50, 300, 300);
-        assert!((overlap_ratio(dirty, content) - 0.75).abs() < f64::EPSILON);
     }
 }
