@@ -29,6 +29,10 @@ pub(super) fn candidate_to_content_candidate(
     let weak_hint = contains_any(&candidate.text, WEAK_CONTENT_HINTS);
     let negative_hint = contains_any(&candidate.text, NEGATIVE_CONTENT_HINTS);
 
+    if negative_hint && !strong_hint {
+        return None;
+    }
+
     let mut confidence = 0.05;
     confidence += if (0.10..=0.92).contains(&area_ratio) {
         0.14
@@ -67,7 +71,7 @@ pub(super) fn candidate_to_content_candidate(
         confidence += 0.13;
     }
     if negative_hint {
-        confidence -= 0.32;
+        confidence -= 0.45;
     }
 
     let touching_edges = touching_edge_count(candidate.rect, geometry);
@@ -82,6 +86,31 @@ pub(super) fn candidate_to_content_candidate(
     }
 
     Some(ContentCandidate::new(candidate.rect, confidence))
+}
+
+pub(super) fn candidate_to_exclusion_candidate(
+    candidate: &UiaAccumulator,
+    geometry: WindowGeometry,
+) -> Option<ContentCandidate> {
+    if !contains_any(&candidate.text, NEGATIVE_CONTENT_HINTS) {
+        return None;
+    }
+
+    let image_area = u64::from(geometry.image_width) * u64::from(geometry.image_height);
+    if image_area == 0 {
+        return None;
+    }
+    let area_ratio = candidate.rect_area() as f32 / image_area as f32;
+    let width_ratio = candidate.rect.width as f32 / geometry.image_width as f32;
+    let height_ratio = candidate.rect.height as f32 / geometry.image_height as f32;
+    let edge_region = (width_ratio <= 0.48 && height_ratio >= 0.16)
+        || (height_ratio <= 0.38 && width_ratio >= 0.16);
+
+    if !(0.012..=0.55).contains(&area_ratio) || !edge_region {
+        return None;
+    }
+
+    Some(ContentCandidate::exclusion(candidate.rect))
 }
 
 impl UiaAccumulator {
@@ -237,15 +266,19 @@ const NEGATIVE_CONTENT_HINTS: &[&str] = &[
     "control bar",
     "chat",
     "participants",
+    "participant",
     "people",
+    "attendees",
     "reactions",
     "captions",
     "transcript",
     "navigation",
     "sidebar",
+    "side panel",
     "filmstrip",
     "gallery",
     "camera preview",
+    "video tile",
     "microphone",
     "leave button",
     "title bar",
@@ -253,17 +286,22 @@ const NEGATIVE_CONTENT_HINTS: &[&str] = &[
     "会議コントロール",
     "チャット",
     "参加者",
+    "出席者",
+    "ユーザー一覧",
     "リアクション",
     "字幕",
     "トランスクリプト",
     "ナビゲーション",
     "サイドバー",
+    "サイドパネル",
+    "ギャラリー",
+    "ビデオタイル",
     "退出",
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::candidate_to_content_candidate;
+    use super::{candidate_to_content_candidate, candidate_to_exclusion_candidate};
     use crate::capture::{
         content_detector::PixelRect,
         uia::{ElementRole, UiaAccumulator, WindowGeometry},
@@ -305,5 +343,28 @@ mod tests {
 
         assert!(shared_confidence > stage_confidence);
         assert!(shared_confidence >= 0.8);
+    }
+
+    #[test]
+    fn participant_panel_is_exclusion_not_content() {
+        let geometry = WindowGeometry {
+            screen_left: 0,
+            screen_top: 0,
+            screen_width: 1600,
+            screen_height: 900,
+            image_width: 1600,
+            image_height: 900,
+        };
+        let panel = UiaAccumulator {
+            rect: PixelRect::new(1260, 80, 300, 740),
+            hits: 20,
+            nearest_leaf_distance: 0,
+            role: ElementRole::Pane,
+            text: "participants side panel".to_string(),
+            is_content_element: true,
+        };
+
+        assert!(candidate_to_content_candidate(&panel, geometry).is_none());
+        assert!(candidate_to_exclusion_candidate(&panel, geometry).is_some());
     }
 }
