@@ -118,7 +118,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
             rect.height.min(i32::MAX as u32) as i32,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
     for alpha in FLASH_ALPHAS.into_iter().skip(1) {
