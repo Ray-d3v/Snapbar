@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui::Window;
-use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
@@ -79,7 +79,7 @@ impl Drop for TeamsWindowFollower {
 }
 
 fn window_hwnd(window: &Window) -> Option<HWND> {
-    let handle = window.window_handle().ok()?.as_raw();
+    let handle = HasWindowHandle::window_handle(window).ok()?.as_raw();
     match handle {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut c_void)),
         _ => None,
@@ -88,7 +88,7 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
 
 fn follow_target(overlay_hwnd: HWND, target_hwnd: HWND) {
     unsafe {
-        if !IsWindow(target_hwnd).as_bool() {
+        if !IsWindow(Some(target_hwnd)).as_bool() {
             return;
         }
         if IsIconic(target_hwnd).as_bool() {
