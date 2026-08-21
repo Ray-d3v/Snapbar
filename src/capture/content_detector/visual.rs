@@ -45,7 +45,7 @@ impl AnalysisFrame {
         let width = ((image.width() as f32 * scale).round() as u32).max(1);
         let height = ((image.height() as f32 * scale).round() as u32).max(1);
         let small = imageops::resize(image, width, height, imageops::FilterType::Triangle);
-        let background = estimate_outer_background(&small);
+        let background = estimate_analysis_background(&small);
         let mut active = vec![false; (width * height) as usize];
 
         for y in 1..height.saturating_sub(1) {
@@ -570,6 +570,38 @@ fn line_matches_background(
     samples > 0 && matches as f32 / samples as f32 >= 0.92
 }
 
+fn estimate_analysis_background(image: &RgbaImage) -> [u8; 4] {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return [0, 0, 0, 255];
+    }
+
+    // Teams may place shared content flush against the left, right, or bottom edge.
+    // The top window-chrome band remains the stable source for the meeting background.
+    let band = (width.min(height) / 40).clamp(1, 8);
+    let sample_step = (width / 1024).max(1);
+    let mut red = Vec::new();
+    let mut green = Vec::new();
+    let mut blue = Vec::new();
+
+    for y in 0..band {
+        let mut x = 0;
+        while x < width {
+            push_color_sample(image, x, y, &mut red, &mut green, &mut blue);
+            x = x.saturating_add(sample_step);
+        }
+    }
+
+    if red.is_empty() {
+        return estimate_outer_background(image);
+    }
+    red.sort_unstable();
+    green.sort_unstable();
+    blue.sort_unstable();
+    let middle = red.len() / 2;
+    [red[middle], green[middle], blue[middle], 255]
+}
 fn estimate_outer_background(image: &RgbaImage) -> [u8; 4] {
     let width = image.width();
     let height = image.height();
