@@ -3,7 +3,10 @@ use std::{ffi::c_void, thread, time::Duration};
 use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, RECT},
-        Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+        Graphics::{
+            Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+            Gdi::UpdateWindow,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SW_SHOWNOACTIVATE,
@@ -119,6 +122,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = UpdateWindow(hwnd);
     }
 
     for alpha in FLASH_ALPHAS.into_iter().skip(1) {
