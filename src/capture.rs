@@ -1,4 +1,11 @@
-use std::{borrow::Cow, thread, time::Duration};
+use std::{
+    borrow::Cow,
+    ffi::c_void,
+    fs,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 mod content_detector;
 mod engine;
@@ -8,6 +15,12 @@ mod uia;
 pub use self::{engine::CaptureEngine, flash::show_capture_flash};
 use anyhow::{Context as _, Result, anyhow};
 use arboard::{Clipboard, ImageData};
+use image::{ColorType, ImageFormat};
+use windows::Win32::{
+    Foundation::SYSTEMTIME,
+    System::{Com::CoTaskMemFree, SystemInformation::GetLocalTime},
+    UI::Shell::{FOLDERID_Screenshots, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+};
 use xcap::Window;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,9 +203,78 @@ pub(super) fn copy_rgba_to_clipboard(width: u32, height: u32, bytes: &[u8]) -> R
     .context("クリップボードへのコピーに失敗しました")
 }
 
+pub fn save_clipboard_image_to_screenshots() -> Result<PathBuf> {
+    let image = Clipboard::new()
+        .and_then(|mut clipboard| clipboard.get_image())
+        .context("クリップボード画像を保存用に取得できませんでした")?;
+    let width = u32::try_from(image.width).context("画像の幅が大きすぎます")?;
+    let height = u32::try_from(image.height).context("画像の高さが大きすぎます")?;
+    let expected_len = image.width.saturating_mul(image.height).saturating_mul(4);
+    if image.bytes.len() != expected_len {
+        return Err(anyhow!("保存する画像のバッファサイズが不正です"));
+    }
+
+    let folder = windows_screenshots_folder()?;
+    fs::create_dir_all(&folder).with_context(|| {
+        format!(
+            "Windowsのスクリーンショット保存先を作成できませんでした: {}",
+            folder.display()
+        )
+    })?;
+    let path = next_screenshot_path(&folder);
+    image::save_buffer_with_format(
+        &path,
+        image.bytes.as_ref(),
+        width,
+        height,
+        ColorType::Rgba8,
+        ImageFormat::Png,
+    )
+    .with_context(|| format!("スクリーンショットを保存できませんでした: {}", path.display()))?;
+    Ok(path)
+}
+
+fn windows_screenshots_folder() -> Result<PathBuf> {
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_Screenshots, KF_FLAG_DEFAULT, None)
+            .context("Windowsのスクリーンショット保存先を取得できませんでした")?;
+        let result = raw
+            .to_string()
+            .map(PathBuf::from)
+            .context("スクリーンショット保存先のパスを読み取れませんでした");
+        CoTaskMemFree(Some(raw.0.cast::<c_void>()));
+        result
+    }
+}
+
+fn next_screenshot_path(folder: &Path) -> PathBuf {
+    let mut now = SYSTEMTIME::default();
+    unsafe {
+        GetLocalTime(&mut now);
+    }
+    let stem = format!(
+        "Screenshot {:04}-{:02}-{:02} {:02}{:02}{:02}",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
+    );
+    let initial = folder.join(format!("{stem}.png"));
+    if !initial.exists() {
+        return initial;
+    }
+
+    for suffix in 2..=9999 {
+        let candidate = folder.join(format!("{stem} ({suffix}).png"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    folder.join(format!("{stem} (duplicate).png"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WindowDescriptor, score_window};
+    use std::path::Path;
+
+    use super::{WindowDescriptor, next_screenshot_path, score_window};
 
     #[test]
     fn teams_shared_window_scores_higher_than_main_window() {
@@ -246,5 +328,15 @@ mod tests {
         };
 
         assert!(score_window(&front) > score_window(&back));
+    }
+
+    #[test]
+    fn screenshot_path_uses_png_extension() {
+        assert_eq!(
+            next_screenshot_path(Path::new("C:/Screenshots"))
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("png")
+        );
     }
 }
