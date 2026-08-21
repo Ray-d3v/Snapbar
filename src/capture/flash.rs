@@ -8,8 +8,8 @@ use windows::{
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SW_SHOWNOACTIVATE,
             SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-            SetWindowPos, ShowWindow, UpdateWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE,
-            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+            SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
     core::w,
@@ -119,7 +119,6 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(hwnd)?;
     }
 
     for alpha in FLASH_ALPHAS.into_iter().skip(1) {
