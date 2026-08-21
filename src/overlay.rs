@@ -15,8 +15,8 @@ use windows::Win32::{
     Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
     UI::WindowsAndMessaging::{
         GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
+        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
+        SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
     },
 };
 
