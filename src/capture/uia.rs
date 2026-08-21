@@ -14,8 +14,8 @@ use super::{
 mod scoring;
 
 use self::scoring::{
-    candidate_key, candidate_to_content_candidate, element_role, element_search_text,
-    is_uia_candidate_rect,
+    candidate_key, candidate_to_content_candidate, candidate_to_exclusion_candidate, element_role,
+    element_search_text, is_uia_candidate_rect,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -189,10 +189,16 @@ pub(super) fn detect_content_candidates(geometry: WindowGeometry) -> Result<Vec<
         }
     }
 
-    Ok(accumulators
-        .values()
-        .filter_map(|candidate| candidate_to_content_candidate(candidate, geometry))
-        .collect())
+    let mut candidates = Vec::new();
+    for candidate in accumulators.values() {
+        if let Some(exclusion) = candidate_to_exclusion_candidate(candidate, geometry) {
+            candidates.push(exclusion);
+        }
+        if let Some(content) = candidate_to_content_candidate(candidate, geometry) {
+            candidates.push(content);
+        }
+    }
+    Ok(candidates)
 }
 
 fn collect_element_ancestors(
@@ -214,10 +220,20 @@ fn collect_element_ancestors(
             if let Some(rect) = geometry.map_ui_rect(ui_rect) {
                 let key = candidate_key(rect);
                 if is_uia_candidate_rect(rect, geometry) && seen_for_point.insert(key) {
+                    let role = element_role(current.get_control_type().ok());
+                    let text = element_search_text(&current);
+                    let is_content_element = current.is_content_element().unwrap_or(false);
                     if let Some(existing) = accumulators.get_mut(&key) {
                         existing.hits = existing.hits.saturating_add(1);
                         existing.nearest_leaf_distance =
                             existing.nearest_leaf_distance.min(leaf_distance);
+                        existing.is_content_element |= is_content_element;
+                        if !text.is_empty() && !existing.text.contains(&text) {
+                            if !existing.text.is_empty() {
+                                existing.text.push(' ');
+                            }
+                            existing.text.push_str(&text);
+                        }
                     } else {
                         accumulators.insert(
                             key,
@@ -225,9 +241,9 @@ fn collect_element_ancestors(
                                 rect,
                                 hits: 1,
                                 nearest_leaf_distance: leaf_distance,
-                                role: element_role(current.get_control_type().ok()),
-                                text: element_search_text(&current),
-                                is_content_element: current.is_content_element().unwrap_or(false),
+                                role,
+                                text,
+                                is_content_element,
                             },
                         );
                     }
