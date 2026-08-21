@@ -58,7 +58,7 @@ impl Drop for EngineInner {
     }
 }
 
-struct SharedState {
+pub(super) struct SharedState {
     target_id: u32,
     state: Mutex<RuntimeState>,
     ready: Condvar,
