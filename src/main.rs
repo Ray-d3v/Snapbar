@@ -9,6 +9,8 @@ mod app;
 mod assets;
 #[cfg(target_os = "windows")]
 mod capture;
+#[cfg(target_os = "windows")]
+mod overlay;
 
 #[cfg(target_os = "windows")]
 fn main() {
