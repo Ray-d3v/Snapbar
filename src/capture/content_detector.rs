@@ -63,6 +63,7 @@ impl PixelRect {
 pub(crate) struct ContentCandidate {
     pub rect: PixelRect,
     pub confidence: f32,
+    is_exclusion: bool,
 }
 
 impl ContentCandidate {
@@ -70,6 +71,15 @@ impl ContentCandidate {
         Self {
             rect,
             confidence: confidence.clamp(0.0, 1.0),
+            is_exclusion: false,
+        }
+    }
+
+    pub(crate) fn exclusion(rect: PixelRect) -> Self {
+        Self {
+            rect,
+            confidence: 1.0,
+            is_exclusion: true,
         }
     }
 }
@@ -80,9 +90,17 @@ pub(crate) fn select_content_rect(
     allow_visual_fallback: bool,
 ) -> Option<PixelRect> {
     let visual_candidate = detect_visual_candidate(image);
+    let exclusions: Vec<PixelRect> = semantic_candidates
+        .iter()
+        .filter(|candidate| candidate.is_exclusion)
+        .map(|candidate| candidate.rect)
+        .collect();
     let mut best: Option<(f32, PixelRect)> = None;
 
-    for candidate in semantic_candidates {
+    for candidate in semantic_candidates
+        .iter()
+        .filter(|candidate| !candidate.is_exclusion)
+    {
         if candidate.confidence < SEMANTIC_CONFIDENCE_THRESHOLD
             || !is_plausible_rect(candidate.rect, image.width(), image.height())
         {
@@ -90,7 +108,10 @@ pub(crate) fn select_content_rect(
         }
 
         let mut score = candidate.confidence + specificity_bonus(candidate.rect, image);
-        for other in semantic_candidates {
+        for other in semantic_candidates
+            .iter()
+            .filter(|other| !other.is_exclusion)
+        {
             if candidate.rect == other.rect {
                 continue;
             }
@@ -106,11 +127,9 @@ pub(crate) fn select_content_rect(
             }
         }
 
-        let refined = refine_uniform_margins(image, candidate.rect);
-        if !is_plausible_rect(refined, image.width(), image.height()) {
+        let Some(refined) = finalize_rect(image, candidate.rect, &exclusions) else {
             continue;
-        }
-
+        };
         if best.is_none_or(|(best_score, _)| score > best_score) {
             best = Some((score, refined));
         }
@@ -126,8 +145,115 @@ pub(crate) fn select_content_rect(
 
     visual_candidate
         .filter(|candidate| candidate.confidence >= VISUAL_CONFIDENCE_THRESHOLD)
-        .map(|candidate| refine_uniform_margins(image, candidate.rect))
-        .filter(|rect| is_plausible_rect(*rect, image.width(), image.height()))
+        .and_then(|candidate| finalize_rect(image, candidate.rect, &exclusions))
+}
+
+fn finalize_rect(
+    image: &RgbaImage,
+    rect: PixelRect,
+    exclusions: &[PixelRect],
+) -> Option<PixelRect> {
+    let refined = refine_uniform_margins(image, rect);
+    let trimmed = trim_excluded_edge_regions(refined, exclusions);
+    let refined = refine_uniform_margins(image, trimmed);
+    is_plausible_rect(refined, image.width(), image.height()).then_some(refined)
+}
+
+fn trim_excluded_edge_regions(rect: PixelRect, exclusions: &[PixelRect]) -> PixelRect {
+    if exclusions.is_empty() || rect.width == 0 || rect.height == 0 {
+        return rect;
+    }
+
+    let tolerance_x = (rect.width / 40).max(4);
+    let tolerance_y = (rect.height / 40).max(4);
+    let mut left_cut = rect.x;
+    let mut right_cut = rect.right();
+    let mut top_cut = rect.y;
+    let mut bottom_cut = rect.bottom();
+    let mut left_intervals = Vec::new();
+    let mut right_intervals = Vec::new();
+    let mut top_intervals = Vec::new();
+    let mut bottom_intervals = Vec::new();
+
+    for exclusion in exclusions {
+        let Some(overlap) = rect.intersection(*exclusion) else {
+            continue;
+        };
+        let width_ratio = overlap.width as f32 / rect.width as f32;
+        let height_ratio = overlap.height as f32 / rect.height as f32;
+
+        if (0.04..=0.45).contains(&width_ratio) {
+            if overlap.x <= rect.x.saturating_add(tolerance_x) {
+                left_cut = left_cut.max(overlap.right());
+                left_intervals.push((overlap.y, overlap.bottom()));
+            }
+            if overlap.right().saturating_add(tolerance_x) >= rect.right() {
+                right_cut = right_cut.min(overlap.x);
+                right_intervals.push((overlap.y, overlap.bottom()));
+            }
+        }
+
+        if (0.04..=0.35).contains(&height_ratio) {
+            if overlap.y <= rect.y.saturating_add(tolerance_y) {
+                top_cut = top_cut.max(overlap.bottom());
+                top_intervals.push((overlap.x, overlap.right()));
+            }
+            if overlap.bottom().saturating_add(tolerance_y) >= rect.bottom() {
+                bottom_cut = bottom_cut.min(overlap.y);
+                bottom_intervals.push((overlap.x, overlap.right()));
+            }
+        }
+    }
+
+    if covered_length(left_intervals) * 100 < rect.height * 45 {
+        left_cut = rect.x;
+    }
+    if covered_length(right_intervals) * 100 < rect.height * 45 {
+        right_cut = rect.right();
+    }
+    if covered_length(top_intervals) * 100 < rect.width * 45 {
+        top_cut = rect.y;
+    }
+    if covered_length(bottom_intervals) * 100 < rect.width * 45 {
+        bottom_cut = rect.bottom();
+    }
+
+    if right_cut <= left_cut || bottom_cut <= top_cut {
+        return rect;
+    }
+
+    let trimmed = PixelRect::new(
+        left_cut,
+        top_cut,
+        right_cut - left_cut,
+        bottom_cut - top_cut,
+    );
+    let enough_width = trimmed.width * 100 >= rect.width * 45;
+    let enough_height = trimmed.height * 100 >= rect.height * 45;
+    let enough_area = trimmed.area() * 100 >= rect.area() * 50;
+    if enough_width && enough_height && enough_area {
+        trimmed
+    } else {
+        rect
+    }
+}
+
+fn covered_length(mut intervals: Vec<(u32, u32)>) -> u32 {
+    if intervals.is_empty() {
+        return 0;
+    }
+    intervals.sort_unstable_by_key(|interval| interval.0);
+    let mut total = 0u32;
+    let mut current = intervals[0];
+    for interval in intervals.into_iter().skip(1) {
+        if interval.0 <= current.1 {
+            current.1 = current.1.max(interval.1);
+        } else {
+            total = total.saturating_add(current.1.saturating_sub(current.0));
+            current = interval;
+        }
+    }
+    total.saturating_add(current.1.saturating_sub(current.0))
 }
 
 fn specificity_bonus(rect: PixelRect, image: &RgbaImage) -> f32 {
@@ -178,6 +304,59 @@ mod tests {
         let detected = select_content_rect(&image, &[ContentCandidate::new(expected, 0.92)], false);
 
         assert_eq!(detected, Some(expected));
+    }
+
+    #[test]
+    fn participants_panel_is_removed_from_semantic_stage() {
+        let image = RgbaImage::from_pixel(1600, 900, Rgba([24, 24, 28, 255]));
+        let stage = PixelRect::new(100, 70, 1400, 760);
+        let participants = PixelRect::new(1220, 80, 280, 740);
+        let detected = select_content_rect(
+            &image,
+            &[
+                ContentCandidate::new(stage, 0.91),
+                ContentCandidate::exclusion(participants),
+            ],
+            false,
+        )
+        .expect("shared content should remain");
+
+        assert_eq!(detected, PixelRect::new(100, 70, 1120, 760));
+    }
+
+    #[test]
+    fn stacked_participant_tiles_form_one_excluded_side_band() {
+        let image = RgbaImage::from_pixel(1600, 900, Rgba([24, 24, 28, 255]));
+        let stage = PixelRect::new(100, 70, 1400, 760);
+        let detected = select_content_rect(
+            &image,
+            &[
+                ContentCandidate::new(stage, 0.91),
+                ContentCandidate::exclusion(PixelRect::new(1240, 90, 260, 220)),
+                ContentCandidate::exclusion(PixelRect::new(1240, 320, 260, 220)),
+                ContentCandidate::exclusion(PixelRect::new(1240, 550, 260, 240)),
+            ],
+            false,
+        )
+        .expect("shared content should remain");
+
+        assert_eq!(detected, PixelRect::new(100, 70, 1140, 760));
+    }
+
+    #[test]
+    fn isolated_negative_button_does_not_crop_the_stage() {
+        let image = RgbaImage::from_pixel(1600, 900, Rgba([24, 24, 28, 255]));
+        let stage = PixelRect::new(100, 70, 1400, 760);
+        let detected = select_content_rect(
+            &image,
+            &[
+                ContentCandidate::new(stage, 0.91),
+                ContentCandidate::exclusion(PixelRect::new(1420, 760, 80, 70)),
+            ],
+            false,
+        );
+
+        assert_eq!(detected, Some(stage));
     }
 
     #[test]

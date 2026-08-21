@@ -18,8 +18,8 @@ use windows::{
 use super::{ScreenRect, content_detector::PixelRect};
 
 const SS_WHITERECT_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0000_0006);
-const FLASH_ALPHAS: [u8; 7] = [72, 62, 50, 36, 24, 12, 0];
-const FLASH_STEP: Duration = Duration::from_millis(18);
+const FLASH_ALPHAS: [u8; 8] = [210, 210, 176, 136, 94, 56, 24, 0];
+const FLASH_STEP: Duration = Duration::from_millis(28);
 
 pub fn show_capture_flash(rect: ScreenRect) {
     if rect.width == 0 || rect.height == 0 {
