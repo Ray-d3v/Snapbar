@@ -123,7 +123,7 @@ impl CaptureEngine {
     pub fn copy_latest_to_clipboard(&self) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
         let cached = self.wait_for_cached_frame()?;
-        copy_rgba_to_clipboard(cached.width, cached.height, &cached.bytes)?;
+        copy_rgba_to_clipboard(cached.width, cached.height, cached.bytes.as_slice())?;
 
         let screen_rect = current_screen_rect(
             self.inner.shared.target_id,
@@ -305,8 +305,10 @@ impl FrameHandler {
         content_rect: PixelRect,
         captured_at: Instant,
     ) -> Result<()> {
-        if content_rect.x.saturating_add(content_rect.width) > frame.width()
-            || content_rect.y.saturating_add(content_rect.height) > frame.height()
+        let source_width = frame.width();
+        let source_height = frame.height();
+        if content_rect.x.saturating_add(content_rect.width) > source_width
+            || content_rect.y.saturating_add(content_rect.height) > source_height
         {
             return Err(anyhow!("Teamsのレイアウト変更を検出しました"));
         }
@@ -314,8 +316,8 @@ impl FrameHandler {
         let fallback_screen_rect = current_screen_rect(
             self.shared.target_id,
             content_rect,
-            frame.width(),
-            frame.height(),
+            source_width,
+            source_height,
         )
         .or_else(|| {
             self.shared.state.lock().ok().and_then(|state| {
@@ -326,7 +328,7 @@ impl FrameHandler {
             })
         })
         .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
-        let mut buffer = frame
+        let buffer = frame
             .buffer_crop(
                 content_rect.x,
                 content_rect.y,
@@ -338,8 +340,8 @@ impl FrameHandler {
         self.publish_frame(
             content_rect,
             fallback_screen_rect,
-            frame.width(),
-            frame.height(),
+            source_width,
+            source_height,
             bytes,
             captured_at,
         )
@@ -386,7 +388,7 @@ impl FrameHandler {
 fn frame_to_image(frame: &mut Frame, scratch: &mut Vec<u8>) -> Result<RgbaImage> {
     let width = frame.width();
     let height = frame.height();
-    let mut buffer = frame
+    let buffer = frame
         .buffer()
         .context("Teamsウィンドウの最新フレームを取得できませんでした")?;
     let bytes = buffer.as_nopadding_buffer(scratch).to_vec();
@@ -442,52 +444,55 @@ fn dirty_region_to_rect(
 }
 
 fn overlap_ratio(left: PixelRect, right: PixelRect) -> f64 {
-    let left_edge = left.x.max(right.x);
-    let top_edge = left.y.max(right.y);
-    let right_edge = left
+    let intersection_left = left.x.max(right.x);
+    let intersection_top = left.y.max(right.y);
+    let intersection_right = left
         .x
         .saturating_add(left.width)
         .min(right.x.saturating_add(right.width));
-    let bottom_edge = left
+    let intersection_bottom = left
         .y
         .saturating_add(left.height)
         .min(right.y.saturating_add(right.height));
-    if right_edge <= left_edge || bottom_edge <= top_edge {
+    if intersection_right <= intersection_left || intersection_bottom <= intersection_top {
         return 0.0;
     }
-    let intersection = u64::from(right_edge - left_edge) * u64::from(bottom_edge - top_edge);
+
+    let intersection_area = u64::from(intersection_right - intersection_left)
+        * u64::from(intersection_bottom - intersection_top);
     let left_area = u64::from(left.width) * u64::from(left.height);
     if left_area == 0 {
         0.0
     } else {
-        intersection as f64 / left_area as f64
+        intersection_area as f64 / left_area as f64
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dirty_region_to_rect, overlap_ratio};
-    use crate::capture::content_detector::PixelRect;
     use windows_capture::frame::DirtyRegion;
 
+    use super::{dirty_region_to_rect, overlap_ratio};
+    use crate::capture::content_detector::PixelRect;
+
     #[test]
-    fn dirty_region_is_clipped_to_frame() {
-        let dirty = DirtyRegion {
-            x: -20,
-            y: 10,
-            width: 80,
-            height: 40,
+    fn dirty_region_is_clamped_to_frame() {
+        let region = DirtyRegion {
+            x: -10,
+            y: 5,
+            width: 40,
+            height: 30,
         };
         assert_eq!(
-            dirty_region_to_rect(&dirty, 100, 100),
-            Some(PixelRect::new(0, 10, 60, 40))
+            dirty_region_to_rect(&region, 100, 100),
+            Some(PixelRect::new(0, 5, 30, 30))
         );
     }
 
     #[test]
-    fn overlap_ratio_uses_dirty_region_area() {
-        let dirty = PixelRect::new(0, 0, 100, 100);
-        let content = PixelRect::new(50, 0, 100, 100);
-        assert!((overlap_ratio(dirty, content) - 0.5).abs() < f64::EPSILON);
+    fn overlap_is_measured_against_dirty_region() {
+        let dirty = PixelRect::new(100, 100, 200, 100);
+        let content = PixelRect::new(150, 50, 300, 300);
+        assert!((overlap_ratio(dirty, content) - 0.75).abs() < f64::EPSILON);
     }
 }
