@@ -17,7 +17,6 @@ use anyhow::{Context as _, Result, anyhow};
 use arboard::{Clipboard, ImageData};
 use image::{ColorType, ImageFormat};
 use windows::Win32::{
-    Foundation::SYSTEMTIME,
     System::{Com::CoTaskMemFree, SystemInformation::GetLocalTime},
     UI::Shell::{FOLDERID_Screenshots, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
 };
@@ -253,10 +252,7 @@ fn windows_screenshots_folder() -> Result<PathBuf> {
 }
 
 fn next_screenshot_path(folder: &Path) -> PathBuf {
-    let mut now = SYSTEMTIME::default();
-    unsafe {
-        GetLocalTime(&mut now);
-    }
+    let now = unsafe { GetLocalTime() };
     let stem = format!(
         "Screenshot {:04}-{:02}-{:02} {:02}{:02}{:02}",
         now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
