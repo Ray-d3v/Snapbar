@@ -6,11 +6,10 @@ use windows::{
         Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SS_WHITERECT,
-            SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-            SetWindowDisplayAffinity, SetWindowPos, ShowWindow, UpdateWindow,
-            WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+            CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SW_SHOWNOACTIVATE,
+            SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
+            SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
     core::w,
@@ -18,6 +17,7 @@ use windows::{
 
 use super::{ScreenRect, content_detector::PixelRect};
 
+const SS_WHITERECT_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0000_0006);
 const FLASH_ALPHAS: [u8; 7] = [72, 62, 50, 36, 24, 12, 0];
 const FLASH_STEP: Duration = Duration::from_millis(18);
 
@@ -88,7 +88,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
     let module = unsafe { GetModuleHandleW(None)? };
     let instance = HINSTANCE(module.0);
     let ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-    let style = WS_POPUP | WINDOW_STYLE(SS_WHITERECT.0 as u32);
+    let style = WS_POPUP | SS_WHITERECT_STYLE;
     let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
@@ -119,7 +119,6 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(hwnd)?;
     }
 
     for alpha in FLASH_ALPHAS.into_iter().skip(1) {
