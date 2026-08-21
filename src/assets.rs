@@ -12,9 +12,12 @@ impl AssetSource for Assets {
             "icons/camera.svg" => Some(include_bytes!("../assets/icons/camera.svg")),
             "icons/check.svg" => Some(include_bytes!("../assets/icons/check.svg")),
             "icons/crop.svg" => Some(include_bytes!("../assets/icons/crop.svg")),
+            "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
             "icons/lock-closed.svg" => Some(include_bytes!("../assets/icons/lock-closed.svg")),
             "icons/lock-open.svg" => Some(include_bytes!("../assets/icons/lock-open.svg")),
             "icons/more.svg" => Some(include_bytes!("../assets/icons/more.svg")),
+            "icons/power.svg" => Some(include_bytes!("../assets/icons/power.svg")),
+            "icons/refresh.svg" => Some(include_bytes!("../assets/icons/refresh.svg")),
             "icons/window.svg" => Some(include_bytes!("../assets/icons/window.svg")),
             _ => None,
         };
@@ -32,9 +35,12 @@ impl AssetSource for Assets {
             "camera.svg",
             "check.svg",
             "crop.svg",
+            "folder.svg",
             "lock-closed.svg",
             "lock-open.svg",
             "more.svg",
+            "power.svg",
+            "refresh.svg",
             "window.svg",
         ]
         .into_iter()
