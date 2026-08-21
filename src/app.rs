@@ -502,6 +502,7 @@ impl Render for Snapbar {
             );
 
         div()
+            .id("root-hover-region")
             .flex()
             .flex_col()
             .gap(px(6.0))
@@ -519,7 +520,7 @@ fn menu_action(
     icon: &'static str,
     label: &'static str,
     color: gpui::Rgba,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
