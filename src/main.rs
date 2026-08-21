@@ -11,6 +11,8 @@ mod assets;
 mod capture;
 #[cfg(target_os = "windows")]
 mod overlay;
+#[cfg(target_os = "windows")]
+mod settings;
 
 #[cfg(target_os = "windows")]
 fn main() {
