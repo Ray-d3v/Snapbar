@@ -155,18 +155,10 @@ fn detect_projection_candidate(
         }
     }
 
-    let max_row_ratio = row_counts
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or_default() as f32
-        / analysis.width as f32;
-    let max_column_ratio = column_counts
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or_default() as f32
-        / analysis.height as f32;
+    let max_row_ratio =
+        row_counts.iter().copied().max().unwrap_or_default() as f32 / analysis.width as f32;
+    let max_column_ratio =
+        column_counts.iter().copied().max().unwrap_or_default() as f32 / analysis.height as f32;
     if max_row_ratio < 0.32 || max_column_ratio < 0.32 {
         return None;
     }
@@ -347,7 +339,8 @@ fn snap_to_projected_surface(image: &RgbaImage, rect: PixelRect) -> PixelRect {
     let spans_long_axis = surface.rect.width * 100 >= rect.width * 80
         || surface.rect.height * 100 >= rect.height * 80;
 
-    if opposite_edges_aligned || (surface.confidence >= 0.91 && spans_long_axis && area_ratio <= 0.90)
+    if opposite_edges_aligned
+        || (surface.confidence >= 0.91 && spans_long_axis && area_ratio <= 0.90)
     {
         surface.rect
     } else {
@@ -658,12 +651,7 @@ fn scale_rect(
     let top = scale_floor(rect.y, target_height, source_height);
     let right = scale_ceil(rect.right(), target_width, source_width);
     let bottom = scale_ceil(rect.bottom(), target_height, source_height);
-    (right > left && bottom > top).then_some(PixelRect::new(
-        left,
-        top,
-        right - left,
-        bottom - top,
-    ))
+    (right > left && bottom > top).then_some(PixelRect::new(left, top, right - left, bottom - top))
 }
 
 fn scale_floor(value: u32, target: u32, source: u32) -> u32 {
@@ -726,7 +714,10 @@ mod tests {
         }
 
         let candidate = detect_visual_candidate(&image).expect("shared surface should be found");
-        assert!(candidate.rect.x >= 140 && candidate.rect.x <= 180, "{candidate:?}");
+        assert!(
+            candidate.rect.x >= 140 && candidate.rect.x <= 180,
+            "{candidate:?}"
+        );
         assert!(candidate.rect.right() <= 1260, "{candidate:?}");
         assert!(candidate.rect.height >= 720, "{candidate:?}");
     }

@@ -132,12 +132,7 @@ impl Snapbar {
         }
     }
 
-    fn set_menu_open(
-        &mut self,
-        open: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_menu_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu_open == open {
             return;
         }
@@ -178,12 +173,7 @@ impl Snapbar {
         }
     }
 
-    fn on_save_toggle_clicked(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_save_toggle_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let next = AppSettings {
             save_to_screenshots: !self.settings.save_to_screenshots,
         };

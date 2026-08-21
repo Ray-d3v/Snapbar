@@ -230,7 +230,12 @@ pub fn save_clipboard_image_to_screenshots() -> Result<PathBuf> {
         ColorType::Rgba8,
         ImageFormat::Png,
     )
-    .with_context(|| format!("スクリーンショットを保存できませんでした: {}", path.display()))?;
+    .with_context(|| {
+        format!(
+            "スクリーンショットを保存できませんでした: {}",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
