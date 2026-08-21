@@ -9,6 +9,8 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 - `Snapbar-Setup-x64.exe`: ユーザー単位インストーラー
 - `Snapbar-portable-x64.exe`: インストール不要の実行ファイル
 
+現在のベータは、上下・左右の参加者表示を除外する共有面検出、外枠なしピルUI、任意のPNG保存に対応しています。
+
 現在はコード署名していないため、Windows SmartScreenの警告が表示される場合があります。
 
 ## 動作方針
