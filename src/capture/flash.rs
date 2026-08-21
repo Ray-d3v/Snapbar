@@ -8,8 +8,8 @@ use windows::{
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SW_SHOWNOACTIVATE,
             SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-            SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE, WS_EX_LAYERED,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+            SetWindowPos, ShowWindow, UpdateWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
     core::w,
@@ -18,8 +18,8 @@ use windows::{
 use super::{ScreenRect, content_detector::PixelRect};
 
 const SS_WHITERECT_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0000_0006);
-const FLASH_ALPHAS: [u8; 7] = [72, 62, 50, 36, 24, 12, 0];
-const FLASH_STEP: Duration = Duration::from_millis(18);
+const FLASH_ALPHAS: [u8; 8] = [210, 210, 176, 136, 94, 56, 24, 0];
+const FLASH_STEP: Duration = Duration::from_millis(28);
 
 pub fn show_capture_flash(rect: ScreenRect) {
     if rect.width == 0 || rect.height == 0 {
@@ -119,6 +119,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(hwnd)?;
     }
 
     for alpha in FLASH_ALPHAS.into_iter().skip(1) {
