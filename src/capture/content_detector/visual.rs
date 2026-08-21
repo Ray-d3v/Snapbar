@@ -34,8 +34,10 @@ pub(super) fn detect_visual_candidate(image: &RgbaImage) -> Option<ContentCandid
         }
     }
 
-    let active = erode(
-        &dilate(&active, small_width, small_height),
+    // Opening removes isolated noise without joining a nearby participant/sidebar panel
+    // to the shared-content surface.
+    let active = dilate(
+        &erode(&active, small_width, small_height),
         small_width,
         small_height,
     );
