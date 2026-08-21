@@ -1,17 +1,18 @@
 use crate::{
     assets::Assets,
     capture::{CaptureEngine, CaptureTarget, discover_teams_targets, show_capture_flash},
+    overlay::TeamsWindowFollower,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, MouseButton, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size,
-    svg, transparent_black,
+    App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
+    transparent_black,
 };
 use gpui_platform::application;
 
-const WINDOW_WIDTH: f32 = 304.0;
-const COLLAPSED_HEIGHT: f32 = 64.0;
-const EXPANDED_HEIGHT: f32 = 138.0;
+const WINDOW_WIDTH: f32 = 248.0;
+const COLLAPSED_HEIGHT: f32 = 58.0;
+const EXPANDED_HEIGHT: f32 = 132.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -26,7 +27,7 @@ struct Snapbar {
     targets: Vec<CaptureTarget>,
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
-    position_locked: bool,
+    follower: Option<TeamsWindowFollower>,
     menu_open: bool,
     capture_state: CaptureState,
     capture_count: u64,
@@ -36,12 +37,12 @@ struct Snapbar {
 }
 
 impl Snapbar {
-    fn new() -> Self {
+    fn new(window: &Window) -> Self {
         let mut snapbar = Self {
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
-            position_locked: false,
+            follower: TeamsWindowFollower::start(window),
             menu_open: false,
             capture_state: CaptureState::NoTarget,
             capture_count: 0,
@@ -57,6 +58,12 @@ impl Snapbar {
         self.targets.get(self.selected_target)
     }
 
+    fn sync_follower(&self) {
+        if let Some(follower) = &self.follower {
+            follower.set_target(self.current_target().map(|target| target.id));
+        }
+    }
+
     fn refresh_targets(&mut self, select_next: bool) {
         let previous_id = self.current_target().map(|target| target.id);
         self.capture_generation = self.capture_generation.wrapping_add(1);
@@ -67,7 +74,8 @@ impl Snapbar {
                 self.targets.clear();
                 self.selected_target = 0;
                 self.capture_state = CaptureState::NoTarget;
-                self.last_error = Some("Teamsウィンドウを検出できません".to_string());
+                self.last_error = Some("Teams会議画面を検出できません".to_string());
+                self.sync_follower();
             }
             Ok(targets) => {
                 let previous_index = previous_id
@@ -86,6 +94,7 @@ impl Snapbar {
                 self.selected_target = 0;
                 self.capture_state = CaptureState::Error;
                 self.last_error = Some(error.to_string());
+                self.sync_follower();
             }
         }
     }
@@ -93,9 +102,10 @@ impl Snapbar {
     fn restart_capture_engine(&mut self) {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.capture_engine = None;
+        self.sync_follower();
         let Some(target_id) = self.current_target().map(|target| target.id) else {
             self.capture_state = CaptureState::NoTarget;
-            self.last_error = Some("Teamsウィンドウを検出できません".to_string());
+            self.last_error = Some("Teams会議画面を検出できません".to_string());
             return;
         };
 
@@ -122,16 +132,6 @@ impl Snapbar {
         cx.notify();
     }
 
-    fn on_crop_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.restart_capture_engine();
-        cx.notify();
-    }
-
-    fn on_lock_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.position_locked = !self.position_locked;
-        cx.notify();
-    }
-
     fn on_more_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.menu_open = !self.menu_open;
         let height = if self.menu_open {
@@ -150,6 +150,8 @@ impl Snapbar {
 
         if self.capture_engine.is_none() {
             self.refresh_targets(false);
+            cx.notify();
+            return;
         }
         let Some(engine) = self.capture_engine.clone() else {
             cx.notify();
@@ -194,13 +196,24 @@ impl Snapbar {
         .detach();
     }
 
+    fn target_label(&self) -> String {
+        if self.current_target().is_none() {
+            return "未検出".to_string();
+        }
+        if self.targets.len() <= 1 {
+            "Teams".to_string()
+        } else {
+            format!("Teams {}/{}", self.selected_target + 1, self.targets.len())
+        }
+    }
+
     fn target_summary(&self) -> String {
         if let Some(error) = &self.last_error {
             return format!("状態: {}", truncate(error, 34));
         }
 
         let Some(target) = self.current_target() else {
-            return "対象: Teamsウィンドウなし".to_string();
+            return "対象: Teams会議画面なし".to_string();
         };
         let name = if target.title.trim().is_empty() {
             &target.app_name
@@ -212,7 +225,7 @@ impl Snapbar {
             .map(|value| format!(" · {value}ms"))
             .unwrap_or_default();
         format!(
-            "対象: {} · {}枚{}",
+            "追従中: {} · {}枚{}",
             truncate(name, 24),
             self.capture_count,
             latency
@@ -223,20 +236,19 @@ impl Snapbar {
 impl Render for Snapbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_target = self.current_target().is_some();
-        let position_locked = self.position_locked;
-        let icon_color = rgb(0x8d8d93);
-        let active_icon_color = rgb(0xf1f1f3);
-        let status_color = match self.capture_state {
-            CaptureState::Idle => rgb(0x85858b),
-            CaptureState::Capturing => rgb(0xf2f2f4),
-            CaptureState::Copied => rgb(0x65c987),
-            CaptureState::NoTarget => rgb(0xd9943a),
-            CaptureState::Error => rgb(0xe0525f),
+        let icon_color = rgb(0xf1f1f3);
+        let muted_icon_color = rgb(0x9a9aa0);
+        let target_dot_color = if has_target {
+            rgb(0x55c77a)
+        } else {
+            rgb(0xd9943a)
         };
-        let shutter_icon = match self.capture_state {
-            CaptureState::Copied => "icons/check.svg",
-            CaptureState::Error => "icons/alert.svg",
-            _ => "icons/camera.svg",
+        let (capture_label, capture_icon, capture_background) = match self.capture_state {
+            CaptureState::Idle => ("スクショ", "icons/camera.svg", rgb(0xd83243)),
+            CaptureState::Capturing => ("撮影中", "icons/camera.svg", rgb(0xa92535)),
+            CaptureState::Copied => ("コピー済み", "icons/check.svg", rgb(0x267a48)),
+            CaptureState::NoTarget => ("再検出", "icons/camera.svg", rgb(0x3a3a40)),
+            CaptureState::Error => ("再試行", "icons/alert.svg", rgb(0xb52c3d)),
         };
 
         let target_button = div()
@@ -244,60 +256,45 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(34.0))
-            .rounded_full()
+            .gap(px(7.0))
+            .w(px(88.0))
+            .h(px(36.0))
+            .rounded(px(12.0))
             .cursor_pointer()
+            .bg(rgb(0x1a1a1e))
+            .text_sm()
             .text_color(if has_target {
-                active_icon_color
-            } else {
                 icon_color
+            } else {
+                muted_icon_color
             })
-            .when(has_target, |button| button.bg(rgb(0x1b1b1e)))
             .hover(|button| button.bg(rgb(0x242428)))
             .active(|button| button.opacity(0.72))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(Self::on_target_clicked))
-            .child(svg().path("icons/window.svg").size(px(18.0)));
+            .child(div().size(px(7.0)).rounded_full().bg(target_dot_color))
+            .child(self.target_label());
 
-        let crop_button = div()
-            .id("crop-button")
+        let capture_button = div()
+            .id("capture-button")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(34.0))
-            .rounded_full()
+            .gap(px(7.0))
+            .w(px(106.0))
+            .h(px(40.0))
+            .rounded(px(13.0))
             .cursor_pointer()
-            .text_color(icon_color)
-            .hover(|button| button.bg(rgb(0x242428)))
+            .bg(capture_background)
+            .text_sm()
+            .text_color(rgb(0xffffff))
+            .hover(|button| button.opacity(0.90))
             .active(|button| button.opacity(0.72))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(Self::on_crop_clicked))
-            .child(svg().path("icons/crop.svg").size(px(18.0)));
-
-        let lock_icon = if self.position_locked {
-            "icons/lock-closed.svg"
-        } else {
-            "icons/lock-open.svg"
-        };
-        let lock_button = div()
-            .id("lock-button")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(34.0))
-            .rounded_full()
-            .cursor_pointer()
-            .text_color(if self.position_locked {
-                active_icon_color
-            } else {
-                icon_color
+            .when(self.capture_state == CaptureState::Capturing, |button| {
+                button.opacity(0.76)
             })
-            .when(self.position_locked, |button| button.bg(rgb(0x1b1b1e)))
-            .hover(|button| button.bg(rgb(0x242428)))
-            .active(|button| button.opacity(0.72))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(Self::on_lock_clicked))
-            .child(svg().path(lock_icon).size(px(18.0)));
+            .on_click(cx.listener(Self::on_capture_clicked))
+            .child(svg().path(capture_icon).size(px(18.0)))
+            .child(capture_label);
 
         let more_button = div()
             .id("more-button")
@@ -305,77 +302,35 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(34.0))
-            .rounded_full()
+            .rounded(px(11.0))
             .cursor_pointer()
             .text_color(if self.menu_open {
-                active_icon_color
-            } else {
                 icon_color
+            } else {
+                muted_icon_color
             })
-            .when(self.menu_open, |button| button.bg(rgb(0x1b1b1e)))
+            .when(self.menu_open, |button| button.bg(rgb(0x1a1a1e)))
             .hover(|button| button.bg(rgb(0x242428)))
             .active(|button| button.opacity(0.72))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(Self::on_more_clicked))
             .child(svg().path("icons/more.svg").size(px(18.0)));
-
-        let status_indicator = div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(2.5))
-            .w(px(38.0))
-            .h(px(28.0))
-            .child(div().w(px(2.0)).h(px(8.0)).rounded_full().bg(status_color))
-            .child(div().w(px(2.0)).h(px(14.0)).rounded_full().bg(status_color))
-            .child(div().w(px(2.0)).h(px(19.0)).rounded_full().bg(status_color))
-            .child(div().w(px(2.0)).h(px(14.0)).rounded_full().bg(status_color))
-            .child(div().w(px(2.0)).h(px(8.0)).rounded_full().bg(status_color));
-
-        let capture_button = div()
-            .id("capture-button")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(40.0))
-            .rounded_full()
-            .cursor_pointer()
-            .bg(rgb(0xd83243))
-            .text_color(rgb(0xffffff))
-            .hover(|button| button.bg(rgb(0xe23d4f)))
-            .active(|button| button.opacity(0.72))
-            .when(self.capture_state == CaptureState::Capturing, |button| {
-                button.opacity(0.72)
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(Self::on_capture_clicked))
-            .child(svg().path(shutter_icon).size(px(19.0)));
 
         let bar = div()
             .id("snapbar")
             .flex()
             .items_center()
-            .gap(px(3.0))
+            .justify_between()
             .w_full()
-            .h(px(56.0))
-            .px(px(10.0))
-            .rounded_full()
+            .h(px(50.0))
+            .px(px(7.0))
+            .rounded(px(17.0))
             .border_1()
-            .border_color(rgb(0x27272b))
-            .bg(rgb(0x09090a))
+            .border_color(rgb(0x2d2d32))
+            .bg(rgb(0x0a0a0c))
             .shadow_lg()
-            .on_mouse_down(MouseButton::Left, move |_, window, _| {
-                if !position_locked {
-                    window.start_window_move();
-                }
-            })
             .child(target_button)
-            .child(crop_button)
-            .child(lock_button)
-            .child(more_button)
-            .child(div().mx(px(4.0)).w(px(1.0)).h(px(24.0)).bg(rgb(0x343438)))
-            .child(status_indicator)
-            .child(capture_button);
+            .child(capture_button)
+            .child(more_button);
 
         let menu = div()
             .id("more-menu")
@@ -383,12 +338,12 @@ impl Render for Snapbar {
             .flex_col()
             .gap(px(8.0))
             .w_full()
-            .h(px(66.0))
-            .px(px(12.0))
+            .h(px(68.0))
+            .px(px(10.0))
             .py(px(9.0))
             .rounded(px(14.0))
             .border_1()
-            .border_color(rgb(0x27272b))
+            .border_color(rgb(0x2d2d32))
             .bg(rgb(0x0d0d0f))
             .shadow_lg()
             .child(
@@ -408,9 +363,9 @@ impl Render for Snapbar {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(px(126.0))
-                            .h(px(26.0))
-                            .rounded(px(8.0))
+                            .w(px(106.0))
+                            .h(px(28.0))
+                            .rounded(px(9.0))
                             .cursor_pointer()
                             .bg(rgb(0x1b1b1e))
                             .text_sm()
@@ -425,9 +380,9 @@ impl Render for Snapbar {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(px(126.0))
-                            .h(px(26.0))
-                            .rounded(px(8.0))
+                            .w(px(106.0))
+                            .h(px(28.0))
+                            .rounded(px(9.0))
                             .cursor_pointer()
                             .bg(rgb(0x1b1b1e))
                             .text_sm()
@@ -465,14 +420,14 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
                 kind: WindowKind::PopUp,
-                is_movable: true,
+                is_movable: false,
                 is_resizable: false,
                 is_minimizable: false,
                 window_background: WindowBackgroundAppearance::Transparent,
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Snapbar::new()),
+            |window, cx| cx.new(|_| Snapbar::new(window)),
         )
         .expect("Snapbar window could not be created");
 
