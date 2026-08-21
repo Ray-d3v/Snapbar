@@ -12,7 +12,10 @@ use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HWND, RECT},
-    Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+    Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+        DwmSetWindowAttribute,
+    },
     UI::WindowsAndMessaging::{
         GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, SW_HIDE, SW_SHOWNOACTIVATE,
         SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
@@ -22,6 +25,7 @@ use windows::Win32::{
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(60);
 const TARGET_TOP_INSET: i32 = 12;
+const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
 
 pub struct TeamsWindowFollower {
     target_id: Arc<AtomicU32>,
@@ -32,6 +36,7 @@ pub struct TeamsWindowFollower {
 impl TeamsWindowFollower {
     pub fn start(window: &Window) -> Option<Self> {
         let overlay_hwnd = window_hwnd(window)?;
+        suppress_window_border(overlay_hwnd);
         let target_id = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_target_id = Arc::clone(&target_id);
@@ -83,6 +88,17 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
     match handle {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut c_void)),
         _ => None,
+    }
+}
+
+fn suppress_window_border(hwnd: HWND) {
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &DWMWA_COLOR_NONE as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
     }
 }
 
