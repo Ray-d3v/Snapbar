@@ -1,0 +1,72 @@
+name: Publish beta from validated artifact
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: contains(github.event.head_commit.message, '[publish-beta-from-artifact]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download validated Windows artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/installer dist/portable
+          gh run download 32434195830 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Snapbar-installer-windows-x64 \
+            --dir dist/installer
+          gh run download 32434195830 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Snapbar-windows-x64 \
+            --dir dist/portable
+          cp dist/installer/Snapbar-Setup-x64.exe dist/Snapbar-Setup-x64.exe
+          cp dist/portable/snapbar.exe dist/Snapbar-portable-x64.exe
+          sha256sum dist/Snapbar-Setup-x64.exe dist/Snapbar-portable-x64.exe > dist/Snapbar-SHA256SUMS.txt
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v0.1.0-beta.1"
+          notes=$(cat <<'EOF'
+          SnapbarのWindows 11向け初回ベータです。
+
+          - `Snapbar-Setup-x64.exe`: ユーザー単位インストーラー
+          - `Snapbar-portable-x64.exe`: インストール不要のポータブル版
+          - `Snapbar-SHA256SUMS.txt`: SHA-256チェックサム
+
+          共有コンテンツ領域を自動検出し、起動中に保持した最新フレームから1クリックでクリップボードへコピーします。成功時には撮影範囲が短く白くフラッシュします。
+
+          現在はコード署名していないため、Windows SmartScreenの警告が表示される場合があります。
+          EOF
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              dist/Snapbar-Setup-x64.exe \
+              dist/Snapbar-portable-x64.exe \
+              dist/Snapbar-SHA256SUMS.txt \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" \
+              dist/Snapbar-Setup-x64.exe#Snapbar-Setup-x64.exe \
+              dist/Snapbar-portable-x64.exe#Snapbar-portable-x64.exe \
+              dist/Snapbar-SHA256SUMS.txt#Snapbar-SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Snapbar v0.1.0-beta.1" \
+              --notes "$notes" \
+              --prerelease
+          fi
