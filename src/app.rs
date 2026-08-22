@@ -14,9 +14,9 @@ use gpui::{
 };
 use gpui_platform::application;
 
-const WINDOW_WIDTH: f32 = 202.0;
-const COLLAPSED_HEIGHT: f32 = 56.0;
-const EXPANDED_HEIGHT: f32 = 204.0;
+const WINDOW_WIDTH: f32 = 252.0;
+const COLLAPSED_HEIGHT: f32 = 66.0;
+const EXPANDED_HEIGHT: f32 = 244.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -156,12 +156,12 @@ impl Snapbar {
         cx.notify();
     }
 
-    fn on_more_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_menu_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.menu_pinned = !self.menu_pinned;
         self.set_menu_open(self.menu_pinned, window, cx);
     }
 
-    fn on_more_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_menu_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
         if *hovered {
             self.set_menu_open(true, window, cx);
         }
@@ -267,17 +267,6 @@ impl Snapbar {
         }
     }
 
-    fn status_label(&self) -> &'static str {
-        match self.capture_state {
-            CaptureState::Idle => "準備完了",
-            CaptureState::Capturing => "撮影中",
-            CaptureState::Copied if self.settings.save_to_screenshots => "コピー・保存済み",
-            CaptureState::Copied => "コピー済み",
-            CaptureState::NoTarget => "対象なし",
-            CaptureState::Error => "要確認",
-        }
-    }
-
     fn menu_summary(&self) -> String {
         if let Some(error) = &self.last_error {
             return truncate(error, 38);
@@ -285,11 +274,19 @@ impl Snapbar {
         if let Some(path) = &self.last_saved_path {
             return format!("保存: {}", truncate(path, 31));
         }
+        let state = match self.capture_state {
+            CaptureState::Idle => "準備完了",
+            CaptureState::Capturing => "撮影中",
+            CaptureState::Copied if self.settings.save_to_screenshots => "コピー・保存済み",
+            CaptureState::Copied => "コピー済み",
+            CaptureState::NoTarget => "対象なし",
+            CaptureState::Error => "要確認",
+        };
         let latency = self
             .last_latency_ms
             .map(|value| format!(" · {value}ms"))
             .unwrap_or_default();
-        format!("{}枚{latency}", self.capture_count)
+        format!("{state} · {}枚{latency}", self.capture_count)
     }
 }
 
@@ -298,12 +295,15 @@ impl Render for Snapbar {
         let has_target = self.current_target().is_some();
         let menu_open = self.menu_open;
         let save_to_screenshots = self.settings.save_to_screenshots;
-        let primary_text = rgb(0xf4f4f5);
-        let secondary_text = rgb(0x929299);
-        let target_dot = if has_target {
-            rgb(0x62d38b)
-        } else {
-            rgb(0xe0a24a)
+        let primary_text = rgb(0xf5f5f6);
+        let secondary_text = rgb(0x96969d);
+        let target_dot = match self.capture_state {
+            CaptureState::Capturing => rgb(0x72a7ff),
+            CaptureState::Copied => rgb(0x62d38b),
+            CaptureState::Error => rgb(0xf06a76),
+            CaptureState::NoTarget => rgb(0xe0a24a),
+            CaptureState::Idle if has_target => rgb(0x62d38b),
+            CaptureState::Idle => rgb(0xe0a24a),
         };
         let (capture_icon, capture_background) = match self.capture_state {
             CaptureState::Idle => ("icons/camera.svg", rgb(0xe5484d)),
@@ -317,73 +317,66 @@ impl Render for Snapbar {
             .id("target-button")
             .flex()
             .items_center()
-            .gap(px(7.0))
-            .w(px(92.0))
-            .h(px(38.0))
-            .px(px(8.0))
-            .rounded(px(12.0))
+            .gap(px(9.0))
+            .w(px(112.0))
+            .h(px(42.0))
+            .px(px(10.0))
+            .rounded(px(14.0))
             .cursor_pointer()
-            .hover(|button| button.bg(rgb(0x1a1a1d)))
+            .text_sm()
+            .text_color(if has_target {
+                primary_text
+            } else {
+                secondary_text
+            })
+            .hover(|button| button.bg(rgb(0x18181b)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_target_clicked))
-            .child(div().size(px(7.0)).rounded_full().bg(target_dot))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(primary_text)
-                            .child(self.target_label()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(secondary_text)
-                            .child(self.status_label()),
-                    ),
-            );
+            .child(div().size(px(8.0)).rounded_full().bg(target_dot))
+            .child(self.target_label());
 
         let capture_button = div()
             .id("capture-button")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(40.0))
+            .size(px(44.0))
             .rounded_full()
             .cursor_pointer()
             .bg(capture_background)
             .text_color(rgb(0xffffff))
             .shadow_sm()
-            .hover(|button| button.opacity(0.90))
+            .hover(|button| button.opacity(0.91))
             .active(|button| button.opacity(0.68))
             .when(self.capture_state == CaptureState::Capturing, |button| {
-                button.opacity(0.74)
+                button.opacity(0.76)
             })
             .on_click(cx.listener(Self::on_capture_clicked))
-            .child(svg().path(capture_icon).size(px(18.0)));
+            .child(svg().path(capture_icon).size(px(19.0)));
 
-        let more_button = div()
-            .id("more-button")
+        let menu_button = div()
+            .id("menu-button")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(32.0))
-            .rounded_full()
+            .size(px(38.0))
+            .rounded(px(13.0))
             .cursor_pointer()
+            .bg(if menu_open {
+                rgb(0x242428)
+            } else {
+                rgb(0x17171a)
+            })
             .text_color(if menu_open {
                 primary_text
             } else {
-                secondary_text
+                rgb(0xb2b2b8)
             })
-            .when(menu_open, |button| button.bg(rgb(0x1a1a1d)))
-            .hover(|button| button.bg(rgb(0x202024)).text_color(primary_text))
+            .hover(|button| button.bg(rgb(0x28282d)).text_color(primary_text))
             .active(|button| button.opacity(0.72))
-            .on_hover(cx.listener(Self::on_more_hovered))
-            .on_click(cx.listener(Self::on_more_clicked))
-            .child(svg().path("icons/more.svg").size(px(17.0)));
+            .on_hover(cx.listener(Self::on_menu_hovered))
+            .on_click(cx.listener(Self::on_menu_clicked))
+            .child(svg().path("icons/menu.svg").size(px(18.0)));
 
         let bar = div()
             .id("snapbar")
@@ -391,30 +384,30 @@ impl Render for Snapbar {
             .items_center()
             .justify_between()
             .w_full()
-            .h(px(50.0))
-            .px(px(7.0))
+            .h(px(58.0))
+            .px(px(12.0))
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_lg()
             .child(target_button)
             .child(capture_button)
-            .child(more_button);
+            .child(menu_button);
 
         let toggle = div()
             .flex()
             .items_center()
-            .w(px(34.0))
-            .h(px(20.0))
+            .w(px(38.0))
+            .h(px(22.0))
             .px(px(2.0))
             .rounded_full()
             .bg(if save_to_screenshots {
                 rgb(0x2f8f5b)
             } else {
-                rgb(0x333338)
+                rgb(0x343439)
             })
             .when(save_to_screenshots, |toggle| toggle.justify_end())
             .when(!save_to_screenshots, |toggle| toggle.justify_start())
-            .child(div().size(px(16.0)).rounded_full().bg(rgb(0xf4f4f5)));
+            .child(div().size(px(18.0)).rounded_full().bg(rgb(0xf4f4f5)));
 
         let save_row = div()
             .id("save-toggle-row")
@@ -422,29 +415,29 @@ impl Render for Snapbar {
             .items_center()
             .justify_between()
             .w_full()
-            .h(px(52.0))
-            .px(px(10.0))
-            .rounded(px(12.0))
+            .h(px(56.0))
+            .px(px(12.0))
+            .rounded(px(14.0))
             .cursor_pointer()
-            .hover(|row| row.bg(rgb(0x1a1a1d)))
+            .hover(|row| row.bg(rgb(0x1a1a1e)))
             .active(|row| row.opacity(0.76))
             .on_click(cx.listener(Self::on_save_toggle_clicked))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
+                    .gap(px(10.0))
                     .child(
                         svg()
                             .path("icons/folder.svg")
-                            .size(px(17.0))
-                            .text_color(rgb(0xc5c5ca)),
+                            .size(px(18.0))
+                            .text_color(rgb(0xc8c8cd)),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(1.0))
+                            .gap(px(2.0))
                             .child(
                                 div()
                                     .text_sm()
@@ -481,11 +474,11 @@ impl Render for Snapbar {
             .id("hover-menu")
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(6.0))
             .w_full()
-            .h(px(142.0))
-            .p(px(6.0))
-            .rounded(px(18.0))
+            .h(px(170.0))
+            .p(px(10.0))
+            .rounded(px(20.0))
             .bg(rgb(0x0d0d0f))
             .shadow_lg()
             .child(save_row)
@@ -494,10 +487,10 @@ impl Render for Snapbar {
             .child(
                 div()
                     .w_full()
-                    .px(px(10.0))
+                    .px(px(12.0))
                     .pt(px(2.0))
                     .text_xs()
-                    .text_color(rgb(0x77777e))
+                    .text_color(rgb(0x7e7e85))
                     .child(self.menu_summary()),
             );
 
@@ -505,9 +498,9 @@ impl Render for Snapbar {
             .id("root-hover-region")
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .size_full()
-            .p(px(3.0))
+            .p(px(4.0))
             .bg(transparent_black())
             .on_hover(cx.listener(Self::on_root_hovered))
             .child(bar)
@@ -525,17 +518,17 @@ fn menu_action(
         .id(id)
         .flex()
         .items_center()
-        .gap(px(9.0))
+        .gap(px(10.0))
         .w_full()
-        .h(px(32.0))
-        .px(px(10.0))
-        .rounded(px(10.0))
+        .h(px(38.0))
+        .px(px(12.0))
+        .rounded(px(12.0))
         .cursor_pointer()
         .text_sm()
         .text_color(color)
-        .hover(|row| row.bg(rgb(0x1a1a1d)))
+        .hover(|row| row.bg(rgb(0x1a1a1e)))
         .active(|row| row.opacity(0.76))
-        .child(svg().path(icon).size(px(17.0)))
+        .child(svg().path(icon).size(px(18.0)))
         .child(label)
 }
 
