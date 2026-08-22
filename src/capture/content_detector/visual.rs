@@ -182,11 +182,8 @@ fn detect_projection_candidate(
     }
 
     let smoothed_columns = smooth_counts(&column_counts, 2);
-    let max_column_ratio = smoothed_columns
-        .iter()
-        .copied()
-        .fold(0.0_f32, f32::max)
-        / analysis.height as f32;
+    let max_column_ratio =
+        smoothed_columns.iter().copied().fold(0.0_f32, f32::max) / analysis.height as f32;
     if max_column_ratio < 0.25 {
         return None;
     }
@@ -212,11 +209,7 @@ fn detect_projection_candidate(
     }
 
     let smoothed_rows = smooth_counts(&row_counts, 1);
-    let max_row_ratio = smoothed_rows
-        .iter()
-        .copied()
-        .fold(0.0_f32, f32::max)
-        / column_width as f32;
+    let max_row_ratio = smoothed_rows.iter().copied().fold(0.0_f32, f32::max) / column_width as f32;
     if max_row_ratio < 0.25 {
         return None;
     }
@@ -290,12 +283,8 @@ fn extend_bottom_over_desktop_chrome(
 
     for y in rows.end..scan_end {
         let active_ratio = row_counts[y as usize] as f32 / column_width as f32;
-        let mean_distance = analysis.mean_distance(PixelRect::new(
-            columns.start,
-            y,
-            column_width,
-            1,
-        ));
+        let mean_distance =
+            analysis.mean_distance(PixelRect::new(columns.start, y, column_width, 1));
         let structured = active_ratio >= 0.02 || mean_distance >= 10.0;
         if structured {
             last_structured = y + 1;
@@ -650,8 +639,8 @@ fn looks_like_desktop_taskbar(image: &RgbaImage, rect: PixelRect) -> bool {
         let mut x = band.x;
         while x < band.right() {
             let pixel = image.get_pixel(x, y).0;
-            let chroma = pixel[0].max(pixel[1]).max(pixel[2])
-                - pixel[0].min(pixel[1]).min(pixel[2]);
+            let chroma =
+                pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
             if color_distance(pixel, base) >= 24.0 || chroma >= 36 {
                 distinctive += 1;
             }
@@ -726,10 +715,26 @@ fn estimate_background_from_perimeter(image: &RgbaImage) -> [u8; 4] {
         sample_horizontal_edge(image, y, step, 0b0010, &mut buckets);
     }
     for x in 0..band {
-        sample_vertical_edge(image, x, band, height.saturating_sub(band), step, 0b0100, &mut buckets);
+        sample_vertical_edge(
+            image,
+            x,
+            band,
+            height.saturating_sub(band),
+            step,
+            0b0100,
+            &mut buckets,
+        );
     }
     for x in width.saturating_sub(band)..width {
-        sample_vertical_edge(image, x, band, height.saturating_sub(band), step, 0b1000, &mut buckets);
+        sample_vertical_edge(
+            image,
+            x,
+            band,
+            height.saturating_sub(band),
+            step,
+            0b1000,
+            &mut buckets,
+        );
     }
 
     choose_background_bucket(&buckets)
@@ -745,7 +750,10 @@ fn sample_horizontal_edge(
     let mut x = 0u32;
     while x < image.width() {
         let pixel = image.get_pixel(x, y).0;
-        buckets.entry(color_bucket_key(pixel)).or_default().add(pixel, side);
+        buckets
+            .entry(color_bucket_key(pixel))
+            .or_default()
+            .add(pixel, side);
         x = x.saturating_add(step);
     }
 }
@@ -762,7 +770,10 @@ fn sample_vertical_edge(
     let mut y = start;
     while y < end {
         let pixel = image.get_pixel(x, y).0;
-        buckets.entry(color_bucket_key(pixel)).or_default().add(pixel, side);
+        buckets
+            .entry(color_bucket_key(pixel))
+            .or_default()
+            .add(pixel, side);
         y = y.saturating_add(step);
     }
 }
@@ -777,14 +788,12 @@ fn choose_background_bucket(buckets: &HashMap<u16, ColorBucket>) -> [u8; 4] {
     for bucket in buckets.values() {
         let color = bucket.color();
         let luminance = luminance(color);
-        let chroma = color[0].max(color[1]).max(color[2])
-            - color[0].min(color[1]).min(color[2]);
+        let chroma = color[0].max(color[1]).max(color[2]) - color[0].min(color[1]).min(color[2]);
         let side_count = bucket.sides.count_ones();
         let enough_evidence = bucket.count.saturating_mul(20) >= total || side_count >= 2;
         if luminance <= 112.0 && chroma <= 64 && enough_evidence {
             let darkness = (112.0 - luminance) / 112.0;
-            let score = bucket.count as f32
-                * (1.0 + darkness * 0.35 + side_count as f32 * 0.05);
+            let score = bucket.count as f32 * (1.0 + darkness * 0.35 + side_count as f32 * 0.05);
             if dark_best.is_none_or(|(best_score, _)| score > best_score) {
                 dark_best = Some((score, bucket));
             }
@@ -825,9 +834,7 @@ fn estimate_region_mode(image: &RgbaImage, rect: PixelRect) -> [u8; 4] {
 }
 
 fn color_bucket_key(pixel: [u8; 4]) -> u16 {
-    (u16::from(pixel[0] >> 4) << 8)
-        | (u16::from(pixel[1] >> 4) << 4)
-        | u16::from(pixel[2] >> 4)
+    (u16::from(pixel[0] >> 4) << 8) | (u16::from(pixel[1] >> 4) << 4) | u16::from(pixel[2] >> 4)
 }
 
 fn local_edge_strength(image: &RgbaImage, x: u32, y: u32) -> f32 {
@@ -1066,10 +1073,7 @@ fn line_matches_background(
 }
 
 fn luminance(pixel: [u8; 4]) -> f32 {
-    (f32::from(pixel[0]) * 54.0
-        + f32::from(pixel[1]) * 183.0
-        + f32::from(pixel[2]) * 19.0)
-        / 256.0
+    (f32::from(pixel[0]) * 54.0 + f32::from(pixel[1]) * 183.0 + f32::from(pixel[2]) * 19.0) / 256.0
 }
 
 fn color_distance(left: [u8; 4], right: [u8; 4]) -> f32 {
@@ -1157,10 +1161,7 @@ mod tests {
             PixelRect::new(shared.x, 708, shared.width, 32),
             Rgba([35, 35, 38, 255]),
         );
-        add_taskbar_icons(
-            &mut image,
-            PixelRect::new(shared.x, 708, shared.width, 32),
-        );
+        add_taskbar_icons(&mut image, PixelRect::new(shared.x, 708, shared.width, 32));
         for row in 0..3 {
             fill_rect(
                 &mut image,
@@ -1204,7 +1205,10 @@ mod tests {
         }
 
         let candidate = detect_visual_candidate(&image).expect("shared surface should be found");
-        assert!(candidate.rect.x >= 140 && candidate.rect.x <= 180, "{candidate:?}");
+        assert!(
+            candidate.rect.x >= 140 && candidate.rect.x <= 180,
+            "{candidate:?}"
+        );
         assert!(candidate.rect.right() <= 1260, "{candidate:?}");
         assert!(candidate.rect.bottom() >= 815, "{candidate:?}");
         assert!(candidate.rect.bottom() <= 845, "{candidate:?}");
