@@ -47,10 +47,12 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 1. Windows UI Automationから、Teams内の「共有画面」「shared content」「presentation」などに対応するUI要素と画面座標を取得します。
 2. UI Automationの画面座標を、その時点の実キャプチャ画像サイズへ整数比で変換します。DPI、拡大率、負座標を含むマルチモニター、ウィンドウサイズの違いを吸収します。
 3. 「参加者」「participants」「people」「chat」「toolbar」などのUI要素は除外領域として別管理します。
-4. UI Automationが広い会議ステージしか返さない場合は、画像外周の色分布からTeams背景を推定し、共有面の行・列方向の連続密度を解析します。上側の参加者ストリップだけでなく、大きなウィンドウで右側に離れて表示される参加者列も共有面から分離します。
-5. 縮小解析で得た共有面の四辺を元解像度の境界へ再スナップし、ウィンドウサイズやモニター解像度に依存しない座標を確定します。
-6. 共有面下部にWindowsタスクバー特有の帯とアイコン構造がある場合は、その帯を共有デスクトップの一部として保持します。均一なTeams背景やレターボックスだけを除去します。
-7. 特定した領域をキャッシュし、Windows Graphics Captureから届く最新フレームを共有領域だけに切り抜いて保持します。
+4. Teamsが共有ステージと参加者・操作UIの間へ描画する、低彩度グレーの**外側・内側・外側**の3層境界を縦横に探索します。観測済みの`#727272 → #606060 → #727272`および`#A8A8A8 → #9B9B9B → #A8A8A8`をアンカーにし、完全一致ではなく色差、並び順、長さ、位置から判定します。
+5. 縦の3層境界が見つかった場合は右側または左側の参加者ペインを共有ステージから切り離し、横の境界が見つかった場合は上側の参加者ストリップやTeams操作UIを除外します。共有アプリ内部の短い罫線は、長さと位置条件を満たさないため採用しません。
+6. 共有画面が全画面でない場合は、Teams背景の既知色`#474747`と`#B2B2B2`に近い実画面上の色を推定し、共有ステージ外周から連続する均一な背景帯だけを除去します。共有アプリ内部に同系色があっても、外周から連続する行・列でなければ切り取りません。
+7. 従来の行・列方向の連続密度、UI Automationの除外領域、元解像度の境界スナップを併用して最終範囲を確定します。
+8. 共有面下部にWindowsタスクバー特有の帯とアイコン構造がある場合は、その帯を共有デスクトップの一部として保持します。Teams側の均一な背景やレターボックスだけを除去します。
+9. 特定した領域をキャッシュし、Windows Graphics Captureから届く最新フレームを共有領域だけに切り抜いて保持します。
 
 赤い撮影ボタンを押した時点では、通常はUI Automation探索やフル画像解析をやり直しません。保持済みの最新フレームをクリップボードへコピーするため、連続撮影時の待ち時間を抑えます。
 
@@ -116,8 +118,10 @@ cargo build --release
 Teams-following GPUI control bar
     └─ persistent Windows Graphics Capture session
         ├─ UI Automation semantic detection
+        ├─ Teams three-layer border detection
+        ├─ known-theme background margin trimming
         ├─ participant/chat/chrome exclusion regions
-        ├─ perimeter-background and row/column shared-surface detection
+        ├─ row/column shared-surface detection
         └─ latest cropped frame cache
             ├─ Windows clipboard
             ├─ optional Windows Screenshots PNG
