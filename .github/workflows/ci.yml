@@ -21,23 +21,20 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply separator tolerance fix and rustfmt
+      - name: Normalize separator bounds and rustfmt
         if: github.event_name == 'pull_request'
         shell: pwsh
         run: |
           git fetch origin $env:GITHUB_HEAD_REF
           git checkout -B $env:GITHUB_HEAD_REF FETCH_HEAD
-          $path = "src\capture\content_detector\teams_frame.rs"
-          $content = Get-Content -Raw $path
-          $content = $content.Replace("position, palette.outer, 18);", "position, palette.outer, 10);")
-          $content = $content.Replace("position, palette.inner, 18);", "position, palette.inner, 10);")
-          Set-Content -Path $path -Value $content -NoNewline -Encoding utf8
+          python scripts/patch_separator_bounds.py
           cargo fmt --all
+          git rm scripts/patch_separator_bounds.py
           if (git status --porcelain) {
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add --all
-            git commit -m "fix: tighten Teams separator palette matching"
+            git commit -m "fix: normalize Teams separator band bounds"
             git push origin "HEAD:$env:GITHUB_HEAD_REF"
           }
 
