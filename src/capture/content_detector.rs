@@ -1,8 +1,12 @@
+mod teams_frame;
 mod visual;
 
 use image::RgbaImage;
 
-use self::visual::{detect_visual_candidate, refine_uniform_margins};
+use self::{
+    teams_frame::{detect_teams_candidate, refine_teams_rect},
+    visual::{detect_visual_candidate, refine_uniform_margins},
+};
 
 const SEMANTIC_CONFIDENCE_THRESHOLD: f32 = 0.55;
 const VISUAL_CONFIDENCE_THRESHOLD: f32 = 0.84;
@@ -89,7 +93,13 @@ pub(crate) fn select_content_rect(
     semantic_candidates: &[ContentCandidate],
     allow_visual_fallback: bool,
 ) -> Option<PixelRect> {
-    let visual_candidate = detect_visual_candidate(image);
+    let visual_candidate = choose_visual_candidate(
+        detect_visual_candidate(image),
+        detect_teams_candidate(
+            image,
+            PixelRect::new(0, 0, image.width(), image.height()),
+        ),
+    );
     let exclusions: Vec<PixelRect> = semantic_candidates
         .iter()
         .filter(|candidate| candidate.is_exclusion)
@@ -148,14 +158,35 @@ pub(crate) fn select_content_rect(
         .and_then(|candidate| finalize_rect(image, candidate.rect, &exclusions))
 }
 
+fn choose_visual_candidate(
+    visual: Option<ContentCandidate>,
+    teams: Option<ContentCandidate>,
+) -> Option<ContentCandidate> {
+    match (visual, teams) {
+        (Some(visual), Some(teams)) => {
+            let overlap = visual.rect.overlap_over_smaller(teams.rect);
+            let teams_is_more_specific = teams.rect.area() * 100 <= visual.rect.area() * 97;
+            if teams.confidence >= visual.confidence || (overlap >= 0.72 && teams_is_more_specific) {
+                Some(teams)
+            } else {
+                Some(visual)
+            }
+        }
+        (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
 fn finalize_rect(
     image: &RgbaImage,
     rect: PixelRect,
     exclusions: &[PixelRect],
 ) -> Option<PixelRect> {
-    let refined = refine_uniform_margins(image, rect);
+    let teams_refined = refine_teams_rect(image, rect);
+    let refined = refine_uniform_margins(image, teams_refined);
     let trimmed = trim_excluded_edge_regions(refined, exclusions);
-    let refined = refine_uniform_margins(image, trimmed);
+    let teams_refined = refine_teams_rect(image, trimmed);
+    let refined = refine_uniform_margins(image, teams_refined);
     is_plausible_rect(refined, image.width(), image.height()).then_some(refined)
 }
 
