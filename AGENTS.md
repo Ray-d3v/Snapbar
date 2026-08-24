@@ -12,6 +12,9 @@
 - If shared-content detection confidence is insufficient, fail closed and leave the clipboard unchanged.
 - Shared-content detection must derive coordinates from the current window/capture geometry. Do not add fixed-resolution, fixed-monitor, or fixed-pixel crop tables.
 - Participant strips and Teams chrome must be excluded, while content that belongs to the presented desktop, including its Windows taskbar, must remain in the capture.
+- A stable UI Automation element whose accessible name identifies shared content is authoritative. Use its `BoundingRectangle` without image-based trimming.
+- Image heuristics may produce diagnostics or a future user-confirmation candidate, but must not be auto-applied when an authoritative UIA rectangle is unavailable.
+- A previously confirmed UIA rectangle may be reused only when the capture size and detected layout are unchanged.
 
 ## Architecture
 
