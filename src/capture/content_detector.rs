@@ -95,10 +95,7 @@ pub(crate) fn select_content_rect(
 ) -> Option<PixelRect> {
     let visual_candidate = choose_visual_candidate(
         detect_visual_candidate(image),
-        detect_teams_candidate(
-            image,
-            PixelRect::new(0, 0, image.width(), image.height()),
-        ),
+        detect_teams_candidate(image, PixelRect::new(0, 0, image.width(), image.height())),
     );
     let exclusions: Vec<PixelRect> = semantic_candidates
         .iter()
@@ -166,7 +163,8 @@ fn choose_visual_candidate(
         (Some(visual), Some(teams)) => {
             let overlap = visual.rect.overlap_over_smaller(teams.rect);
             let teams_is_more_specific = teams.rect.area() * 100 <= visual.rect.area() * 97;
-            if teams.confidence >= visual.confidence || (overlap >= 0.72 && teams_is_more_specific) {
+            if teams.confidence >= visual.confidence || (overlap >= 0.72 && teams_is_more_specific)
+            {
                 Some(teams)
             } else {
                 Some(visual)

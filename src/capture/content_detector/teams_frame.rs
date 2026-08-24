@@ -95,10 +95,8 @@ fn refine_with_evidence(image: &RgbaImage, rect: PixelRect) -> Option<RefinedRec
         return None;
     }
 
-    let confidence = (0.72
-        + separator_confidence * 0.17
-        + background_confidence * 0.11)
-        .clamp(0.0, 0.99);
+    let confidence =
+        (0.72 + separator_confidence * 0.17 + background_confidence * 0.11).clamp(0.0, 0.99);
     Some(RefinedRect {
         rect: surface,
         confidence,
@@ -188,11 +186,8 @@ fn detect_separator(image: &RgbaImage, rect: PixelRect, axis: Axis) -> Option<Se
                             continue;
                         }
 
-                        let first_outer = average_profile(
-                            &outer_profile,
-                            start_offset,
-                            outer_width as usize,
-                        );
+                        let first_outer =
+                            average_profile(&outer_profile, start_offset, outer_width as usize);
                         let inner = average_profile(
                             &inner_profile,
                             start_offset + outer_width as usize,
@@ -213,9 +208,8 @@ fn detect_separator(image: &RgbaImage, rect: PixelRect, axis: Axis) -> Option<Se
                         else {
                             continue;
                         };
-                        let outside_score = outside_background_ratio(
-                            image, rect, axis, start, end, side,
-                        );
+                        let outside_score =
+                            outside_background_ratio(image, rect, axis, start, end, side);
                         let continuity = (first_outer + inner + second_outer) / 3.0;
                         let shape = first_outer.min(second_outer) * 0.55 + inner * 0.45;
                         let score = (continuity * 0.54
@@ -283,9 +277,7 @@ fn band_match_ratio(
             Axis::Vertical => image.get_pixel(position, cursor).0,
         };
         samples += 1;
-        if is_neutral_gray(pixel)
-            && gray_value(pixel).abs_diff(target_gray) <= tolerance
-        {
+        if is_neutral_gray(pixel) && gray_value(pixel).abs_diff(target_gray) <= tolerance {
             matches += 1;
         }
         cursor = cursor.saturating_add(step);
@@ -349,12 +341,9 @@ fn outside_background_ratio(
         (Axis::Vertical, SeparatorSide::Left) => {
             PixelRect::new(rect.x, rect.y, start.saturating_sub(rect.x), rect.height)
         }
-        (Axis::Vertical, SeparatorSide::Right) => PixelRect::new(
-            end,
-            rect.y,
-            rect.right().saturating_sub(end),
-            rect.height,
-        ),
+        (Axis::Vertical, SeparatorSide::Right) => {
+            PixelRect::new(end, rect.y, rect.right().saturating_sub(end), rect.height)
+        }
         _ => return 0.0,
     };
     if outside.width == 0 || outside.height == 0 {
@@ -386,10 +375,7 @@ fn outside_background_ratio(
     }
 }
 
-fn trim_known_teams_background(
-    image: &RgbaImage,
-    rect: PixelRect,
-) -> (PixelRect, f32) {
+fn trim_known_teams_background(image: &RgbaImage, rect: PixelRect) -> (PixelRect, f32) {
     let Some(background) = estimate_theme_background(image, rect) else {
         return (rect, 0.0);
     };
@@ -399,20 +385,8 @@ fn trim_known_teams_background(
 
     let max_vertical = rect.height * 46 / 100;
     let max_horizontal = rect.width * 46 / 100;
-    let top_trim = background_row_run(
-        image,
-        rect,
-        background.color,
-        max_vertical,
-        true,
-    );
-    let bottom_trim = background_row_run(
-        image,
-        rect,
-        background.color,
-        max_vertical,
-        false,
-    );
+    let top_trim = background_row_run(image, rect, background.color, max_vertical, true);
+    let bottom_trim = background_row_run(image, rect, background.color, max_vertical, false);
     let vertical = PixelRect::new(
         rect.x,
         rect.y.saturating_add(top_trim),
@@ -424,20 +398,9 @@ fn trim_known_teams_background(
         return (rect, 0.0);
     }
 
-    let left_trim = background_column_run(
-        image,
-        vertical,
-        background.color,
-        max_horizontal,
-        true,
-    );
-    let right_trim = background_column_run(
-        image,
-        vertical,
-        background.color,
-        max_horizontal,
-        false,
-    );
+    let left_trim = background_column_run(image, vertical, background.color, max_horizontal, true);
+    let right_trim =
+        background_column_run(image, vertical, background.color, max_horizontal, false);
     let candidate = PixelRect::new(
         vertical.x.saturating_add(left_trim),
         vertical.y,
@@ -550,12 +513,7 @@ fn sample_theme_row(
 ) {
     let mut x = rect.x;
     while x < rect.right() {
-        add_theme_sample(
-            image.get_pixel(x, y).0,
-            dark_samples,
-            light_samples,
-            total,
-        );
+        add_theme_sample(image.get_pixel(x, y).0, dark_samples, light_samples, total);
         x = x.saturating_add(step);
     }
 }
@@ -571,12 +529,7 @@ fn sample_theme_column(
 ) {
     let mut y = rect.y;
     while y < rect.bottom() {
-        add_theme_sample(
-            image.get_pixel(x, y).0,
-            dark_samples,
-            light_samples,
-            total,
-        );
+        add_theme_sample(image.get_pixel(x, y).0, dark_samples, light_samples, total);
         y = y.saturating_add(step);
     }
 }
@@ -835,7 +788,10 @@ mod tests {
             PixelRect::new(rect.x + 1, rect.y + 35, rect.width - 2, rect.height - 76),
             Rgba([66, 66, 68, 255]),
         );
-        draw_taskbar(image, PixelRect::new(rect.x, rect.bottom() - 40, rect.width, 40));
+        draw_taskbar(
+            image,
+            PixelRect::new(rect.x, rect.bottom() - 40, rect.width, 40),
+        );
     }
 
     fn draw_light_window(image: &mut RgbaImage, rect: PixelRect) {
@@ -850,7 +806,10 @@ mod tests {
             PixelRect::new(rect.x + 1, rect.y + 37, rect.width - 2, rect.height - 82),
             Rgba([250, 250, 251, 255]),
         );
-        draw_taskbar(image, PixelRect::new(rect.x, rect.bottom() - 44, rect.width, 44));
+        draw_taskbar(
+            image,
+            PixelRect::new(rect.x, rect.bottom() - 44, rect.width, 44),
+        );
     }
 
     fn draw_taskbar(image: &mut RgbaImage, rect: PixelRect) {
