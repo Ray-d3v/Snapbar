@@ -169,8 +169,8 @@ impl WindowGeometry {
             return None;
         }
 
-        let raw_area = u64::try_from(raw_right - raw_left).ok()?
-            * u64::try_from(raw_bottom - raw_top).ok()?;
+        let raw_area =
+            u64::try_from(raw_right - raw_left).ok()? * u64::try_from(raw_bottom - raw_top).ok()?;
         let intersection_area = u64::try_from(intersection_right - intersection_left).ok()?
             * u64::try_from(intersection_bottom - intersection_top).ok()?;
         if intersection_area.saturating_mul(100) < raw_area.saturating_mul(98) {
@@ -347,7 +347,9 @@ fn authoritative_control_rank(control_type: ControlType) -> Option<u8> {
     match control_type {
         ControlType::MenuItem => Some(5),
         ControlType::Document => Some(4),
-        ControlType::Pane | ControlType::Custom | ControlType::Group | ControlType::Image => Some(3),
+        ControlType::Pane | ControlType::Custom | ControlType::Group | ControlType::Image => {
+            Some(3)
+        }
         _ => None,
     }
 }
