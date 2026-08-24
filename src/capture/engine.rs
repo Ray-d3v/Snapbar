@@ -225,7 +225,22 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         }
 
         let result = if needs_detection {
-            self.detect_and_cache(frame, now)
+            match self.detect_and_cache(frame, now) {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if can_reuse_confirmed_rect(
+                        current_rect,
+                        size_changed,
+                        dirty_layout_change,
+                    ) =>
+                {
+                    self.cache_crop(frame, current_rect.expect("checked above"), now)
+                        .with_context(|| {
+                            format!("UIA再検出後に確認済み範囲を再利用できませんでした: {error}")
+                        })
+                }
+                Err(error) => Err(error),
+            }
         } else if let Some(rect) = current_rect {
             self.cache_crop(frame, rect, now)
         } else {
@@ -272,12 +287,21 @@ impl FrameHandler {
         let image = frame_to_image(frame, &mut self.scratch)?;
         let target = find_target_window(self.shared.target_id)?;
         let geometry = WindowGeometry::from_window(&target, &image)?;
-        let semantic_candidates = detect_content_candidates(geometry).unwrap_or_default();
-        let content_rect = select_content_rect(&image, &semantic_candidates, true).ok_or_else(|| {
-            anyhow!(
-                "共有コンテンツ領域を安全に特定できなかったため、ウィンドウ全体はコピーしませんでした"
-            )
-        })?;
+        let detection = detect_content_candidates(self.shared.target_id, geometry)?;
+        let content_rect = if let Some(rect) = detection.authoritative_rect {
+            rect
+        } else {
+            let has_heuristic_candidate =
+                select_content_rect(&image, &detection.fallback_candidates, true).is_some();
+            let detail = if has_heuristic_candidate {
+                "画像推定候補はありますが、精度優先のため自動採用しません"
+            } else {
+                "共有コンテンツ候補も取得できませんでした"
+            };
+            return Err(anyhow!(
+                "Teamsの確定UIA共有要素を取得できませんでした。{detail}。メニューから対象を再検出してください"
+            ));
+        };
         let fallback_screen_rect = geometry
             .map_pixel_rect_to_screen(content_rect)
             .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
@@ -385,6 +409,14 @@ impl FrameHandler {
     }
 }
 
+fn can_reuse_confirmed_rect(
+    current_rect: Option<PixelRect>,
+    size_changed: bool,
+    dirty_layout_change: bool,
+) -> bool {
+    current_rect.is_some() && !size_changed && !dirty_layout_change
+}
+
 fn frame_to_image(frame: &mut Frame, scratch: &mut Vec<u8>) -> Result<RgbaImage> {
     let width = frame.width();
     let height = frame.height();
@@ -464,5 +496,21 @@ fn overlap_ratio(left: PixelRect, right: PixelRect) -> f64 {
         0.0
     } else {
         intersection_area as f64 / left_area as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_reuse_confirmed_rect;
+    use crate::capture::content_detector::PixelRect;
+
+    #[test]
+    fn confirmed_rect_is_reused_only_for_transient_periodic_failures() {
+        let rect = Some(PixelRect::new(12, 143, 2231, 1254));
+
+        assert!(can_reuse_confirmed_rect(rect, false, false));
+        assert!(!can_reuse_confirmed_rect(rect, true, false));
+        assert!(!can_reuse_confirmed_rect(rect, false, true));
+        assert!(!can_reuse_confirmed_rect(None, false, false));
     }
 }
