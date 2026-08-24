@@ -171,9 +171,9 @@ fn detect_separator(image: &RgbaImage, rect: PixelRect, axis: Axis) -> Option<Se
         for offset in 0..profile_length {
             let position = search_start + offset as u32;
             outer_profile[offset] =
-                band_match_ratio(image, rect, axis, position, palette.outer, 18);
+                band_match_ratio(image, rect, axis, position, palette.outer, 10);
             inner_profile[offset] =
-                band_match_ratio(image, rect, axis, position, palette.inner, 18);
+                band_match_ratio(image, rect, axis, position, palette.inner, 10);
         }
 
         for start_offset in 0..profile_length {
