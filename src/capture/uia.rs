@@ -287,7 +287,7 @@ fn scan_authoritative_rect(
         insert_or_replace_candidate(&mut candidates, candidate);
     }
 
-    select_unique_authoritative_candidate(&candidates).map(|candidate| candidate.rect)
+    Ok(select_unique_authoritative_candidate(&candidates).map(|candidate| candidate.rect))
 }
 
 fn authoritative_candidate_from_element(
