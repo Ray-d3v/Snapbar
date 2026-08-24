@@ -1,8 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use image::RgbaImage;
-use uiautomation::types::{Point, Rect as UiRect};
+use uiautomation::types::{ControlType, Handle, Point, Rect as UiRect, TreeScope};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 use xcap::Window;
 
@@ -17,6 +21,10 @@ use self::scoring::{
     candidate_key, candidate_to_content_candidate, candidate_to_exclusion_candidate, element_role,
     element_search_text, is_uia_candidate_rect,
 };
+
+const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(50);
+const STABILITY_DELAY: Duration = Duration::from_millis(35);
+const RECT_STABILITY_TOLERANCE: u32 = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WindowGeometry {
@@ -139,6 +147,38 @@ impl WindowGeometry {
             pixel_bottom - pixel_top,
         ))
     }
+
+    fn map_ui_rect_strict(self, rect: UiRect) -> Option<PixelRect> {
+        let raw_left = i64::from(rect.get_left());
+        let raw_top = i64::from(rect.get_top());
+        let raw_right = i64::from(rect.get_right());
+        let raw_bottom = i64::from(rect.get_bottom());
+        if raw_right <= raw_left || raw_bottom <= raw_top {
+            return None;
+        }
+
+        let window_left = i64::from(self.screen_left);
+        let window_top = i64::from(self.screen_top);
+        let window_right = window_left + i64::from(self.screen_width);
+        let window_bottom = window_top + i64::from(self.screen_height);
+        let intersection_left = raw_left.max(window_left);
+        let intersection_top = raw_top.max(window_top);
+        let intersection_right = raw_right.min(window_right);
+        let intersection_bottom = raw_bottom.min(window_bottom);
+        if intersection_right <= intersection_left || intersection_bottom <= intersection_top {
+            return None;
+        }
+
+        let raw_area = u64::try_from(raw_right - raw_left).ok()?
+            * u64::try_from(raw_bottom - raw_top).ok()?;
+        let intersection_area = u64::try_from(intersection_right - intersection_left).ok()?
+            * u64::try_from(intersection_bottom - intersection_top).ok()?;
+        if intersection_area.saturating_mul(100) < raw_area.saturating_mul(98) {
+            return None;
+        }
+
+        self.map_ui_rect(rect)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,14 +206,211 @@ struct UiaAccumulator {
 
 type CandidateKey = (u32, u32, u32, u32);
 
-pub(super) fn detect_content_candidates(geometry: WindowGeometry) -> Result<Vec<ContentCandidate>> {
+#[derive(Debug, Default)]
+pub(super) struct UiaDetection {
+    pub authoritative_rect: Option<PixelRect>,
+    pub fallback_candidates: Vec<ContentCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AuthoritativeCandidate {
+    rect: PixelRect,
+    rank: u8,
+}
+
+pub(super) fn detect_content_candidates(
+    target_id: u32,
+    geometry: WindowGeometry,
+) -> Result<UiaDetection> {
+    let automation = UIAutomation::new()
+        .or_else(|_| UIAutomation::new_direct())
+        .context("Windows UI Automationを初期化できませんでした")?;
+
+    let authoritative_rect = detect_authoritative_rect(&automation, target_id, geometry)?;
+    if authoritative_rect.is_some() {
+        return Ok(UiaDetection {
+            authoritative_rect,
+            fallback_candidates: Vec::new(),
+        });
+    }
+
+    Ok(UiaDetection {
+        authoritative_rect: None,
+        fallback_candidates: detect_sampled_candidates(&automation, geometry)?,
+    })
+}
+
+fn detect_authoritative_rect(
+    automation: &UIAutomation,
+    target_id: u32,
+    geometry: WindowGeometry,
+) -> Result<Option<PixelRect>> {
+    let mut first = scan_authoritative_rect(automation, target_id, geometry)?;
+    if first.is_none() {
+        let _ = automation.element_from_point(geometry.sample_point(0.50, 0.55));
+        thread::sleep(PROVIDER_WARMUP_DELAY);
+        first = scan_authoritative_rect(automation, target_id, geometry)?;
+    }
+
+    let Some(first) = first else {
+        return Ok(None);
+    };
+
+    thread::sleep(STABILITY_DELAY);
+    let Some(second) = scan_authoritative_rect(automation, target_id, geometry)? else {
+        return Ok(None);
+    };
+
+    Ok(rects_are_stable(first, second, RECT_STABILITY_TOLERANCE).then_some(second))
+}
+
+fn scan_authoritative_rect(
+    automation: &UIAutomation,
+    target_id: u32,
+    geometry: WindowGeometry,
+) -> Result<Option<PixelRect>> {
+    let root = automation
+        .element_from_handle(Handle::from(target_id as isize))
+        .context("TeamsウィンドウのUI Automationルートを取得できませんでした")?;
+    let condition = automation
+        .create_true_condition()
+        .context("UI Automationの検索条件を作成できませんでした")?;
+    let elements = root
+        .find_all(TreeScope::Subtree, &condition)
+        .context("TeamsのUI Automationツリーを走査できませんでした")?;
+
+    let mut candidates = Vec::new();
+    for element in elements {
+        let Some(candidate) = authoritative_candidate_from_element(&element, geometry) else {
+            continue;
+        };
+        insert_or_replace_candidate(&mut candidates, candidate);
+    }
+
+    select_unique_authoritative_candidate(&candidates).map(|candidate| candidate.rect)
+}
+
+fn authoritative_candidate_from_element(
+    element: &UIElement,
+    geometry: WindowGeometry,
+) -> Option<AuthoritativeCandidate> {
+    if element.is_offscreen().unwrap_or(true) {
+        return None;
+    }
+
+    let name_rank = authoritative_name_rank(&element.get_name().ok()?)?;
+    let control_rank = authoritative_control_rank(element.get_control_type().ok()?)?;
+    let rect = geometry.map_ui_rect_strict(element.get_bounding_rectangle().ok()?)?;
+    if !is_authoritative_content_rect(rect, geometry) {
+        return None;
+    }
+
+    Some(AuthoritativeCandidate {
+        rect,
+        rank: name_rank.saturating_mul(10).saturating_add(control_rank),
+    })
+}
+
+fn authoritative_name_rank(name: &str) -> Option<u8> {
+    let normalized = normalize_accessible_name(name);
+    if normalized.contains("共有") && normalized.contains("コンテンツ") {
+        return Some(4);
+    }
+    if [
+        "sharedcontent",
+        "presentedcontent",
+        "presentationcontent",
+        "sharingcontent",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+    {
+        return Some(4);
+    }
+    if normalized.contains("sharedscreen") || normalized.contains("screensharing") {
+        return Some(3);
+    }
+    None
+}
+
+fn normalize_accessible_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(character, '_' | '-' | '–' | '—' | '・' | '/' | '\\')
+        })
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn authoritative_control_rank(control_type: ControlType) -> Option<u8> {
+    match control_type {
+        ControlType::MenuItem => Some(5),
+        ControlType::Document => Some(4),
+        ControlType::Pane | ControlType::Custom | ControlType::Group | ControlType::Image => Some(3),
+        _ => None,
+    }
+}
+
+fn is_authoritative_content_rect(rect: PixelRect, geometry: WindowGeometry) -> bool {
+    if rect.width < (geometry.image_width / 5).max(96)
+        || rect.height < (geometry.image_height / 5).max(54)
+    {
+        return false;
+    }
+
+    let image_area = u64::from(geometry.image_width) * u64::from(geometry.image_height);
+    let rect_area = u64::from(rect.width) * u64::from(rect.height);
+    if image_area == 0 {
+        return false;
+    }
+    let area_ratio = rect_area as f64 / image_area as f64;
+    (0.08..=0.985).contains(&area_ratio)
+}
+
+fn insert_or_replace_candidate(
+    candidates: &mut Vec<AuthoritativeCandidate>,
+    candidate: AuthoritativeCandidate,
+) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|existing| rects_are_stable(existing.rect, candidate.rect, RECT_STABILITY_TOLERANCE))
+    {
+        if candidate.rank > existing.rank {
+            *existing = candidate;
+        }
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn select_unique_authoritative_candidate(
+    candidates: &[AuthoritativeCandidate],
+) -> Option<AuthoritativeCandidate> {
+    let best_rank = candidates.iter().map(|candidate| candidate.rank).max()?;
+    let mut best = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.rank == best_rank);
+    let selected = best.next()?;
+    best.next().is_none().then_some(selected)
+}
+
+fn rects_are_stable(left: PixelRect, right: PixelRect, tolerance: u32) -> bool {
+    left.x.abs_diff(right.x) <= tolerance
+        && left.y.abs_diff(right.y) <= tolerance
+        && left.width.abs_diff(right.width) <= tolerance.saturating_mul(2)
+        && left.height.abs_diff(right.height) <= tolerance.saturating_mul(2)
+}
+
+fn detect_sampled_candidates(
+    automation: &UIAutomation,
+    geometry: WindowGeometry,
+) -> Result<Vec<ContentCandidate>> {
     const SAMPLE_X: [f64; 7] = [0.06, 0.21, 0.36, 0.50, 0.64, 0.79, 0.94];
     const SAMPLE_Y: [f64; 7] = [0.06, 0.20, 0.35, 0.50, 0.65, 0.80, 0.94];
     const MAX_ANCESTORS: u8 = 10;
 
-    let automation = UIAutomation::new()
-        .or_else(|_| UIAutomation::new_direct())
-        .context("Windows UI Automationを初期化できませんでした")?;
     let walker = automation
         .get_raw_view_walker()
         .context("Windows UI Automationツリーを取得できませんでした")?;
@@ -275,9 +512,13 @@ fn scale_ceil(value: u64, target: u32, source: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowGeometry;
-    use crate::capture::{ScreenRect, content_detector::PixelRect};
     use uiautomation::types::Rect as UiRect;
+
+    use super::{
+        AuthoritativeCandidate, WindowGeometry, authoritative_name_rank,
+        select_unique_authoritative_candidate,
+    };
+    use crate::capture::{ScreenRect, content_detector::PixelRect};
 
     #[test]
     fn screen_coordinates_map_across_dpi_and_negative_monitor_origin() {
@@ -294,6 +535,23 @@ mod tests {
             .expect("UIA rectangle should overlap the captured window");
 
         assert_eq!(mapped, PixelRect::new(240, 135, 1800, 900));
+    }
+
+    #[test]
+    fn exact_measured_rect_maps_to_teams_relative_coordinates() {
+        let geometry = WindowGeometry {
+            screen_left: 828,
+            screen_top: -1448,
+            screen_width: 2255,
+            screen_height: 1397,
+            image_width: 2255,
+            image_height: 1397,
+        };
+        let mapped = geometry
+            .map_ui_rect_strict(UiRect::new(840, -1305, 3071, -51))
+            .expect("measured shared content should map inside Teams");
+
+        assert_eq!(mapped, PixelRect::new(12, 143, 2231, 1254));
     }
 
     #[test]
@@ -316,5 +574,46 @@ mod tests {
                 height: 600,
             })
         );
+    }
+
+    #[test]
+    fn authoritative_name_requires_strong_shared_content_semantics() {
+        assert_eq!(authoritative_name_rank("共有コンテンツ"), Some(4));
+        assert_eq!(authoritative_name_rank("共有  コンテンツ"), Some(4));
+        assert_eq!(authoritative_name_rank("Shared content"), Some(4));
+        assert_eq!(authoritative_name_rank("共有"), None);
+        assert_eq!(authoritative_name_rank("コンテンツ"), None);
+        assert_eq!(authoritative_name_rank("共有を停止"), None);
+    }
+
+    #[test]
+    fn unique_highest_rank_candidate_is_selected() {
+        let lower = AuthoritativeCandidate {
+            rect: PixelRect::new(0, 0, 900, 600),
+            rank: 43,
+        };
+        let menu_item = AuthoritativeCandidate {
+            rect: PixelRect::new(12, 143, 2231, 1254),
+            rank: 45,
+        };
+
+        assert_eq!(
+            select_unique_authoritative_candidate(&[lower, menu_item]),
+            Some(menu_item)
+        );
+    }
+
+    #[test]
+    fn ambiguous_equal_rank_candidates_fail_closed() {
+        let left = AuthoritativeCandidate {
+            rect: PixelRect::new(10, 100, 900, 600),
+            rank: 45,
+        };
+        let right = AuthoritativeCandidate {
+            rect: PixelRect::new(920, 100, 900, 600),
+            rank: 45,
+        };
+
+        assert_eq!(select_unique_authoritative_candidate(&[left, right]), None);
     }
 }
