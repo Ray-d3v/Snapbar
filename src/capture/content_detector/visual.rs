@@ -49,6 +49,21 @@ impl AnalysisFrame {
         let height = ((image.height() as f32 * scale).round() as u32).max(1);
         let small = imageops::resize(image, width, height, imageops::FilterType::Triangle);
         let background = estimate_analysis_background(&small);
+        let background_luminance = luminance(background);
+        let color_activity_threshold = if background_luminance >= 170.0 {
+            12.0
+        } else if background_luminance >= 125.0 {
+            18.0
+        } else {
+            COLOR_ACTIVITY_THRESHOLD
+        };
+        let edge_activity_threshold = if background_luminance >= 170.0 {
+            10.0
+        } else if background_luminance >= 125.0 {
+            15.0
+        } else {
+            EDGE_ACTIVITY_THRESHOLD
+        };
         let mut active = vec![false; (width * height) as usize];
         let mut distance = vec![0u8; active.len()];
 
@@ -59,8 +74,9 @@ impl AnalysisFrame {
                 let edge_strength = local_edge_strength(&small, x, y);
                 let pixel_index = index(x, y, width);
                 distance[pixel_index] = background_distance.round().clamp(0.0, 255.0) as u8;
-                active[pixel_index] = background_distance >= COLOR_ACTIVITY_THRESHOLD
-                    || (background_distance >= 8.0 && edge_strength >= EDGE_ACTIVITY_THRESHOLD);
+                active[pixel_index] = background_distance >= color_activity_threshold
+                    || (background_distance >= color_activity_threshold * 0.35
+                        && edge_strength >= edge_activity_threshold);
             }
         }
 
@@ -257,6 +273,7 @@ fn detect_projection_candidate(
         analysis.height,
     )?;
     let rect = refine_projected_edges(image, rect);
+    let rect = extend_top_over_continuous_surface_edges(image, rect);
     let confidence = 0.50
         + fill_ratio.min(1.0) * 0.20
         + rows.mean_ratio.min(1.0) * 0.10
@@ -494,6 +511,57 @@ fn snap_to_projected_surface(image: &RgbaImage, rect: PixelRect) -> PixelRect {
 
     if opposite_edges_aligned || removes_side_band || removes_top_band {
         surface.rect
+    } else {
+        rect
+    }
+}
+
+fn extend_top_over_continuous_surface_edges(image: &RgbaImage, rect: PixelRect) -> PixelRect {
+    if rect.y == 0
+        || rect.y.saturating_mul(100) > image.height().saturating_mul(30)
+        || rect.width.saturating_mul(100) < image.width().saturating_mul(35)
+    {
+        return rect;
+    }
+
+    let has_left_edge = rect.x > 0;
+    let has_right_edge = rect.right() < image.width();
+    let required_edges = u32::from(has_left_edge) + u32::from(has_right_edge);
+    if required_edges == 0 {
+        return rect;
+    }
+
+    let step = (rect.y / 180).max(1);
+    let mut continuous_edges = 0u32;
+    for boundary in [
+        has_left_edge.then_some(rect.x),
+        has_right_edge.then_some(rect.right()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut samples = 0u32;
+        let mut matches = 0u32;
+        let mut y = 0u32;
+        while y < rect.y {
+            samples += 1;
+            if color_distance(
+                image.get_pixel(boundary - 1, y).0,
+                image.get_pixel(boundary, y).0,
+            ) >= 3.0
+            {
+                matches += 1;
+            }
+            y = y.saturating_add(step);
+        }
+
+        if samples > 0 && matches.saturating_mul(100) >= samples.saturating_mul(68) {
+            continuous_edges += 1;
+        }
+    }
+
+    if continuous_edges == required_edges {
+        PixelRect::new(rect.x, 0, rect.width, rect.bottom())
     } else {
         rect
     }
@@ -813,31 +881,45 @@ fn choose_background_bucket(buckets: &HashMap<u16, ColorBucket>) -> [u8; 4] {
         return [0, 0, 0, 255];
     }
     let total: u32 = buckets.values().map(|bucket| bucket.count).sum();
-    let mut dark_best: Option<(f32, &ColorBucket)> = None;
+    let mut best: Option<(f32, &ColorBucket)> = None;
 
     for bucket in buckets.values() {
         let color = bucket.color();
-        let luminance = luminance(color);
         let chroma = color[0].max(color[1]).max(color[2]) - color[0].min(color[1]).min(color[2]);
         let side_count = bucket.sides.count_ones();
-        let enough_evidence = bucket.count.saturating_mul(20) >= total || side_count >= 2;
-        if luminance <= 112.0 && chroma <= 64 && enough_evidence {
-            let darkness = (112.0 - luminance) / 112.0;
-            let score = bucket.count as f32 * (1.0 + darkness * 0.35 + side_count as f32 * 0.05);
-            if dark_best.is_none_or(|(best_score, _)| score > best_score) {
-                dark_best = Some((score, bucket));
-            }
+        let frequency = bucket.count as f32 / total.max(1) as f32;
+        let has_horizontal_pair = bucket.sides & 0b0011 == 0b0011;
+        let has_vertical_pair = bucket.sides & 0b1100 == 0b1100;
+        let opposite_pair_bonus = match (has_horizontal_pair, has_vertical_pair) {
+            (true, true) => 0.48,
+            (true, false) | (false, true) => 0.30,
+            (false, false) => 0.0,
+        };
+        let neutrality = 1.0 - f32::from(chroma) / 255.0;
+        let luminance_extremity = ((luminance(color) - 127.5).abs() / 127.5).min(1.0);
+        let enough_evidence = frequency >= 0.012 || side_count >= 2;
+        if !enough_evidence {
+            continue;
+        }
+
+        // Teams may be dark or light. Prefer a stable, low-chroma color that occurs on
+        // multiple perimeter sides instead of assuming the meeting background is dark.
+        let score = frequency * 2.20
+            + side_count as f32 * 0.22
+            + opposite_pair_bonus
+            + neutrality * 0.18
+            + luminance_extremity * 0.08;
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, bucket));
         }
     }
 
-    dark_best
-        .map(|(_, bucket)| bucket.color())
-        .unwrap_or_else(|| {
-            buckets
-                .values()
-                .max_by_key(|bucket| bucket.count)
-                .map_or([0, 0, 0, 255], ColorBucket::color)
-        })
+    best.map(|(_, bucket)| bucket.color()).unwrap_or_else(|| {
+        buckets
+            .values()
+            .max_by_key(|bucket| bucket.count)
+            .map_or([0, 0, 0, 255], ColorBucket::color)
+    })
 }
 
 fn estimate_region_mode(image: &RgbaImage, rect: PixelRect) -> [u8; 4] {
@@ -864,7 +946,7 @@ fn estimate_region_mode(image: &RgbaImage, rect: PixelRect) -> [u8; 4] {
 }
 
 fn color_bucket_key(pixel: [u8; 4]) -> u16 {
-    (u16::from(pixel[0] >> 4) << 8) | (u16::from(pixel[1] >> 4) << 4) | u16::from(pixel[2] >> 4)
+    (u16::from(pixel[0] >> 3) << 10) | (u16::from(pixel[1] >> 3) << 5) | u16::from(pixel[2] >> 3)
 }
 
 fn local_edge_strength(image: &RgbaImage, x: u32, y: u32) -> f32 {
@@ -1242,6 +1324,58 @@ mod tests {
         assert!(candidate.rect.right() <= 1260, "{candidate:?}");
         assert!(candidate.rect.bottom() >= 815, "{candidate:?}");
         assert!(candidate.rect.bottom() <= 845, "{candidate:?}");
+    }
+
+    #[test]
+    fn light_mode_side_participant_strip_is_removed_and_taskbar_is_kept() {
+        let mut image = RgbaImage::from_pixel(1920, 900, Rgba([244, 245, 247, 255]));
+        let shared = PixelRect::new(180, 0, 1240, 900);
+        fill_rect(&mut image, shared, Rgba([252, 252, 253, 255]));
+        fill_rect(
+            &mut image,
+            PixelRect::new(shared.x, 70, shared.width, 78),
+            Rgba([234, 239, 248, 255]),
+        );
+        fill_rect(
+            &mut image,
+            PixelRect::new(shared.x, 148, shared.width, 702),
+            Rgba([15, 92, 168, 255]),
+        );
+        fill_rect(
+            &mut image,
+            PixelRect::new(shared.x, 850, shared.width, 50),
+            Rgba([238, 239, 242, 255]),
+        );
+        add_taskbar_icons(&mut image, PixelRect::new(shared.x, 850, shared.width, 50));
+
+        for row in 0..3 {
+            let tile = PixelRect::new(1450, 90 + row * 250, 430, 220);
+            fill_rect(&mut image, tile, Rgba([249, 249, 250, 255]));
+            fill_rect(
+                &mut image,
+                PixelRect::new(tile.x, tile.y, tile.width, 2),
+                Rgba([218, 219, 224, 255]),
+            );
+            fill_rect(
+                &mut image,
+                PixelRect::new(tile.x + 165, tile.y + 54, 100, 100),
+                Rgba([112 + row as u8 * 18, 145, 190, 255]),
+            );
+            fill_rect(
+                &mut image,
+                PixelRect::new(tile.x + 24, tile.bottom() - 32, 180, 10),
+                Rgba([88, 89, 94, 255]),
+            );
+        }
+
+        let detected = refine_uniform_margins(&image, PixelRect::new(0, 0, 1920, 900));
+        assert!(detected.x >= 165 && detected.x <= 195, "{detected:?}");
+        assert!(
+            detected.right() >= 1400 && detected.right() <= 1440,
+            "{detected:?}"
+        );
+        assert_eq!(detected.y, 0, "{detected:?}");
+        assert_eq!(detected.bottom(), 900, "{detected:?}");
     }
 
     #[test]

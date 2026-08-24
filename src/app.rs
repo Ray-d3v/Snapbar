@@ -14,9 +14,9 @@ use gpui::{
 };
 use gpui_platform::application;
 
-const WINDOW_WIDTH: f32 = 252.0;
-const COLLAPSED_HEIGHT: f32 = 66.0;
-const EXPANDED_HEIGHT: f32 = 244.0;
+const WINDOW_WIDTH: f32 = 286.0;
+const COLLAPSED_HEIGHT: f32 = 68.0;
+const EXPANDED_HEIGHT: f32 = 246.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -297,20 +297,17 @@ impl Render for Snapbar {
         let save_to_screenshots = self.settings.save_to_screenshots;
         let primary_text = rgb(0xf5f5f6);
         let secondary_text = rgb(0x96969d);
-        let target_dot = match self.capture_state {
-            CaptureState::Capturing => rgb(0x72a7ff),
-            CaptureState::Copied => rgb(0x62d38b),
-            CaptureState::Error => rgb(0xf06a76),
+        let target_icon_color = match self.capture_state {
+            CaptureState::Error => rgb(0xf07178),
             CaptureState::NoTarget => rgb(0xe0a24a),
-            CaptureState::Idle if has_target => rgb(0x62d38b),
-            CaptureState::Idle => rgb(0xe0a24a),
+            _ if has_target => rgb(0xd7d7dc),
+            _ => secondary_text,
         };
-        let (capture_icon, capture_background) = match self.capture_state {
-            CaptureState::Idle => ("icons/camera.svg", rgb(0xe5484d)),
-            CaptureState::Capturing => ("icons/camera.svg", rgb(0xa92f3a)),
-            CaptureState::Copied => ("icons/check.svg", rgb(0x2d8654)),
-            CaptureState::NoTarget => ("icons/camera.svg", rgb(0x34343a)),
-            CaptureState::Error => ("icons/alert.svg", rgb(0xbd3544)),
+        let capture_background = match self.capture_state {
+            CaptureState::NoTarget => rgb(0x35353a),
+            CaptureState::Capturing => rgb(0xc83f47),
+            CaptureState::Error => rgb(0xd1444c),
+            CaptureState::Idle | CaptureState::Copied => rgb(0xe5484d),
         };
 
         let target_button = div()
@@ -318,10 +315,10 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .gap(px(9.0))
-            .w(px(112.0))
-            .h(px(42.0))
-            .px(px(10.0))
-            .rounded(px(14.0))
+            .w(px(126.0))
+            .h(px(44.0))
+            .px(px(11.0))
+            .rounded(px(15.0))
             .cursor_pointer()
             .text_sm()
             .text_color(if has_target {
@@ -332,7 +329,12 @@ impl Render for Snapbar {
             .hover(|button| button.bg(rgb(0x18181b)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_target_clicked))
-            .child(div().size(px(8.0)).rounded_full().bg(target_dot))
+            .child(
+                svg()
+                    .path("icons/window.svg")
+                    .size(px(18.0))
+                    .text_color(target_icon_color),
+            )
             .child(self.target_label());
 
         let capture_button = div()
@@ -340,11 +342,10 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(44.0))
+            .size(px(46.0))
             .rounded_full()
             .cursor_pointer()
             .bg(capture_background)
-            .text_color(rgb(0xffffff))
             .shadow_sm()
             .hover(|button| button.opacity(0.91))
             .active(|button| button.opacity(0.68))
@@ -352,40 +353,50 @@ impl Render for Snapbar {
                 button.opacity(0.76)
             })
             .on_click(cx.listener(Self::on_capture_clicked))
-            .child(svg().path(capture_icon).size(px(19.0)));
+            .child(
+                svg()
+                    .path("icons/camera.svg")
+                    .size(px(20.0))
+                    .text_color(rgb(0xffffff)),
+            );
 
+        let menu_icon_color = if menu_open {
+            primary_text
+        } else {
+            rgb(0xc8c8ce)
+        };
         let menu_button = div()
             .id("menu-button")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(38.0))
-            .rounded(px(13.0))
+            .size(px(42.0))
+            .rounded(px(14.0))
             .cursor_pointer()
             .bg(if menu_open {
                 rgb(0x242428)
             } else {
                 rgb(0x17171a)
             })
-            .text_color(if menu_open {
-                primary_text
-            } else {
-                rgb(0xb2b2b8)
-            })
-            .hover(|button| button.bg(rgb(0x28282d)).text_color(primary_text))
+            .hover(|button| button.bg(rgb(0x28282d)))
             .active(|button| button.opacity(0.72))
             .on_hover(cx.listener(Self::on_menu_hovered))
             .on_click(cx.listener(Self::on_menu_clicked))
-            .child(svg().path("icons/menu.svg").size(px(18.0)));
+            .child(
+                svg()
+                    .path("icons/menu.svg")
+                    .size(px(20.0))
+                    .text_color(menu_icon_color),
+            );
 
         let bar = div()
             .id("snapbar")
             .flex()
             .items_center()
-            .justify_between()
+            .gap(px(12.0))
             .w_full()
-            .h(px(58.0))
-            .px(px(12.0))
+            .h(px(60.0))
+            .px(px(14.0))
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_lg()
