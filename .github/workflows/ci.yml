@@ -21,6 +21,21 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Apply rustfmt on the implementation branch
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          git fetch origin $env:GITHUB_HEAD_REF
+          git checkout -B $env:GITHUB_HEAD_REF FETCH_HEAD
+          cargo fmt --all
+          if (git status --porcelain) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add --all
+            git commit -m "style: apply rustfmt"
+            git push origin "HEAD:$env:GITHUB_HEAD_REF"
+          }
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
