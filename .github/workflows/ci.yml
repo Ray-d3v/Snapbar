@@ -28,6 +28,7 @@ jobs:
           git fetch origin $env:GITHUB_HEAD_REF
           git checkout -B $env:GITHUB_HEAD_REF FETCH_HEAD
           python scripts/apply_visible_icons_light_mode.py
+          python scripts/patch_light_surface_top.py
           cargo fmt --all
           if (git status --porcelain) {
             git config user.name "github-actions[bot]"
