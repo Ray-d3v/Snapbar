@@ -18,9 +18,10 @@ use gpui::{
 use gpui_platform::application;
 
 const WINDOW_WIDTH: f32 = 286.0;
-const COLLAPSED_HEIGHT: f32 = 68.0;
 const EXPANDED_HEIGHT: f32 = 246.0;
-const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+const MENU_OPEN_DELAY: Duration = Duration::from_millis(110);
+const MENU_CLOSE_DELAY: Duration = Duration::from_millis(220);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -40,9 +41,14 @@ struct Snapbar {
     meeting_monitor: MeetingMonitor,
     resident: ResidentController,
     last_monitor_generation: u64,
+    shared_content_hint: bool,
     settings: AppSettings,
     menu_open: bool,
     menu_pinned: bool,
+    menu_button_hovered: bool,
+    root_hovered: bool,
+    menu_open_generation: u64,
+    menu_close_generation: u64,
     capture_state: CaptureState,
     capture_count: u64,
     capture_generation: u64,
@@ -61,9 +67,14 @@ impl Snapbar {
             meeting_monitor: MeetingMonitor::start(),
             resident: ResidentController::start(),
             last_monitor_generation: u64::MAX,
+            shared_content_hint: false,
             settings: AppSettings::load(),
             menu_open: false,
             menu_pinned: false,
+            menu_button_hovered: false,
+            root_hovered: false,
+            menu_open_generation: 0,
+            menu_close_generation: 0,
             capture_state: CaptureState::NoTarget,
             capture_count: 0,
             capture_generation: 0,
@@ -106,18 +117,20 @@ impl Snapbar {
             cx.quit();
             return;
         }
+
+        let mut changed = false;
         if self.resident.take_rescan_requested() {
-            self.meeting_monitor.request_scan();
-            if self.current_target().is_some() {
-                self.restart_capture_engine();
-            }
+            self.request_redetection();
+            changed = true;
         }
 
         let snapshot = self.meeting_monitor.snapshot();
         if snapshot.generation != self.last_monitor_generation {
             self.apply_meeting_snapshot(snapshot);
+            changed = true;
         }
 
+        let previous_state = self.capture_state;
         match self.capture_engine.as_ref() {
             Some(engine) if engine.is_ready() => {
                 if matches!(
@@ -135,24 +148,40 @@ impl Snapbar {
             None if self.current_target().is_none() => {
                 self.capture_state = CaptureState::NoTarget;
             }
+            None if self.capture_state != CaptureState::Capturing => {
+                self.capture_state = CaptureState::WaitingForShare;
+            }
             None => {}
         }
-        cx.notify();
+        changed |= previous_state != self.capture_state;
+
+        if changed {
+            cx.notify();
+        }
     }
 
     fn apply_meeting_snapshot(&mut self, snapshot: MeetingSnapshot) {
         self.last_monitor_generation = snapshot.generation;
         let previous_id = self.current_target().map(|target| target.id);
         let next_id = snapshot.target.as_ref().map(|target| target.id);
+        let was_shared = self.shared_content_hint;
+        self.shared_content_hint = snapshot.shared_content_hint;
 
         match snapshot.target {
             Some(target) => {
                 self.targets = vec![target];
                 self.selected_target = 0;
-                if previous_id != next_id || self.capture_engine.is_none() {
-                    self.restart_capture_engine();
+                self.sync_follower();
+
+                if self.shared_content_hint {
+                    if previous_id != next_id || !was_shared || self.capture_engine.is_none() {
+                        self.restart_capture_engine();
+                    }
                 } else {
-                    self.sync_follower();
+                    self.capture_generation = self.capture_generation.wrapping_add(1);
+                    self.capture_engine = None;
+                    self.capture_state = CaptureState::WaitingForShare;
+                    self.last_error = None;
                 }
             }
             None => {
@@ -162,6 +191,7 @@ impl Snapbar {
                 self.selected_target = 0;
                 self.capture_state = CaptureState::NoTarget;
                 self.last_error = None;
+                self.shared_content_hint = false;
                 self.sync_follower();
             }
         }
@@ -176,6 +206,11 @@ impl Snapbar {
             self.last_error = None;
             return;
         };
+        if !self.shared_content_hint {
+            self.capture_state = CaptureState::WaitingForShare;
+            self.last_error = None;
+            return;
+        }
 
         match CaptureEngine::start(target_id) {
             Ok(engine) => {
@@ -192,23 +227,68 @@ impl Snapbar {
 
     fn request_redetection(&mut self) {
         self.meeting_monitor.request_scan();
-        if self.current_target().is_some() {
+        if self.current_target().is_some() && self.shared_content_hint {
             self.restart_capture_engine();
         }
     }
 
-    fn set_menu_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.menu_open == open {
             return;
         }
         self.menu_open = open;
-        let height = if open {
-            EXPANDED_HEIGHT
-        } else {
-            COLLAPSED_HEIGHT
-        };
-        window.resize(size(px(WINDOW_WIDTH), px(height)));
+        if let Some(follower) = &self.follower {
+            follower.set_menu_open(open);
+        }
         cx.notify();
+    }
+
+    fn cancel_menu_open(&mut self) {
+        self.menu_open_generation = self.menu_open_generation.wrapping_add(1);
+    }
+
+    fn cancel_menu_close(&mut self) {
+        self.menu_close_generation = self.menu_close_generation.wrapping_add(1);
+    }
+
+    fn schedule_menu_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_open || self.menu_pinned {
+            return;
+        }
+        self.cancel_menu_open();
+        let generation = self.menu_open_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(MENU_OPEN_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.menu_open_generation == generation
+                    && this.menu_button_hovered
+                    && !this.menu_pinned
+                {
+                    this.set_menu_open(true, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_menu_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_pinned || !self.menu_open {
+            return;
+        }
+        self.cancel_menu_close();
+        let generation = self.menu_close_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(MENU_CLOSE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.menu_close_generation == generation
+                    && !this.root_hovered
+                    && !this.menu_pinned
+                {
+                    this.set_menu_open(false, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn on_target_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -221,20 +301,30 @@ impl Snapbar {
         cx.notify();
     }
 
-    fn on_menu_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_menu_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_menu_open();
+        self.cancel_menu_close();
         self.menu_pinned = !self.menu_pinned;
-        self.set_menu_open(self.menu_pinned, window, cx);
+        self.set_menu_open(self.menu_pinned, cx);
     }
 
     fn on_menu_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu_button_hovered = *hovered;
         if *hovered {
-            self.set_menu_open(true, window, cx);
+            self.cancel_menu_close();
+            self.schedule_menu_open(window, cx);
+        } else {
+            self.cancel_menu_open();
         }
     }
 
     fn on_root_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !*hovered && !self.menu_pinned {
-            self.set_menu_open(false, window, cx);
+        self.root_hovered = *hovered;
+        if *hovered {
+            self.cancel_menu_close();
+        } else {
+            self.cancel_menu_open();
+            self.schedule_menu_close(window, cx);
         }
     }
 
@@ -261,7 +351,11 @@ impl Snapbar {
 
         let Some(engine) = self.capture_engine.clone() else {
             self.meeting_monitor.request_scan();
-            self.capture_state = CaptureState::NoTarget;
+            self.capture_state = if self.current_target().is_some() {
+                CaptureState::WaitingForShare
+            } else {
+                CaptureState::NoTarget
+            };
             cx.notify();
             return;
         };
@@ -597,7 +691,7 @@ impl Render for Snapbar {
             .id("root-hover-region")
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(4.0))
             .size_full()
             .p(px(4.0))
             .bg(transparent_black())
@@ -633,14 +727,7 @@ fn menu_action(
 
 pub fn run() {
     application().with_assets(Assets).run(|cx: &mut App| {
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(COLLAPSED_HEIGHT)), cx);
+        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(EXPANDED_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
