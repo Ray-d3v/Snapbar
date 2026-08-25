@@ -18,10 +18,10 @@ use windows::Win32::{
     },
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow,
-        IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
-        WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
+        SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
     },
 };
 

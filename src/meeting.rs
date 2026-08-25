@@ -9,8 +9,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use uiautomation::types::{ControlType, Handle, Point, TreeScope};
 use uiautomation::UIAutomation;
+use uiautomation::types::{ControlType, Handle, Point, TreeScope};
 use windows::Win32::{
     Foundation::{BOOL, HWND, LPARAM},
     System::Threading::GetCurrentThreadId,
@@ -119,7 +119,8 @@ impl Drop for MeetingMonitor {
         let thread_id = self.hook_thread_id.load(Ordering::Acquire);
         if thread_id != 0 {
             unsafe {
-                let _ = PostThreadMessageW(thread_id, WM_QUIT, Default::default(), Default::default());
+                let _ =
+                    PostThreadMessageW(thread_id, WM_QUIT, Default::default(), Default::default());
             }
         }
         for worker in self.workers.drain(..) {
@@ -309,7 +310,9 @@ fn run_monitor(
 
 fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
     let windows = Window::all().context("Teamsウィンドウ一覧を取得できませんでした")?;
-    let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct()).ok();
+    let automation = UIAutomation::new()
+        .or_else(|_| UIAutomation::new_direct())
+        .ok();
     let mut meetings = Vec::new();
 
     for (z_index, window) in windows.into_iter().enumerate() {
@@ -545,11 +548,7 @@ fn hwnd_from_id(target_id: u32) -> HWND {
     HWND(target_id as usize as *mut c_void)
 }
 
-fn run_win_event_hook(
-    signal: Arc<ScanSignal>,
-    stop: Arc<AtomicBool>,
-    thread_id: Arc<AtomicU32>,
-) {
+fn run_win_event_hook(signal: Arc<ScanSignal>, stop: Arc<AtomicBool>, thread_id: Arc<AtomicU32>) {
     thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
     let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
     let hooks = unsafe {
@@ -671,9 +670,11 @@ mod tests {
     fn meeting_entry_is_debounced() {
         let started = Instant::now();
         let mut state = DebouncedMeetingState::default();
-        assert!(state
-            .update(started, vec![evidence(42, true, true, false)])
-            .is_none());
+        assert!(
+            state
+                .update(started, vec![evidence(42, true, true, false)])
+                .is_none()
+        );
         let active = state.update(
             started + Duration::from_millis(700),
             vec![evidence(42, true, true, false)],

@@ -87,13 +87,15 @@ impl Snapbar {
     }
 
     fn start_resident_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| loop {
-            cx.background_executor().timer(RESIDENT_SYNC_INTERVAL).await;
-            if this
-                .update(cx, |this, cx| this.sync_resident_state(cx))
-                .is_err()
-            {
-                break;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(RESIDENT_SYNC_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| this.sync_resident_state(cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
