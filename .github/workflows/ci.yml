@@ -21,7 +21,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply Windows API fixes and rustfmt on the implementation branch
+      - name: Apply resident refactor cleanup and rustfmt
         if: github.event_name == 'pull_request'
         shell: pwsh
         run: |
@@ -32,27 +32,28 @@ jobs:
 
           meeting = Path("src/meeting.rs")
           lines = meeting.read_text(encoding="utf-8").splitlines()
-          start = lines.index("use windows::Win32::{")
-          end = lines.index("use xcap::Window;")
-          replacement = '''use windows::{
-              Win32::{
-                  Foundation::{HWND, LPARAM},
-                  System::Threading::GetCurrentThreadId,
-                  UI::{
-                      Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
-                      WindowsAndMessaging::{
-                          EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                          EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-                          WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, EnumChildWindows,
-                          GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
-                          PostThreadMessageW, WM_QUIT,
+          if "use windows::Win32::{" in lines:
+              start = lines.index("use windows::Win32::{")
+              end = lines.index("use xcap::Window;")
+              replacement = '''use windows::{
+                  Win32::{
+                      Foundation::{HWND, LPARAM},
+                      System::Threading::GetCurrentThreadId,
+                      UI::{
+                          Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+                          WindowsAndMessaging::{
+                              EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+                              EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+                              WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, EnumChildWindows,
+                              GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
+                              PostThreadMessageW, WM_QUIT,
+                          },
                       },
                   },
-              },
-              core::BOOL,
-          };'''.splitlines()
-          lines[start:end] = replacement
-          meeting.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                  core::BOOL,
+              };'''.splitlines()
+              lines[start:end] = replacement
+              meeting.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
           app = Path("src/app.rs")
           text = app.read_text(encoding="utf-8")
@@ -60,13 +61,43 @@ jobs:
           if "            Some(_) => {}\n" not in text:
               text = text.replace(marker, "            Some(_) => {}\n" + marker, 1)
           app.write_text(text, encoding="utf-8")
+
+          capture = Path("src/capture.rs")
+          text = capture.read_text(encoding="utf-8")
+          text = text.replace("use xcap::Window;\n", "")
+          start_marker = "#[derive(Debug)]\nstruct Candidate {"
+          end_marker = "pub(super) fn copy_rgba_to_clipboard"
+          if start_marker in text:
+              start = text.index(start_marker)
+              end = text.index(end_marker)
+              text = text[:start] + text[end:]
+          tests_marker = "#[cfg(test)]\nmod tests {"
+          if tests_marker in text:
+              text = text[:text.index(tests_marker)] + '''#[cfg(test)]
+          mod tests {
+              use std::path::Path;
+
+              use super::next_screenshot_path;
+
+              #[test]
+              fn screenshot_path_uses_png_extension() {
+                  assert_eq!(
+                      next_screenshot_path(Path::new("C:/Screenshots"))
+                          .extension()
+                          .and_then(|value| value.to_str()),
+                      Some("png")
+                  );
+              }
+          }
+          '''
+          capture.write_text(text, encoding="utf-8")
           '@ | python -
           cargo fmt --all
           if (git status --porcelain) {
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add --all
-            git commit -m "fix: align resident monitor with windows-rs APIs"
+            git commit -m "refactor: remove obsolete Teams target discovery"
             git push origin "HEAD:$env:GITHUB_HEAD_REF"
           }
 
