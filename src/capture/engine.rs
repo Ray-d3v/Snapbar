@@ -1,12 +1,13 @@
 use std::{
     ffi::c_void,
-    sync::{Arc, Condvar, Mutex},
-    thread,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use image::{RgbaImage, imageops};
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame::{DirtyRegion, Frame},
@@ -21,15 +22,16 @@ use xcap::Window;
 
 use super::{
     CaptureReceipt, ScreenRect,
-    content_detector::{PixelRect, select_content_rect},
+    content_detector::PixelRect,
     copy_rgba_to_clipboard,
     flash::current_screen_rect,
-    uia::{WindowGeometry, detect_content_candidates},
+    uia::{WindowGeometry, detect_content_rect},
 };
 
-const FRAME_CACHE_INTERVAL: Duration = Duration::from_millis(50);
+const BACKUP_CACHE_INTERVAL: Duration = Duration::from_millis(750);
+const FRESH_FRAME_WAIT: Duration = Duration::from_millis(45);
 const DETECTION_RETRY_INTERVAL: Duration = Duration::from_millis(750);
-const FULL_REDETECTION_INTERVAL: Duration = Duration::from_secs(3);
+const FULL_REDETECTION_INTERVAL: Duration = Duration::from_secs(8);
 const READY_TIMEOUT: Duration = Duration::from_millis(1_200);
 
 #[derive(Clone)]
@@ -50,17 +52,14 @@ impl Drop for EngineInner {
             .ok()
             .and_then(|mut control| control.take());
         if let Some(control) = control {
-            let _ = thread::Builder::new()
-                .name("snapbar-capture-stop".to_string())
-                .spawn(move || {
-                    let _ = control.stop();
-                });
+            let _ = control.stop();
         }
     }
 }
 
 pub(super) struct SharedState {
     target_id: u32,
+    capture_requested: AtomicBool,
     state: Mutex<RuntimeState>,
     ready: Condvar,
 }
@@ -70,13 +69,13 @@ struct RuntimeState {
     latest: Option<CachedFrame>,
     content_rect: Option<PixelRect>,
     last_error: Option<String>,
+    frame_sequence: u64,
 }
 
-#[derive(Clone)]
 struct CachedFrame {
     width: u32,
     height: u32,
-    bytes: Arc<Vec<u8>>,
+    bytes: Vec<u8>,
     captured_at: Instant,
     content_rect: PixelRect,
     fallback_screen_rect: ScreenRect,
@@ -89,13 +88,13 @@ pub(super) struct FrameHandler {
     last_cache_update: Option<Instant>,
     last_detection: Option<Instant>,
     last_source_size: Option<(u32, u32)>,
-    scratch: Vec<u8>,
 }
 
 impl CaptureEngine {
     pub fn start(target_id: u32) -> Result<Self> {
         let shared = Arc::new(SharedState {
             target_id,
+            capture_requested: AtomicBool::new(false),
             state: Mutex::new(RuntimeState::default()),
             ready: Condvar::new(),
         });
@@ -132,26 +131,24 @@ impl CaptureEngine {
 
     pub fn copy_latest_to_clipboard(&self) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
-        let cached = self.wait_for_cached_frame()?;
-        copy_rgba_to_clipboard(cached.width, cached.height, cached.bytes.as_slice())?;
+        let (baseline_sequence, had_frame) = self
+            .inner
+            .shared
+            .state
+            .lock()
+            .map(|state| (state.frame_sequence, state.latest.is_some()))
+            .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
+        self.inner
+            .shared
+            .capture_requested
+            .store(true, Ordering::Release);
 
-        let screen_rect = current_screen_rect(
-            self.inner.shared.target_id,
-            cached.content_rect,
-            cached.source_width,
-            cached.source_height,
-        )
-        .unwrap_or(cached.fallback_screen_rect);
-
-        Ok(CaptureReceipt {
-            screen_rect,
-            latency: started_at.elapsed(),
-            frame_age: cached.captured_at.elapsed(),
-        })
-    }
-
-    fn wait_for_cached_frame(&self) -> Result<CachedFrame> {
-        let deadline = Instant::now() + READY_TIMEOUT;
+        let timeout = if had_frame {
+            FRESH_FRAME_WAIT
+        } else {
+            READY_TIMEOUT
+        };
+        let deadline = Instant::now() + timeout;
         let mut state = self
             .inner
             .shared
@@ -160,33 +157,60 @@ impl CaptureEngine {
             .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
 
         loop {
-            if let Some(frame) = state.latest.clone() {
-                return Ok(frame);
-            }
-            if let Some(error) = state.last_error.clone() {
-                return Err(anyhow!(error));
+            let has_fresh_frame = state.frame_sequence > baseline_sequence;
+            if state.latest.is_some() && (has_fresh_frame || !had_frame) {
+                break;
             }
 
             let now = Instant::now();
             if now >= deadline {
-                return Err(anyhow!(
-                    "共有コンテンツを準備中です。少し待ってからもう一度撮影してください"
-                ));
+                break;
             }
-            let timeout = deadline.saturating_duration_since(now);
+            let wait_for = deadline.saturating_duration_since(now);
             let (next_state, wait_result) = self
                 .inner
                 .shared
                 .ready
-                .wait_timeout(state, timeout)
+                .wait_timeout(state, wait_for)
                 .map_err(|_| anyhow!("キャプチャ状態の待機に失敗しました"))?;
             state = next_state;
-            if wait_result.timed_out() && state.latest.is_none() {
-                return Err(anyhow!(
-                    "共有コンテンツを準備中です。少し待ってからもう一度撮影してください"
-                ));
+            if wait_result.timed_out() {
+                break;
             }
         }
+
+        self.inner
+            .shared
+            .capture_requested
+            .store(false, Ordering::Release);
+
+        let cached = state.latest.as_ref().ok_or_else(|| {
+            state.last_error.clone().map_or_else(
+                || anyhow!("共有コンテンツを準備中です。少し待ってからもう一度撮影してください"),
+                |message| anyhow!(message),
+            )
+        })?;
+        copy_rgba_to_clipboard(cached.width, cached.height, cached.bytes.as_slice())?;
+        let content_rect = cached.content_rect;
+        let source_width = cached.source_width;
+        let source_height = cached.source_height;
+        let fallback_screen_rect = cached.fallback_screen_rect;
+        let frame_age = cached.captured_at.elapsed();
+        drop(state);
+
+        let screen_rect = current_screen_rect(
+            self.inner.shared.target_id,
+            content_rect,
+            source_width,
+            source_height,
+        )
+        .unwrap_or(fallback_screen_rect);
+
+        Ok(CaptureReceipt {
+            screen_rect,
+            latency: started_at.elapsed(),
+            frame_age,
+        })
     }
 }
 
@@ -200,7 +224,6 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             last_cache_update: None,
             last_detection: None,
             last_source_size: None,
-            scratch: Vec::new(),
         })
     }
 
@@ -211,34 +234,46 @@ impl GraphicsCaptureApiHandler for FrameHandler {
     ) -> std::result::Result<(), Self::Error> {
         let now = Instant::now();
         let source_size = (frame.width(), frame.height());
-        let current_rect = self
+        let requested = self
+            .shared
+            .capture_requested
+            .swap(false, Ordering::AcqRel);
+        let (current_rect, has_latest) = self
             .shared
             .state
             .lock()
-            .ok()
-            .and_then(|state| state.content_rect);
+            .map(|state| (state.content_rect, state.latest.is_some()))
+            .unwrap_or((None, false));
         let size_changed = self.last_source_size != Some(source_size);
+        if size_changed {
+            self.last_source_size = Some(source_size);
+        }
         let periodic_redetect = current_rect.is_some()
             && self
                 .last_detection
                 .is_none_or(|last| now.duration_since(last) >= FULL_REDETECTION_INTERVAL);
         let missing_rect_retry = current_rect.is_none()
-            && self
-                .last_detection
-                .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL);
-        let dirty_layout_change =
-            current_rect.is_some_and(|rect| dirty_regions_suggest_layout_change(frame, rect));
+            && (requested
+                || self
+                    .last_detection
+                    .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL));
+        let dirty_layout_change = current_rect.is_some_and(|rect| {
+            self.last_detection
+                .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL)
+                && dirty_regions_suggest_layout_change(frame, rect)
+        });
         let needs_detection =
             size_changed || periodic_redetect || missing_rect_retry || dirty_layout_change;
+        let needs_cache = requested
+            || !has_latest
+            || self
+                .last_cache_update
+                .is_none_or(|last| now.duration_since(last) >= BACKUP_CACHE_INTERVAL);
 
         if current_rect.is_none() && !needs_detection {
             return Ok(());
         }
-        if !needs_detection
-            && self
-                .last_cache_update
-                .is_some_and(|last| now.duration_since(last) < FRAME_CACHE_INTERVAL)
-        {
+        if !needs_detection && !needs_cache {
             return Ok(());
         }
 
@@ -253,7 +288,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
                         dirty_layout_change,
                     ) =>
                 {
-                    self.cache_crop(frame, current_rect.expect("checked above"), now)
+                    self.cache_crop(frame, current_rect.expect("checked above"), now, None)
                         .with_context(|| {
                             format!("UIA再検出後に確認済み範囲を再利用できませんでした: {error}")
                         })
@@ -261,7 +296,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
                 Err(error) => Err(error),
             }
         } else if let Some(rect) = current_rect {
-            self.cache_crop(frame, rect, now)
+            self.cache_crop(frame, rect, now, None)
         } else {
             Err(anyhow!("共有コンテンツ領域がまだ特定されていません"))
         };
@@ -269,7 +304,6 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         match result {
             Ok(()) => {
                 self.last_cache_update = Some(now);
-                self.last_source_size = Some(source_size);
             }
             Err(error) => {
                 let message = error.to_string();
@@ -300,42 +334,24 @@ impl GraphicsCaptureApiHandler for FrameHandler {
 
 impl FrameHandler {
     fn detect_and_cache(&mut self, frame: &mut Frame, captured_at: Instant) -> Result<()> {
-        let image = frame_to_image(frame, &mut self.scratch)?;
+        let source_width = frame.width();
+        let source_height = frame.height();
         let target = find_target_window(self.shared.target_id)?;
-        let geometry = WindowGeometry::from_window(&target, &image)?;
-        let detection = detect_content_candidates(self.shared.target_id, geometry)?;
-        let content_rect = if let Some(rect) = detection.authoritative_rect {
-            rect
-        } else {
-            let has_heuristic_candidate =
-                select_content_rect(&image, &detection.fallback_candidates, true).is_some();
-            let detail = if has_heuristic_candidate {
-                "画像推定候補はありますが、精度優先のため自動採用しません"
-            } else {
-                "共有コンテンツ候補も取得できませんでした"
-            };
-            return Err(anyhow!(
-                "Teamsの確定UIA共有要素を取得できませんでした。{detail}。メニューから対象を再検出してください"
-            ));
-        };
+        let geometry =
+            WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
+        let content_rect = detect_content_rect(self.shared.target_id, geometry)?.ok_or_else(|| {
+            anyhow!(
+                "Teamsの確定UIA共有要素を取得できませんでした。精度優先のため画像推定は自動採用しません。メニューから会議・共有を再検出してください"
+            )
+        })?;
         let fallback_screen_rect = geometry
             .map_pixel_rect_to_screen(content_rect)
             .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
-        let cropped = imageops::crop_imm(
-            &image,
-            content_rect.x,
-            content_rect.y,
-            content_rect.width,
-            content_rect.height,
-        )
-        .to_image();
-        self.publish_frame(
+        self.cache_crop(
+            frame,
             content_rect,
-            fallback_screen_rect,
-            image.width(),
-            image.height(),
-            cropped.into_raw(),
             captured_at,
+            Some(fallback_screen_rect),
         )
     }
 
@@ -344,6 +360,7 @@ impl FrameHandler {
         frame: &mut Frame,
         content_rect: PixelRect,
         captured_at: Instant,
+        known_screen_rect: Option<ScreenRect>,
     ) -> Result<()> {
         let source_width = frame.width();
         let source_height = frame.height();
@@ -353,22 +370,26 @@ impl FrameHandler {
             return Err(anyhow!("Teamsのレイアウト変更を検出しました"));
         }
 
-        let fallback_screen_rect = current_screen_rect(
-            self.shared.target_id,
-            content_rect,
-            source_width,
-            source_height,
-        )
-        .or_else(|| {
-            self.shared.state.lock().ok().and_then(|state| {
-                state
-                    .latest
-                    .as_ref()
-                    .map(|frame| frame.fallback_screen_rect)
+        let fallback_screen_rect = known_screen_rect
+            .or_else(|| {
+                current_screen_rect(
+                    self.shared.target_id,
+                    content_rect,
+                    source_width,
+                    source_height,
+                )
             })
-        })
-        .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
-        let buffer = frame
+            .or_else(|| {
+                self.shared.state.lock().ok().and_then(|state| {
+                    state
+                        .latest
+                        .as_ref()
+                        .map(|frame| frame.fallback_screen_rect)
+                })
+            })
+            .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
+
+        let mut buffer = frame
             .buffer_crop(
                 content_rect.x,
                 content_rect.y,
@@ -376,49 +397,55 @@ impl FrameHandler {
                 content_rect.y + content_rect.height,
             )
             .context("最新の共有画面フレームを取得できませんでした")?;
-        let bytes = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
-        self.publish_frame(
-            content_rect,
-            fallback_screen_rect,
-            source_width,
-            source_height,
-            bytes,
-            captured_at,
-        )
-    }
-
-    fn publish_frame(
-        &self,
-        content_rect: PixelRect,
-        fallback_screen_rect: ScreenRect,
-        source_width: u32,
-        source_height: u32,
-        bytes: Vec<u8>,
-        captured_at: Instant,
-    ) -> Result<()> {
-        let expected_len = content_rect.width as usize * content_rect.height as usize * 4;
-        if bytes.len() != expected_len {
+        let row_pitch = buffer.row_pitch() as usize;
+        let row_bytes = content_rect.width as usize * 4;
+        let expected_len = row_bytes * content_rect.height as usize;
+        let raw = buffer.as_raw_buffer();
+        let required_raw_len = row_pitch
+            .saturating_mul(content_rect.height.saturating_sub(1) as usize)
+            .saturating_add(row_bytes);
+        if raw.len() < required_raw_len {
             return Err(anyhow!("共有画面フレームのバッファサイズが不正です"));
         }
 
-        let cached = CachedFrame {
-            width: content_rect.width,
-            height: content_rect.height,
-            bytes: Arc::new(bytes),
-            captured_at,
-            content_rect,
-            fallback_screen_rect,
-            source_width,
-            source_height,
-        };
         let mut state = self
             .shared
             .state
             .lock()
             .map_err(|_| anyhow!("キャプチャ状態を更新できませんでした"))?;
-        state.latest = Some(cached);
+        let mut bytes = state
+            .latest
+            .take()
+            .map(|frame| frame.bytes)
+            .unwrap_or_default();
+        if bytes.capacity() > expected_len.saturating_mul(2) {
+            bytes = Vec::with_capacity(expected_len);
+        }
+        bytes.resize(expected_len, 0);
+        if row_pitch == row_bytes {
+            bytes.copy_from_slice(&raw[..expected_len]);
+        } else {
+            for row in 0..content_rect.height as usize {
+                let source_start = row * row_pitch;
+                let target_start = row * row_bytes;
+                bytes[target_start..target_start + row_bytes]
+                    .copy_from_slice(&raw[source_start..source_start + row_bytes]);
+            }
+        }
+
+        state.latest = Some(CachedFrame {
+            width: content_rect.width,
+            height: content_rect.height,
+            bytes,
+            captured_at,
+            content_rect,
+            fallback_screen_rect,
+            source_width,
+            source_height,
+        });
         state.content_rect = Some(content_rect);
         state.last_error = None;
+        state.frame_sequence = state.frame_sequence.wrapping_add(1);
         drop(state);
         self.shared.ready.notify_all();
         Ok(())
@@ -433,17 +460,6 @@ fn can_reuse_confirmed_rect(
     current_rect.is_some() && !size_changed && !dirty_layout_change
 }
 
-fn frame_to_image(frame: &mut Frame, scratch: &mut Vec<u8>) -> Result<RgbaImage> {
-    let width = frame.width();
-    let height = frame.height();
-    let buffer = frame
-        .buffer()
-        .context("Teamsウィンドウの最新フレームを取得できませんでした")?;
-    let bytes = buffer.as_nopadding_buffer(scratch).to_vec();
-    RgbaImage::from_raw(width, height, bytes)
-        .ok_or_else(|| anyhow!("Teamsウィンドウの画像バッファを構築できませんでした"))
-}
-
 fn find_target_window(target_id: u32) -> Result<Window> {
     Window::all()
         .context("ウィンドウ一覧を再取得できませんでした")?
@@ -456,21 +472,39 @@ fn dirty_regions_suggest_layout_change(frame: &Frame, content_rect: PixelRect) -
     let Ok(regions) = frame.dirty_regions() else {
         return false;
     };
-    let frame_area = u64::from(frame.width()) * u64::from(frame.height());
+    let frame_width = frame.width();
+    let frame_height = frame.height();
+    let frame_area = u64::from(frame_width) * u64::from(frame_height);
     if frame_area == 0 {
         return false;
     }
 
     regions.iter().any(|region| {
-        let Some(region_rect) = dirty_region_to_rect(region, frame.width(), frame.height()) else {
+        let Some(region_rect) = dirty_region_to_rect(region, frame_width, frame_height) else {
             return false;
         };
         let region_area = u64::from(region_rect.width) * u64::from(region_rect.height);
         let area_ratio = region_area as f64 / frame_area as f64;
-        if !(0.02..=0.35).contains(&area_ratio) {
+        if !(0.01..=0.45).contains(&area_ratio) {
             return false;
         }
-        overlap_ratio(region_rect, content_rect) < 0.35
+        if overlap_ratio(region_rect, content_rect) >= 0.35 {
+            return false;
+        }
+
+        let region_right = region_rect.x.saturating_add(region_rect.width);
+        let region_bottom = region_rect.y.saturating_add(region_rect.height);
+        let content_right = content_rect.x.saturating_add(content_rect.width);
+        let content_bottom = content_rect.y.saturating_add(content_rect.height);
+        let boundary_tolerance = 32;
+        let near_vertical_boundary = region_rect.x.abs_diff(content_right) <= boundary_tolerance
+            || region_right.abs_diff(content_rect.x) <= boundary_tolerance;
+        let near_horizontal_boundary = region_rect.y.abs_diff(content_bottom) <= boundary_tolerance
+            || region_bottom.abs_diff(content_rect.y) <= boundary_tolerance;
+        let tall_band = region_rect.height.saturating_mul(100) >= frame_height.saturating_mul(55);
+        let wide_band = region_rect.width.saturating_mul(100) >= frame_width.saturating_mul(55);
+
+        (near_vertical_boundary && tall_band) || (near_horizontal_boundary && wide_band)
     })
 }
 
