@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: snapbar-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -53,7 +57,7 @@ jobs:
           }
           "ISCC=$iscc" >> $env:GITHUB_ENV
 
-      - name: Build Windows installer
+      - name: Build Windows installer and portable package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -65,12 +69,13 @@ jobs:
           if (-not (Test-Path "dist\Snapbar-Setup-x64.exe")) {
             throw "Installer was not generated."
           }
+          Copy-Item "target\release\snapbar.exe" "dist\Snapbar-portable-x64.exe" -Force
 
       - name: Upload portable executable
         uses: actions/upload-artifact@v4
         with:
           name: Snapbar-windows-x64
-          path: target/release/snapbar.exe
+          path: dist/Snapbar-portable-x64.exe
           if-no-files-found: error
 
       - name: Upload Windows installer
@@ -96,8 +101,8 @@ jobs:
           現在はコード署名していないため、Windows SmartScreenの警告が表示される場合があります。
           "@
           gh release create $tag `
-            "dist/Snapbar-Setup-x64.exe#Snapbar-Setup-x64.exe" `
-            "target/release/snapbar.exe#Snapbar-portable-x64.exe" `
+            "dist/Snapbar-Setup-x64.exe" `
+            "dist/Snapbar-portable-x64.exe" `
             --target $env:GITHUB_SHA `
             --title "Snapbar $tag" `
             --notes $notes `
