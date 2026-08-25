@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: snapbar-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -20,86 +24,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Apply resident refactor cleanup and rustfmt
-        if: github.event_name == 'pull_request'
-        shell: pwsh
-        run: |
-          git fetch origin $env:GITHUB_HEAD_REF
-          git checkout -B $env:GITHUB_HEAD_REF FETCH_HEAD
-          @'
-          from pathlib import Path
-
-          meeting = Path("src/meeting.rs")
-          lines = meeting.read_text(encoding="utf-8").splitlines()
-          if "use windows::Win32::{" in lines:
-              start = lines.index("use windows::Win32::{")
-              end = lines.index("use xcap::Window;")
-              replacement = '''use windows::{
-                  Win32::{
-                      Foundation::{HWND, LPARAM},
-                      System::Threading::GetCurrentThreadId,
-                      UI::{
-                          Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
-                          WindowsAndMessaging::{
-                              EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                              EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-                              WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, EnumChildWindows,
-                              GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
-                              PostThreadMessageW, WM_QUIT,
-                          },
-                      },
-                  },
-                  core::BOOL,
-              };'''.splitlines()
-              lines[start:end] = replacement
-              meeting.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-          app = Path("src/app.rs")
-          text = app.read_text(encoding="utf-8")
-          marker = "            None if self.current_target().is_none() => {"
-          if "            Some(_) => {}\n" not in text:
-              text = text.replace(marker, "            Some(_) => {}\n" + marker, 1)
-          app.write_text(text, encoding="utf-8")
-
-          capture = Path("src/capture.rs")
-          text = capture.read_text(encoding="utf-8")
-          text = text.replace("use xcap::Window;\n", "")
-          start_marker = "#[derive(Debug)]\nstruct Candidate {"
-          end_marker = "pub(super) fn copy_rgba_to_clipboard"
-          if start_marker in text:
-              start = text.index(start_marker)
-              end = text.index(end_marker)
-              text = text[:start] + text[end:]
-          tests_marker = "#[cfg(test)]\nmod tests {"
-          if tests_marker in text:
-              text = text[:text.index(tests_marker)] + '''#[cfg(test)]
-          mod tests {
-              use std::path::Path;
-
-              use super::next_screenshot_path;
-
-              #[test]
-              fn screenshot_path_uses_png_extension() {
-                  assert_eq!(
-                      next_screenshot_path(Path::new("C:/Screenshots"))
-                          .extension()
-                          .and_then(|value| value.to_str()),
-                      Some("png")
-                  );
-              }
-          }
-          '''
-          capture.write_text(text, encoding="utf-8")
-          '@ | python -
-          cargo fmt --all
-          if (git status --porcelain) {
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add --all
-            git commit -m "refactor: remove obsolete Teams target discovery"
-            git push origin "HEAD:$env:GITHUB_HEAD_REF"
-          }
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -133,7 +57,7 @@ jobs:
           }
           "ISCC=$iscc" >> $env:GITHUB_ENV
 
-      - name: Build Windows installer
+      - name: Build Windows installer and portable package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -145,12 +69,13 @@ jobs:
           if (-not (Test-Path "dist\Snapbar-Setup-x64.exe")) {
             throw "Installer was not generated."
           }
+          Copy-Item "target\release\snapbar.exe" "dist\Snapbar-portable-x64.exe" -Force
 
       - name: Upload portable executable
         uses: actions/upload-artifact@v4
         with:
           name: Snapbar-windows-x64
-          path: target/release/snapbar.exe
+          path: dist/Snapbar-portable-x64.exe
           if-no-files-found: error
 
       - name: Upload Windows installer
@@ -176,8 +101,8 @@ jobs:
           現在はコード署名していないため、Windows SmartScreenの警告が表示される場合があります。
           "@
           gh release create $tag `
-            "dist/Snapbar-Setup-x64.exe#Snapbar-Setup-x64.exe" `
-            "target/release/snapbar.exe#Snapbar-portable-x64.exe" `
+            "dist/Snapbar-Setup-x64.exe" `
+            "dist/Snapbar-portable-x64.exe" `
             --target $env:GITHUB_SHA `
             --title "Snapbar $tag" `
             --notes $notes `
