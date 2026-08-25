@@ -21,18 +21,52 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply rustfmt on the implementation branch
+      - name: Apply Windows API fixes and rustfmt on the implementation branch
         if: github.event_name == 'pull_request'
         shell: pwsh
         run: |
           git fetch origin $env:GITHUB_HEAD_REF
           git checkout -B $env:GITHUB_HEAD_REF FETCH_HEAD
+          @'
+          from pathlib import Path
+
+          meeting = Path("src/meeting.rs")
+          lines = meeting.read_text(encoding="utf-8").splitlines()
+          start = lines.index("use windows::Win32::{")
+          end = lines.index("use xcap::Window;")
+          replacement = '''use windows::{
+              Win32::{
+                  Foundation::{HWND, LPARAM},
+                  System::Threading::GetCurrentThreadId,
+                  UI::{
+                      Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+                      WindowsAndMessaging::{
+                          EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+                          EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+                          WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, EnumChildWindows,
+                          GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
+                          PostThreadMessageW, WM_QUIT,
+                      },
+                  },
+              },
+              core::BOOL,
+          };'''.splitlines()
+          lines[start:end] = replacement
+          meeting.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          app = Path("src/app.rs")
+          text = app.read_text(encoding="utf-8")
+          marker = "            None if self.current_target().is_none() => {"
+          if "            Some(_) => {}\n" not in text:
+              text = text.replace(marker, "            Some(_) => {}\n" + marker, 1)
+          app.write_text(text, encoding="utf-8")
+          '@ | python -
           cargo fmt --all
           if (git status --porcelain) {
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add --all
-            git commit -m "style: apply rustfmt"
+            git commit -m "fix: align resident monitor with windows-rs APIs"
             git push origin "HEAD:$env:GITHUB_HEAD_REF"
           }
 
