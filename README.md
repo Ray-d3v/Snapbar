@@ -56,7 +56,7 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 
 共有領域を一意に確定できない場合は、Teamsウィンドウ全体や画像推定範囲をコピーせず、失敗として停止します。
 
-## 操作バー
+## 操作バーとホバーメニュー
 
 操作バーは外枠のない不透明な黒いピルです。
 
@@ -67,6 +67,9 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 - 共有コンテンツUIA要素と最新フレームが準備できるまで、撮影ボタンはグレー表示で無効です。
 - 共有開始後に準備が完了すると、撮影ボタンが赤色になり有効化されます。
 - 右端の三本線メニューには、PNG保存トグル、会議・共有の再検出、アプリ終了を配置しています。
+- メニューは約110msのホバーで開き、カーソルが外れても約220msの猶予後に閉じます。猶予中に戻れば閉じません。
+- メニューボタンをクリックすると固定表示になり、再クリックで閉じます。
+- Win32の入力リージョンを黒いピルとメニューの形に合わせているため、透明な余白や隙間はTeamsへのクリックを遮りません。
 
 通知領域のSnapbarアイコンを右クリックすると、以下を実行できます。
 
@@ -82,6 +85,18 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 - 撮影成功後、実際に取得した共有領域へ短い白いフラッシュを表示します。
 - 共有されているWindowsデスクトップのタスクバーは共有コンテンツに含まれます。
 - 参加者映像、チャット、Teams操作UIはUIA共有領域の外側なので含まれません。
+
+## メモリと処理負荷
+
+- Windows Graphics Captureセッションは、会議中でも共有コンテンツが存在するときだけ開始します。共有終了・会議退出時には停止します。
+- UIA座標の算出だけのためにTeamsウィンドウ全体をCPUメモリへコピーしません。
+- CPU側へ取得するのは確定済みの共有領域だけです。
+- 最新の切り抜き画像は1枚だけ保持し、同じ`Vec<u8>`を再利用します。フレームごとの大規模なヒープ確保を避けます。
+- 待機時のバックアップ更新は約750ms間隔です。撮影ボタンを押したときだけ次の新しいフレームを最大約45ms待ち、来なければ直近のバックアップを使います。
+- UIAの全走査は共有開始・レイアウト変更時と低頻度の整合性確認に限定します。
+- 操作バーのTeams追従は位置が変化した場合だけ`SetWindowPos`を実行します。
+
+GPUIとWindows Graphics Capture自体の基礎メモリは必要ですが、旧実装にあったフルフレーム二重コピー、20fpsのCPUキャッシュ、共有前のWGC起動を廃止しています。
 
 ## 操作
 
@@ -142,9 +157,11 @@ Resident Snapbar process
 │  └─ debounced join / leave state
 └─ hidden GPUI control bar
    └─ active meeting detected → follow Teams window and show
-      └─ persistent Windows Graphics Capture session
+      ├─ debounced hover menu + visible-shape input region
+      └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle
-         └─ latest cropped frame cache
+         ├─ cropped-only reusable CPU buffer
+         └─ one low-frequency latest-frame backup
             ├─ Windows clipboard
             ├─ optional Windows Screenshots PNG
             └─ click-through flash overlay
