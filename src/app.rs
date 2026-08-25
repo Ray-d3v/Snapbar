@@ -1,10 +1,13 @@
+use std::time::Duration;
+
 use crate::{
     assets::Assets,
     capture::{
-        CaptureEngine, CaptureTarget, discover_teams_targets, save_clipboard_image_to_screenshots,
-        show_capture_flash,
+        CaptureEngine, CaptureTarget, save_clipboard_image_to_screenshots, show_capture_flash,
     },
+    meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::TeamsWindowFollower,
+    resident::ResidentController,
     settings::AppSettings,
 };
 use gpui::{
@@ -17,10 +20,12 @@ use gpui_platform::application;
 const WINDOW_WIDTH: f32 = 286.0;
 const COLLAPSED_HEIGHT: f32 = 68.0;
 const EXPANDED_HEIGHT: f32 = 246.0;
+const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
     Idle,
+    WaitingForShare,
     Capturing,
     Copied,
     NoTarget,
@@ -32,6 +37,9 @@ struct Snapbar {
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
     follower: Option<TeamsWindowFollower>,
+    meeting_monitor: MeetingMonitor,
+    resident: ResidentController,
+    last_monitor_generation: u64,
     settings: AppSettings,
     menu_open: bool,
     menu_pinned: bool,
@@ -44,12 +52,15 @@ struct Snapbar {
 }
 
 impl Snapbar {
-    fn new(window: &Window) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut snapbar = Self {
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
             follower: TeamsWindowFollower::start(window),
+            meeting_monitor: MeetingMonitor::start(),
+            resident: ResidentController::start(),
+            last_monitor_generation: u64::MAX,
             settings: AppSettings::load(),
             menu_open: false,
             menu_pinned: false,
@@ -60,7 +71,8 @@ impl Snapbar {
             last_saved_path: None,
             last_error: None,
         };
-        snapbar.refresh_targets(false);
+        snapbar.apply_meeting_snapshot(snapbar.meeting_monitor.snapshot());
+        snapbar.start_resident_sync(window, cx);
         snapbar
     }
 
@@ -74,36 +86,79 @@ impl Snapbar {
         }
     }
 
-    fn refresh_targets(&mut self, select_next: bool) {
-        let previous_id = self.current_target().map(|target| target.id);
-        self.capture_generation = self.capture_generation.wrapping_add(1);
-        self.capture_engine = None;
+    fn start_resident_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(RESIDENT_SYNC_INTERVAL).await;
+            if this
+                .update(cx, |this, cx| this.sync_resident_state(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
 
-        match discover_teams_targets() {
-            Ok(targets) if targets.is_empty() => {
+    fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
+        if self.resident.quit_requested() {
+            cx.quit();
+            return;
+        }
+        if self.resident.take_rescan_requested() {
+            self.meeting_monitor.request_scan();
+            if self.current_target().is_some() {
+                self.restart_capture_engine();
+            }
+        }
+
+        let snapshot = self.meeting_monitor.snapshot();
+        if snapshot.generation != self.last_monitor_generation {
+            self.apply_meeting_snapshot(snapshot);
+        }
+
+        match self.capture_engine.as_ref() {
+            Some(engine) if engine.is_ready() => {
+                if matches!(
+                    self.capture_state,
+                    CaptureState::NoTarget | CaptureState::WaitingForShare
+                ) {
+                    self.capture_state = CaptureState::Idle;
+                    self.last_error = None;
+                }
+            }
+            Some(_) if self.capture_state != CaptureState::Capturing => {
+                self.capture_state = CaptureState::WaitingForShare;
+            }
+            None if self.current_target().is_none() => {
+                self.capture_state = CaptureState::NoTarget;
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
+    fn apply_meeting_snapshot(&mut self, snapshot: MeetingSnapshot) {
+        self.last_monitor_generation = snapshot.generation;
+        let previous_id = self.current_target().map(|target| target.id);
+        let next_id = snapshot.target.as_ref().map(|target| target.id);
+
+        match snapshot.target {
+            Some(target) => {
+                self.targets = vec![target];
+                self.selected_target = 0;
+                if previous_id != next_id || self.capture_engine.is_none() {
+                    self.restart_capture_engine();
+                } else {
+                    self.sync_follower();
+                }
+            }
+            None => {
+                self.capture_generation = self.capture_generation.wrapping_add(1);
+                self.capture_engine = None;
                 self.targets.clear();
                 self.selected_target = 0;
                 self.capture_state = CaptureState::NoTarget;
-                self.last_error = Some("Teams会議画面を検出できません".to_string());
-                self.sync_follower();
-            }
-            Ok(targets) => {
-                let previous_index = previous_id
-                    .and_then(|id| targets.iter().position(|target| target.id == id))
-                    .unwrap_or(0);
-                self.selected_target = if select_next && targets.len() > 1 {
-                    (previous_index + 1) % targets.len()
-                } else {
-                    previous_index
-                };
-                self.targets = targets;
-                self.restart_capture_engine();
-            }
-            Err(error) => {
-                self.targets.clear();
-                self.selected_target = 0;
-                self.capture_state = CaptureState::Error;
-                self.last_error = Some(error.to_string());
+                self.last_error = None;
                 self.sync_follower();
             }
         }
@@ -115,20 +170,27 @@ impl Snapbar {
         self.sync_follower();
         let Some(target_id) = self.current_target().map(|target| target.id) else {
             self.capture_state = CaptureState::NoTarget;
-            self.last_error = Some("Teams会議画面を検出できません".to_string());
+            self.last_error = None;
             return;
         };
 
         match CaptureEngine::start(target_id) {
             Ok(engine) => {
                 self.capture_engine = Some(engine);
-                self.capture_state = CaptureState::Idle;
+                self.capture_state = CaptureState::WaitingForShare;
                 self.last_error = None;
             }
             Err(error) => {
                 self.capture_state = CaptureState::Error;
                 self.last_error = Some(error.to_string());
             }
+        }
+    }
+
+    fn request_redetection(&mut self) {
+        self.meeting_monitor.request_scan();
+        if self.current_target().is_some() {
+            self.restart_capture_engine();
         }
     }
 
@@ -147,12 +209,12 @@ impl Snapbar {
     }
 
     fn on_target_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_targets(true);
+        self.request_redetection();
         cx.notify();
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_targets(false);
+        self.request_redetection();
         cx.notify();
     }
 
@@ -194,13 +256,18 @@ impl Snapbar {
             return;
         }
 
-        if self.capture_engine.is_none() {
-            self.refresh_targets(false);
-        }
         let Some(engine) = self.capture_engine.clone() else {
+            self.meeting_monitor.request_scan();
+            self.capture_state = CaptureState::NoTarget;
             cx.notify();
             return;
         };
+        if !engine.is_ready() {
+            self.capture_state = CaptureState::WaitingForShare;
+            self.last_error = Some("共有コンテンツを待機中です".to_string());
+            cx.notify();
+            return;
+        }
 
         self.capture_generation = self.capture_generation.wrapping_add(1);
         let generation = self.capture_generation;
@@ -258,12 +325,16 @@ impl Snapbar {
 
     fn target_label(&self) -> String {
         if self.current_target().is_none() {
-            return "未接続".to_string();
+            return "会議待機中".to_string();
         }
-        if self.targets.len() <= 1 {
+        if self
+            .capture_engine
+            .as_ref()
+            .is_some_and(CaptureEngine::is_ready)
+        {
             "Teams".to_string()
         } else {
-            format!("Teams {}/{}", self.selected_target + 1, self.targets.len())
+            "共有待ち".to_string()
         }
     }
 
@@ -276,10 +347,11 @@ impl Snapbar {
         }
         let state = match self.capture_state {
             CaptureState::Idle => "準備完了",
+            CaptureState::WaitingForShare => "共有待ち",
             CaptureState::Capturing => "撮影中",
             CaptureState::Copied if self.settings.save_to_screenshots => "コピー・保存済み",
             CaptureState::Copied => "コピー済み",
-            CaptureState::NoTarget => "対象なし",
+            CaptureState::NoTarget => "会議待機中",
             CaptureState::Error => "要確認",
         };
         let latency = self
@@ -293,18 +365,23 @@ impl Snapbar {
 impl Render for Snapbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_target = self.current_target().is_some();
+        let can_capture = self
+            .capture_engine
+            .as_ref()
+            .is_some_and(CaptureEngine::is_ready)
+            && self.capture_state != CaptureState::Capturing;
         let menu_open = self.menu_open;
         let save_to_screenshots = self.settings.save_to_screenshots;
         let primary_text = rgb(0xf5f5f6);
         let secondary_text = rgb(0x96969d);
         let target_icon_color = match self.capture_state {
             CaptureState::Error => rgb(0xf07178),
-            CaptureState::NoTarget => rgb(0xe0a24a),
+            CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0xe0a24a),
             _ if has_target => rgb(0xd7d7dc),
             _ => secondary_text,
         };
         let capture_background = match self.capture_state {
-            CaptureState::NoTarget => rgb(0x35353a),
+            CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0x35353a),
             CaptureState::Capturing => rgb(0xc83f47),
             CaptureState::Error => rgb(0xd1444c),
             CaptureState::Idle | CaptureState::Copied => rgb(0xe5484d),
@@ -344,20 +421,28 @@ impl Render for Snapbar {
             .justify_center()
             .size(px(46.0))
             .rounded_full()
-            .cursor_pointer()
             .bg(capture_background)
             .shadow_sm()
-            .hover(|button| button.opacity(0.91))
-            .active(|button| button.opacity(0.68))
+            .when(can_capture, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|button| button.opacity(0.91))
+                    .active(|button| button.opacity(0.68))
+                    .on_click(cx.listener(Self::on_capture_clicked))
+            })
+            .when(!can_capture, |button| button.opacity(0.66))
             .when(self.capture_state == CaptureState::Capturing, |button| {
                 button.opacity(0.76)
             })
-            .on_click(cx.listener(Self::on_capture_clicked))
             .child(
                 svg()
                     .path("icons/camera.svg")
                     .size(px(20.0))
-                    .text_color(rgb(0xffffff)),
+                    .text_color(if can_capture {
+                        rgb(0xffffff)
+                    } else {
+                        rgb(0xa7a7ac)
+                    }),
             );
 
         let menu_icon_color = if menu_open {
@@ -468,7 +553,7 @@ impl Render for Snapbar {
         let refresh_row = menu_action(
             "refresh-row",
             "icons/refresh.svg",
-            "対象を再検出",
+            "会議・共有を再検出",
             primary_text,
         )
         .on_click(cx.listener(Self::on_refresh_clicked));
@@ -566,7 +651,7 @@ pub fn run() {
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
-            |window, cx| cx.new(|_| Snapbar::new(window)),
+            |window, cx| cx.new(|cx| Snapbar::new(window, cx)),
         )
         .expect("Snapbar window could not be created");
 
