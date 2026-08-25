@@ -131,6 +131,7 @@ impl Snapbar {
             Some(_) if self.capture_state != CaptureState::Capturing => {
                 self.capture_state = CaptureState::WaitingForShare;
             }
+            Some(_) => {}
             None if self.current_target().is_none() => {
                 self.capture_state = CaptureState::NoTarget;
             }

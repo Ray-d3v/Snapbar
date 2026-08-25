@@ -11,20 +11,21 @@ use std::{
 use anyhow::{Context as _, Result};
 use uiautomation::UIAutomation;
 use uiautomation::types::{ControlType, Handle, Point, TreeScope};
-use windows::Win32::{
-    Foundation::{BOOL, HWND, LPARAM},
-    System::Threading::GetCurrentThreadId,
-    UI::{
-        Accessibility::{
-            EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, HWINEVENTHOOK, SetWinEventHook,
-            UnhookWinEvent, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-        },
-        WindowsAndMessaging::{
-            EnumChildWindows, GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
-            PostThreadMessageW, WM_QUIT,
+use windows::{
+    Win32::{
+        Foundation::{HWND, LPARAM},
+        System::Threading::GetCurrentThreadId,
+        UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+            WindowsAndMessaging::{
+                EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumChildWindows,
+                GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
+                PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+            },
         },
     },
+    core::BOOL,
 };
 use xcap::Window;
 
