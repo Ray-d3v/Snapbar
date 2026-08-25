@@ -20,8 +20,8 @@ use windows::Win32::{
         GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic,
         IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
-        WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
@@ -100,10 +100,7 @@ impl TeamsWindowFollower {
                 while !thread_stop.load(Ordering::Acquire) {
                     let client_size = client_size(overlay_hwnd);
                     if client_size != previous_client_size {
-                        apply_window_region(
-                            overlay_hwnd,
-                            thread_menu_open.load(Ordering::Acquire),
-                        );
+                        apply_window_region(overlay_hwnd, thread_menu_open.load(Ordering::Acquire));
                         previous_client_size = client_size;
                     }
 
@@ -225,16 +222,8 @@ fn apply_window_region(hwnd: HWND, menu_open: bool) {
     let bar_top = scale_logical(4, height, LOGICAL_WINDOW_HEIGHT);
     let bar_bottom = scale_logical(64, height, LOGICAL_WINDOW_HEIGHT);
     let bar_radius = scale_logical(60, height, LOGICAL_WINDOW_HEIGHT).max(1);
-    let bar_region = unsafe {
-        CreateRoundRectRgn(
-            left,
-            bar_top,
-            right,
-            bar_bottom,
-            bar_radius,
-            bar_radius,
-        )
-    };
+    let bar_region =
+        unsafe { CreateRoundRectRgn(left, bar_top, right, bar_bottom, bar_radius, bar_radius) };
     if bar_region.is_null() {
         return;
     }
@@ -244,14 +233,7 @@ fn apply_window_region(hwnd: HWND, menu_open: bool) {
         let menu_bottom = scale_logical(238, height, LOGICAL_WINDOW_HEIGHT);
         let menu_radius = scale_logical(40, height, LOGICAL_WINDOW_HEIGHT).max(1);
         let menu_region = unsafe {
-            CreateRoundRectRgn(
-                left,
-                menu_top,
-                right,
-                menu_bottom,
-                menu_radius,
-                menu_radius,
-            )
+            CreateRoundRectRgn(left, menu_top, right, menu_bottom, menu_radius, menu_radius)
         };
         if !menu_region.is_null() {
             let combined = unsafe { CombineRgn(bar_region, bar_region, menu_region, RGN_OR) };
