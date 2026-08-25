@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+// Retained for diagnostics and regression tests. Automatic capture is UIA-authoritative.
+#[allow(dead_code)]
 mod content_detector;
 mod engine;
 mod flash;
