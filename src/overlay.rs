@@ -17,13 +17,16 @@ use windows::Win32::{
         DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
-        GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
-        SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
+        GWL_EXSTYLE, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow,
+        IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
+        WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(60);
+const IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const TARGET_TOP_INSET: i32 = 12;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
 
@@ -36,7 +39,11 @@ pub struct TeamsWindowFollower {
 impl TeamsWindowFollower {
     pub fn start(window: &Window) -> Option<Self> {
         let overlay_hwnd = window_hwnd(window)?;
-        suppress_window_border(overlay_hwnd);
+        configure_overlay_window(overlay_hwnd);
+        unsafe {
+            let _ = ShowWindow(overlay_hwnd, SW_HIDE);
+        }
+
         let target_id = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_target_id = Arc::clone(&target_id);
@@ -52,12 +59,17 @@ impl TeamsWindowFollower {
 
                 while !thread_stop.load(Ordering::Acquire) {
                     let target_id = thread_target_id.load(Ordering::Acquire);
-                    if target_id != 0 {
-                        let target_hwnd = HWND(target_id as usize as *mut c_void);
-                        follow_target(overlay_hwnd, target_hwnd);
+                    if target_id == 0 {
+                        hide_overlay(overlay_hwnd);
+                        thread::sleep(IDLE_INTERVAL);
+                        continue;
                     }
+
+                    let target_hwnd = HWND(target_id as usize as *mut c_void);
+                    follow_target(overlay_hwnd, target_hwnd);
                     thread::sleep(FOLLOW_INTERVAL);
                 }
+                hide_overlay(overlay_hwnd);
             })
             .ok()?;
 
@@ -91,6 +103,29 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
     }
 }
 
+fn configure_overlay_window(hwnd: HWND) {
+    suppress_window_border(hwnd);
+    unsafe {
+        let current = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let desired = current | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, desired as i32);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_NOOWNERZORDER
+                | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 fn suppress_window_border(hwnd: HWND) {
     unsafe {
         let _ = DwmSetWindowAttribute(
@@ -102,23 +137,31 @@ fn suppress_window_border(hwnd: HWND) {
     }
 }
 
+fn hide_overlay(overlay_hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(overlay_hwnd, SW_HIDE);
+    }
+}
+
 fn follow_target(overlay_hwnd: HWND, target_hwnd: HWND) {
     unsafe {
-        if !IsWindow(Some(target_hwnd)).as_bool() {
-            return;
-        }
-        if IsIconic(target_hwnd).as_bool() {
-            let _ = ShowWindow(overlay_hwnd, SW_HIDE);
+        if !IsWindow(Some(target_hwnd)).as_bool()
+            || !IsWindowVisible(target_hwnd).as_bool()
+            || IsIconic(target_hwnd).as_bool()
+        {
+            hide_overlay(overlay_hwnd);
             return;
         }
     }
 
     let Some(target_rect) = extended_frame_bounds(target_hwnd) else {
+        hide_overlay(overlay_hwnd);
         return;
     };
     let mut overlay_rect = RECT::default();
     unsafe {
         if GetWindowRect(overlay_hwnd, &mut overlay_rect).is_err() {
+            hide_overlay(overlay_hwnd);
             return;
         }
     }
@@ -126,6 +169,7 @@ fn follow_target(overlay_hwnd: HWND, target_hwnd: HWND) {
     let target_width = target_rect.right.saturating_sub(target_rect.left);
     let overlay_width = overlay_rect.right.saturating_sub(overlay_rect.left);
     if target_width <= 0 || overlay_width <= 0 {
+        hide_overlay(overlay_hwnd);
         return;
     }
 
