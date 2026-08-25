@@ -28,6 +28,7 @@ use super::{
 };
 
 const FRAME_CACHE_INTERVAL: Duration = Duration::from_millis(50);
+const DETECTION_RETRY_INTERVAL: Duration = Duration::from_millis(750);
 const FULL_REDETECTION_INTERVAL: Duration = Duration::from_secs(3);
 const READY_TIMEOUT: Duration = Duration::from_millis(1_200);
 
@@ -120,6 +121,15 @@ impl CaptureEngine {
         })
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.inner
+            .shared
+            .state
+            .lock()
+            .ok()
+            .is_some_and(|state| state.latest.is_some())
+    }
+
     pub fn copy_latest_to_clipboard(&self) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
         let cached = self.wait_for_cached_frame()?;
@@ -208,14 +218,22 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             .ok()
             .and_then(|state| state.content_rect);
         let size_changed = self.last_source_size != Some(source_size);
-        let periodic_redetect = self
-            .last_detection
-            .is_none_or(|last| now.duration_since(last) >= FULL_REDETECTION_INTERVAL);
+        let periodic_redetect = current_rect.is_some()
+            && self
+                .last_detection
+                .is_none_or(|last| now.duration_since(last) >= FULL_REDETECTION_INTERVAL);
+        let missing_rect_retry = current_rect.is_none()
+            && self
+                .last_detection
+                .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL);
         let dirty_layout_change =
             current_rect.is_some_and(|rect| dirty_regions_suggest_layout_change(frame, rect));
         let needs_detection =
-            size_changed || periodic_redetect || dirty_layout_change || current_rect.is_none();
+            size_changed || periodic_redetect || missing_rect_retry || dirty_layout_change;
 
+        if current_rect.is_none() && !needs_detection {
+            return Ok(());
+        }
         if !needs_detection
             && self
                 .last_cache_update
@@ -225,6 +243,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         }
 
         let result = if needs_detection {
+            self.last_detection = Some(now);
             match self.detect_and_cache(frame, now) {
                 Ok(()) => Ok(()),
                 Err(error)
@@ -251,9 +270,6 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             Ok(()) => {
                 self.last_cache_update = Some(now);
                 self.last_source_size = Some(source_size);
-                if needs_detection {
-                    self.last_detection = Some(now);
-                }
             }
             Err(error) => {
                 let message = error.to_string();
