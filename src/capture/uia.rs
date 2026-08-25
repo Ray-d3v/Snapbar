@@ -1,26 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
-use image::RgbaImage;
 use uiautomation::types::{ControlType, Handle, Point, Rect as UiRect, TreeScope};
-use uiautomation::{UIAutomation, UIElement, UITreeWalker};
+use uiautomation::{UIAutomation, UIElement};
 use xcap::Window;
 
-use super::{
-    ScreenRect,
-    content_detector::{ContentCandidate, PixelRect},
-};
-
-mod scoring;
-
-use self::scoring::{
-    candidate_key, candidate_to_content_candidate, candidate_to_exclusion_candidate, element_role,
-    element_search_text, is_uia_candidate_rect,
-};
+use super::{ScreenRect, content_detector::PixelRect};
 
 const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(50);
 const STABILITY_DELAY: Duration = Duration::from_millis(35);
@@ -37,9 +22,11 @@ pub(super) struct WindowGeometry {
 }
 
 impl WindowGeometry {
-    pub(super) fn from_window(window: &Window, image: &RgbaImage) -> Result<Self> {
-        let image_width = image.width();
-        let image_height = image.height();
+    pub(super) fn from_window_dimensions(
+        window: &Window,
+        image_width: u32,
+        image_height: u32,
+    ) -> Result<Self> {
         let screen_width = window
             .width()
             .context("Teamsウィンドウの幅を取得できませんでした")?;
@@ -182,74 +169,24 @@ impl WindowGeometry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ElementRole {
-    Image,
-    Document,
-    Custom,
-    Pane,
-    Group,
-    Other,
-    Text,
-    Interactive,
-    Chrome,
-}
-
-#[derive(Debug)]
-struct UiaAccumulator {
-    rect: PixelRect,
-    hits: u32,
-    nearest_leaf_distance: u8,
-    role: ElementRole,
-    text: String,
-    is_content_element: bool,
-}
-
-type CandidateKey = (u32, u32, u32, u32);
-
-#[derive(Debug, Default)]
-pub(super) struct UiaDetection {
-    pub authoritative_rect: Option<PixelRect>,
-    pub fallback_candidates: Vec<ContentCandidate>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AuthoritativeCandidate {
     rect: PixelRect,
     rank: u8,
 }
 
-pub(super) fn detect_content_candidates(
+pub(super) fn detect_content_rect(
     target_id: u32,
     geometry: WindowGeometry,
-) -> Result<UiaDetection> {
+) -> Result<Option<PixelRect>> {
     let automation = UIAutomation::new()
         .or_else(|_| UIAutomation::new_direct())
         .context("Windows UI Automationを初期化できませんでした")?;
 
-    let authoritative_rect = detect_authoritative_rect(&automation, target_id, geometry)?;
-    if authoritative_rect.is_some() {
-        return Ok(UiaDetection {
-            authoritative_rect,
-            fallback_candidates: Vec::new(),
-        });
-    }
-
-    Ok(UiaDetection {
-        authoritative_rect: None,
-        fallback_candidates: detect_sampled_candidates(&automation, geometry)?,
-    })
-}
-
-fn detect_authoritative_rect(
-    automation: &UIAutomation,
-    target_id: u32,
-    geometry: WindowGeometry,
-) -> Result<Option<PixelRect>> {
-    let mut first = scan_authoritative_rect(automation, target_id, geometry)?;
+    let mut first = scan_authoritative_rect(&automation, target_id, geometry)?;
     if first.is_none() {
         let _ = automation.element_from_point(geometry.sample_point(0.50, 0.55));
         thread::sleep(PROVIDER_WARMUP_DELAY);
-        first = scan_authoritative_rect(automation, target_id, geometry)?;
+        first = scan_authoritative_rect(&automation, target_id, geometry)?;
     }
 
     let Some(first) = first else {
@@ -257,7 +194,7 @@ fn detect_authoritative_rect(
     };
 
     thread::sleep(STABILITY_DELAY);
-    let Some(second) = scan_authoritative_rect(automation, target_id, geometry)? else {
+    let Some(second) = scan_authoritative_rect(&automation, target_id, geometry)? else {
         return Ok(None);
     };
 
@@ -403,98 +340,6 @@ fn rects_are_stable(left: PixelRect, right: PixelRect, tolerance: u32) -> bool {
         && left.y.abs_diff(right.y) <= tolerance
         && left.width.abs_diff(right.width) <= tolerance.saturating_mul(2)
         && left.height.abs_diff(right.height) <= tolerance.saturating_mul(2)
-}
-
-fn detect_sampled_candidates(
-    automation: &UIAutomation,
-    geometry: WindowGeometry,
-) -> Result<Vec<ContentCandidate>> {
-    const SAMPLE_X: [f64; 7] = [0.06, 0.21, 0.36, 0.50, 0.64, 0.79, 0.94];
-    const SAMPLE_Y: [f64; 7] = [0.06, 0.20, 0.35, 0.50, 0.65, 0.80, 0.94];
-    const MAX_ANCESTORS: u8 = 10;
-
-    let walker = automation
-        .get_raw_view_walker()
-        .context("Windows UI Automationツリーを取得できませんでした")?;
-    let mut accumulators = HashMap::<CandidateKey, UiaAccumulator>::new();
-
-    for y_fraction in SAMPLE_Y {
-        for x_fraction in SAMPLE_X {
-            let point = geometry.sample_point(x_fraction, y_fraction);
-            let Ok(element) = automation.element_from_point(point) else {
-                continue;
-            };
-            collect_element_ancestors(element, &walker, geometry, MAX_ANCESTORS, &mut accumulators);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    for candidate in accumulators.values() {
-        if let Some(exclusion) = candidate_to_exclusion_candidate(candidate, geometry) {
-            candidates.push(exclusion);
-        }
-        if let Some(content) = candidate_to_content_candidate(candidate, geometry) {
-            candidates.push(content);
-        }
-    }
-    Ok(candidates)
-}
-
-fn collect_element_ancestors(
-    element: UIElement,
-    walker: &UITreeWalker,
-    geometry: WindowGeometry,
-    max_ancestors: u8,
-    accumulators: &mut HashMap<CandidateKey, UiaAccumulator>,
-) {
-    let mut current = element;
-    let mut seen_for_point = HashSet::new();
-
-    for leaf_distance in 0..=max_ancestors {
-        if current.get_process_id().ok() == Some(std::process::id()) {
-            break;
-        }
-
-        if let Ok(ui_rect) = current.get_bounding_rectangle() {
-            if let Some(rect) = geometry.map_ui_rect(ui_rect) {
-                let key = candidate_key(rect);
-                if is_uia_candidate_rect(rect, geometry) && seen_for_point.insert(key) {
-                    let role = element_role(current.get_control_type().ok());
-                    let text = element_search_text(&current);
-                    let is_content_element = current.is_content_element().unwrap_or(false);
-                    if let Some(existing) = accumulators.get_mut(&key) {
-                        existing.hits = existing.hits.saturating_add(1);
-                        existing.nearest_leaf_distance =
-                            existing.nearest_leaf_distance.min(leaf_distance);
-                        existing.is_content_element |= is_content_element;
-                        if !text.is_empty() && !existing.text.contains(&text) {
-                            if !existing.text.is_empty() {
-                                existing.text.push(' ');
-                            }
-                            existing.text.push_str(&text);
-                        }
-                    } else {
-                        accumulators.insert(
-                            key,
-                            UiaAccumulator {
-                                rect,
-                                hits: 1,
-                                nearest_leaf_distance: leaf_distance,
-                                role,
-                                text,
-                                is_content_element,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        let Ok(parent) = walker.get_parent(&current) else {
-            break;
-        };
-        current = parent;
-    }
 }
 
 fn add_fraction(origin: i32, size: u32, fraction: f64) -> i32 {
