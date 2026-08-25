@@ -167,12 +167,12 @@ impl CaptureEngine {
                 break;
             }
             let wait_for = deadline.saturating_duration_since(now);
-            let (next_state, wait_result) = self
-                .inner
-                .shared
-                .ready
-                .wait_timeout(state, wait_for)
-                .map_err(|_| anyhow!("キャプチャ状態の待機に失敗しました"))?;
+            let (next_state, wait_result) =
+                self.inner
+                    .shared
+                    .ready
+                    .wait_timeout(state, wait_for)
+                    .map_err(|_| anyhow!("キャプチャ状態の待機に失敗しました"))?;
             state = next_state;
             if wait_result.timed_out() {
                 break;
@@ -234,10 +234,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
     ) -> std::result::Result<(), Self::Error> {
         let now = Instant::now();
         let source_size = (frame.width(), frame.height());
-        let requested = self
-            .shared
-            .capture_requested
-            .swap(false, Ordering::AcqRel);
+        let requested = self.shared.capture_requested.swap(false, Ordering::AcqRel);
         let (current_rect, has_latest) = self
             .shared
             .state
@@ -347,12 +344,7 @@ impl FrameHandler {
         let fallback_screen_rect = geometry
             .map_pixel_rect_to_screen(content_rect)
             .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
-        self.cache_crop(
-            frame,
-            content_rect,
-            captured_at,
-            Some(fallback_screen_rect),
-        )
+        self.cache_crop(frame, content_rect, captured_at, Some(fallback_screen_rect))
     }
 
     fn cache_crop(
