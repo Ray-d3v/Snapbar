@@ -53,12 +53,12 @@ const MA_NOACTIVATE: isize = 3;
 
 pub const WINDOW_WIDTH: f32 = 280.0;
 pub const WINDOW_HEIGHT: f32 = 40.0;
-const COLLAPSED_WIDTH: f32 = 92.0;
-const COLLAPSED_HEIGHT: f32 = 28.0;
-const EXPANDED_WIDTH: f32 = 272.0;
-const EXPANDED_HEIGHT: f32 = 34.0;
-const COMPACT_WIDTH: f32 = 40.0;
-const COMPACT_HEIGHT: f32 = 34.0;
+pub const COLLAPSED_WIDTH: f32 = 92.0;
+pub const COLLAPSED_HEIGHT: f32 = 28.0;
+pub const EXPANDED_WIDTH: f32 = 272.0;
+pub const EXPANDED_HEIGHT: f32 = 34.0;
+pub const COMPACT_WIDTH: f32 = 40.0;
+pub const COMPACT_HEIGHT: f32 = 34.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -423,12 +423,7 @@ impl NativeHoverSubclass {
         });
         let state_ptr = Box::into_raw(state) as usize;
         let installed = unsafe {
-            SetWindowSubclass(
-                hwnd.0,
-                Some(overlay_subclass_proc),
-                SUBCLASS_ID,
-                state_ptr,
-            )
+            SetWindowSubclass(hwnd.0, Some(overlay_subclass_proc), SUBCLASS_ID, state_ptr)
         };
         if installed == 0 {
             unsafe {
@@ -490,7 +485,9 @@ unsafe extern "system" fn overlay_subclass_proc(
                 if pointer_over {
                     state.start_leave_tracking(hwnd);
                 }
-                let effects = state.machine.expand_elapsed(pointer_over && state.interactive());
+                let effects = state
+                    .machine
+                    .expand_elapsed(pointer_over && state.interactive());
                 state.apply_effects(hwnd, effects);
             }
             TIMER_COLLAPSE => {

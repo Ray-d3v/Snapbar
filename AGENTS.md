@@ -24,9 +24,9 @@
 - Reuse the cropped CPU buffer and avoid per-frame heap allocation. Keep only one latest cropped frame and a low-frequency backup refresh.
 - Place the visible Snapbar affordance in the center-safe area of the Teams title bar, not over the meeting content or meeting control row.
 - The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand controls horizontally only; never open a menu below the title bar.
-- Use DWM frame and caption-button bounds to avoid the Windows caption controls. When the available title-bar span is too narrow, reduce to a single camera control.
+- Use DWM frame and caption-button bounds to avoid the Windows caption controls. `DWMWA_CAPTION_BUTTON_BOUNDS` is window-relative and must be converted using `GetWindowRect` before combining it with screen-space `DWMWA_EXTENDED_FRAME_BOUNDS`. When the available title-bar span is too narrow, reduce to a single camera control.
 - Hover expansion and collapse must be debounced. The non-pinned control strip must always collapse after the pointer leaves the actual visible surface.
-- Use GPUI's `on_hover` / Windows mouse-leave path and a stored cancellable `Task` for hover disclosure. Do not add periodic cursor polling or detached timer-generation schemes.
+- Keep hover disclosure at the native overlay-window level: one `SetWindowSubclass` controller, one explicit state machine, `TrackMouseEvent` / `WM_MOUSELEAVE`, and pointer verification at timer boundaries. GPUI must only render the published mode. Do not use element-level hover as the source of truth, detached timer generations, or permanent cursor polling.
 - Invisible transparent window areas must not intercept clicks or title-bar dragging intended for Teams.
 
 ## Architecture

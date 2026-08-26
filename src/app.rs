@@ -14,15 +14,13 @@ use crate::{
     settings::AppSettings,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, Task, Window, WindowBackgroundAppearance, WindowBounds,
+    App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
     transparent_black,
 };
 use gpui_platform::application;
 
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
-const EXPAND_DELAY: Duration = Duration::from_millis(180);
-const COLLAPSE_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -46,8 +44,6 @@ struct Snapbar {
     compact_layout: bool,
     settings: AppSettings,
     expanded: bool,
-    surface_hovered: bool,
-    hover_transition: Option<Task<()>>,
     capture_state: CaptureState,
     capture_generation: u64,
     last_error: Option<String>,
@@ -55,11 +51,13 @@ struct Snapbar {
 
 impl Snapbar {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let follower = TeamsWindowFollower::start(window);
+        let overlay_events = follower.as_ref().map(TeamsWindowFollower::subscribe);
         let mut snapbar = Self {
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
-            follower: TeamsWindowFollower::start(window),
+            follower,
             meeting_monitor: MeetingMonitor::start(),
             resident: ResidentController::start(),
             last_monitor_generation: u64::MAX,
@@ -67,8 +65,6 @@ impl Snapbar {
             compact_layout: false,
             settings: AppSettings::load(),
             expanded: false,
-            surface_hovered: false,
-            hover_transition: None,
             capture_state: CaptureState::NoTarget,
             capture_generation: 0,
             last_error: None,
@@ -76,6 +72,9 @@ impl Snapbar {
         let snapshot = snapbar.meeting_monitor.snapshot();
         snapbar.apply_meeting_snapshot(snapshot, cx);
         snapbar.start_resident_sync(window, cx);
+        if let Some(events) = overlay_events {
+            snapbar.start_overlay_sync(events, window, cx);
+        }
         snapbar
     }
 
@@ -104,6 +103,29 @@ impl Snapbar {
         .detach();
     }
 
+    fn start_overlay_sync(
+        &self,
+        events: async_channel::Receiver<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            while events.recv().await.is_ok() {
+                if this
+                    .update(cx, |this, cx| {
+                        if this.sync_overlay_state() {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
         if self.resident.quit_requested() {
             cx.quit();
@@ -122,28 +144,7 @@ impl Snapbar {
             changed = true;
         }
 
-        let compact_layout = self
-            .follower
-            .as_ref()
-            .is_some_and(TeamsWindowFollower::is_compact);
-        if compact_layout != self.compact_layout {
-            self.compact_layout = compact_layout;
-            if compact_layout {
-                self.reset_disclosure(cx);
-            }
-            changed = true;
-        }
-
-        let follower_visible = self
-            .follower
-            .as_ref()
-            .is_some_and(TeamsWindowFollower::is_visible);
-        if !follower_visible
-            && (self.expanded || self.surface_hovered || self.hover_transition.is_some())
-        {
-            self.reset_disclosure(cx);
-            changed = true;
-        }
+        changed |= self.sync_overlay_state();
 
         let previous_state = self.capture_state;
         match self.capture_engine.as_ref() {
@@ -183,7 +184,9 @@ impl Snapbar {
         self.shared_content_hint = snapshot.shared_content_hint;
 
         if previous_id != next_id {
-            self.reset_disclosure(cx);
+            self.expanded = false;
+            self.compact_layout = false;
+            cx.notify();
         }
 
         match snapshot.target {
@@ -211,7 +214,9 @@ impl Snapbar {
                 self.capture_state = CaptureState::NoTarget;
                 self.last_error = None;
                 self.shared_content_hint = false;
-                self.reset_disclosure(cx);
+                self.expanded = false;
+                self.compact_layout = false;
+                cx.notify();
                 self.sync_follower();
             }
         }
@@ -252,53 +257,20 @@ impl Snapbar {
         }
     }
 
-    fn reset_disclosure(&mut self, cx: &mut Context<Self>) {
-        self.hover_transition = None;
-        self.surface_hovered = false;
-        self.set_expanded(false, cx);
-    }
-
-    fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
-        let expanded = expanded && !self.compact_layout;
-        if let Some(follower) = &self.follower {
-            follower.set_expanded(expanded);
-        }
-        if self.expanded == expanded {
-            return;
-        }
-        self.expanded = expanded;
-        cx.notify();
-    }
-
-    fn on_surface_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.hover_transition = None;
-
-        if self.compact_layout {
-            self.surface_hovered = false;
-            self.set_expanded(false, cx);
-            return;
-        }
-
-        self.surface_hovered = *hovered;
-        let target_expanded = *hovered;
-        if self.expanded == target_expanded {
-            return;
-        }
-
-        let delay = if target_expanded {
-            EXPAND_DELAY
-        } else {
-            COLLAPSE_DELAY
+    fn sync_overlay_state(&mut self) -> bool {
+        let Some(follower) = self.follower.as_ref() else {
+            let changed = self.expanded || self.compact_layout;
+            self.expanded = false;
+            self.compact_layout = false;
+            return changed;
         };
-        self.hover_transition = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.compact_layout || this.surface_hovered != target_expanded {
-                    return;
-                }
-                this.set_expanded(target_expanded, cx);
-            });
-        }));
+
+        let compact = follower.is_compact();
+        let expanded = follower.is_visible() && follower.is_expanded() && !compact;
+        let changed = self.compact_layout != compact || self.expanded != expanded;
+        self.compact_layout = compact;
+        self.expanded = expanded;
+        changed
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -479,7 +451,6 @@ impl Render for Snapbar {
             .bg(rgb(0x0b0b0d))
             .shadow_sm()
             .cursor_pointer()
-            .on_hover(cx.listener(Self::on_surface_hovered))
             .child(div().size(px(7.0)).rounded_full().bg(status_color))
             .child(
                 svg()
@@ -619,7 +590,6 @@ impl Render for Snapbar {
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_lg()
-            .on_hover(cx.listener(Self::on_surface_hovered))
             .child(status)
             .child(capture)
             .child(save)
