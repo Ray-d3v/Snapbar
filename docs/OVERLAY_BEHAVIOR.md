@@ -3,6 +3,7 @@
 The Snapbar control surface is a fixed-size transparent GPUI window with a native Win32 region.
 
 - The native region must be expressed in **window-relative** coordinates, including the client-area origin offset.
+- `ClientToScreen` is bound directly from `user32` so the client origin can be converted without depending on a generated windows-rs module placement.
 - The complete 68 px control-bar surface must remain inside the region at every DPI scale. Button bottoms, antialiasing, and shadows must not be clipped.
 - When the menu is open, the bar and menu regions overlap slightly so there is no dead strip during pointer travel.
 - An unpinned hover menu must close after the pointer remains outside the visible bar/menu surface for the configured close delay.
