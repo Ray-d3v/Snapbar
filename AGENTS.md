@@ -4,9 +4,9 @@
 
 - Snapbar targets Windows 11.
 - Snapbar is manually launched and remains resident in the notification area until the user explicitly exits it. Do not add Windows logon startup without a separate explicit request.
-- While no Teams meeting is detected, keep the control bar hidden. Show it automatically only after local meeting evidence remains stable for the configured debounce interval.
-- Minimized Teams windows are not treated as meeting exit; hide the control bar until the meeting window is restored.
-- The notification-area menu and the in-overlay menu must both provide a clear full-process exit action.
+- While no Teams meeting is detected, keep the title-bar control hidden. Show it automatically only after local meeting evidence remains stable for the configured debounce interval.
+- Minimized Teams windows are not treated as meeting exit; hide the title-bar control until the meeting window is restored.
+- The notification-area menu and the title-bar controls must both provide a clear full-process exit action when the full control strip is available.
 - Every successful capture must be copied to the Windows clipboard.
 - Optional PNG persistence is allowed only behind an explicit user-controlled toggle, must default to off, and must use the Windows configured Screenshots known folder.
 - Do not add uploads, telemetry, network calls, a Windows service, or Graph/Teams cloud dependencies for meeting detection.
@@ -22,7 +22,11 @@
 - Start Windows Graphics Capture only while shared-content evidence exists. Stop and release the capture session when sharing ends or the meeting exits.
 - Do not copy the full Teams frame to CPU memory merely to compute UIA geometry. Read only the authoritative cropped region.
 - Reuse the cropped CPU buffer and avoid per-frame heap allocation. Keep only one latest cropped frame and a low-frequency backup refresh.
-- Hover menus must debounce open and close transitions. Invisible transparent window areas must not intercept clicks intended for Teams.
+- Place the visible Snapbar affordance in the center-safe area of the Teams title bar, not over the meeting content or meeting control row.
+- The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand controls horizontally only; never open a menu below the title bar.
+- Use DWM frame and caption-button bounds to avoid the Windows caption controls. When the available title-bar span is too narrow, reduce to a single camera control.
+- Hover expansion and collapse must be debounced. The non-pinned control strip must always collapse after the pointer leaves the actual visible surface.
+- Invisible transparent window areas must not intercept clicks or title-bar dragging intended for Teams.
 
 ## Architecture
 
@@ -30,9 +34,9 @@
 - Keep Windows capture, shared-content detection, clipboard, and optional file-save logic isolated from GPUI under `src/capture.rs` and `src/capture/`.
 - Keep local meeting detection isolated in `src/meeting.rs` and notification-area lifetime control in `src/resident.rs`.
 - Prefer `SetWinEventHook` for prompt local change notification, but retain a low-frequency watchdog scan for missed events.
-- Keep the visible control bar opaque black. Transparency is permitted only outside its rounded silhouette.
-- Keep the native input region aligned to the visible bar and menu silhouettes so transparent gaps remain click-through.
-- Keep the control bar out of Alt+Tab and the taskbar, do not activate it when shown, and exclude it from screen capture.
+- Keep the visible title-bar controls opaque black. Transparency is permitted only outside their rounded silhouette.
+- Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette.
+- Keep the control out of Alt+Tab and the taskbar, do not activate it when shown or clicked, and exclude it from screen capture.
 - Prefer small, direct changes. Do not introduce Electron, Tauri, another webview, a background service, or cloud authentication.
 
 ## Quality gates

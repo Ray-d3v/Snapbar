@@ -1,6 +1,6 @@
 # Snapbar
 
-Microsoft Teamsで他の参加者が共有している画面の**共有コンテンツ部分だけ**を、会議画面に追従する操作バーから1クリックでWindowsクリップボードへコピーする軽量Windowsアプリです。
+Microsoft Teamsで他の参加者が共有している画面の**共有コンテンツ部分だけ**を、Teamsのタイトルバー中央から1クリックでWindowsクリップボードへコピーする軽量Windowsアプリです。
 
 ## ダウンロード
 
@@ -15,11 +15,11 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 
 - Snapbarを手動で起動すると、通知領域に常駐してTeams会議をローカル監視します。
 - Windowsログオン時の自動起動は現時点では登録しません。
-- 会議へ参加していない間は操作バーを表示しません。
-- 会議参加を複合条件で確認すると、対象Teamsウィンドウの上部中央へ操作バーを自動表示します。
-- Teamsを最小化した場合は退出扱いにせず、操作バーだけを非表示にします。Teamsを復元すると再表示します。
-- 会議退出を一定時間確認すると操作バーとキャプチャセッションを停止し、通知領域で次の会議を待ちます。
-- アプリを完全終了するには、操作バーのメニューまたは通知領域のSnapbarアイコンを右クリックして`Snapbarを終了`を選択します。
+- 会議へ参加していない間はタイトルバーの操作UIを表示しません。
+- 会議参加を複合条件で確認すると、対象Teamsウィンドウのタイトルバー中央へ小さなSnapbarピルを自動表示します。
+- Teamsを最小化した場合は退出扱いにせず、Snapbarだけを非表示にします。Teamsを復元すると再表示します。
+- 会議退出を一定時間確認するとSnapbarとキャプチャセッションを停止し、通知領域で次の会議を待ちます。
+- アプリを完全終了するには、展開したタイトルバー操作列の電源ボタン、または通知領域のSnapbarアイコンを右クリックして`Snapbarを終了`を選択します。
 - アップロード、テレメトリ、クラウド認証、Windowsサービスはありません。
 
 ## 会議の自動検出
@@ -44,7 +44,7 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 
 共有画面の切り抜きは画像内容やテーマ色から推測しません。TeamsがWindows UI Automationへ公開する共有コンテンツ要素を正本にします。
 
-1. 選択中のTeams HWNDからUI Automationルートを取得します。
+1. 選択中のTeams HWNDからWindows UI Automationルートを取得します。
 2. UIAサブツリー全体を走査し、`IsOffscreen == false`で、Accessible Nameに「共有」と「コンテンツ」の両方を含む要素を探します。英語環境では`shared content`、`presented content`などを使用します。
 3. 実機で確認された`ControlType.MenuItem`を最優先し、`Document`、`Pane`、`Custom`、`Group`、`Image`も互換候補として扱います。
 4. `AutomationId`や動的な`fui-*`クラス名には依存しません。
@@ -56,20 +56,40 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 
 共有領域を一意に確定できない場合は、Teamsウィンドウ全体や画像推定範囲をコピーせず、失敗として停止します。
 
-## 操作バーとホバーメニュー
+## タイトルバー操作UI
 
-操作バーは外枠のない不透明な黒いピルです。
+Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトルバー中央の空き領域**だけを使用します。
 
-- 対象Teamsウィンドウの移動、リサイズ、最大化、別モニターへの移動へ追従します。
-- タスクバーとAlt+Tabには表示しません。
-- Teamsからフォーカスを奪わずに表示します。
+### 通常時
+
+- 約`92 × 30px`の小さな黒いピルだけを表示します。
+- 状態ドット、カメラアイコン、`Snapbar`ラベルだけの構成です。
+- 透明なウィンドウ全体ではなく、実際に見えているピル部分だけがマウス入力を受け取ります。
+- そのほかのタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
+
+### ホバー時
+
+約180msホバーすると、中央を基準に**横方向だけ**へ約`272 × 36px`まで展開します。下方向へメニューを出さないため、直下のTeams会議操作UIへ被りません。
+
+左から次の操作を配置しています。
+
+- 状態表示／再検出
+- 共有画面を撮影してクリップボードへコピー
+- Windowsのスクリーンショットフォルダーにも保存するトグル
+- 会議・共有の再検出
+- Snapbarを終了
+
+カーソルが操作列から外れて約400ms経過すると自動で縮みます。GPUIのマウス離脱イベントが欠落した場合も、Win32の実カーソル座標を50ms間隔で確認して必ず閉じます。クリック固定はありません。
+
+### 配置と狭いウィンドウ
+
+- `DWMWA_EXTENDED_FRAME_BOUNDS`でTeamsの表示枠を取得します。
+- `DWMWA_CAPTION_BUTTON_BOUNDS`で右側の最小化・最大化・閉じるボタン領域を避けます。
+- 左側の会議名と右側のキャプションボタンを避けた中央領域へ配置します。
+- Teamsの移動、最大化、スナップ、別モニターへの移動、DPI変更へ追従します。
+- 横幅が足りない場合は、中央のカメラボタン1個だけへ縮退します。
+- タスクバーとAlt+Tabには表示せず、Teamsからフォーカスを奪いません。
 - Snapbar自身はキャプチャ画像から除外します。
-- 共有コンテンツUIA要素と最新フレームが準備できるまで、撮影ボタンはグレー表示で無効です。
-- 共有開始後に準備が完了すると、撮影ボタンが赤色になり有効化されます。
-- 右端の三本線メニューには、PNG保存トグル、会議・共有の再検出、アプリ終了を配置しています。
-- メニューは約110msのホバーで開き、カーソルが外れても約220msの猶予後に閉じます。猶予中に戻れば閉じません。
-- メニューボタンをクリックすると固定表示になり、再クリックで閉じます。
-- Win32の入力リージョンを黒いピルとメニューの形に合わせているため、透明な余白や隙間はTeamsへのクリックを遮りません。
 
 通知領域のSnapbarアイコンを右クリックすると、以下を実行できます。
 
@@ -79,7 +99,7 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 ## スクリーンショット
 
 - 撮影結果は必ずWindowsクリップボードへコピーします。
-- `ファイルにも保存`を有効にした場合だけ、Windowsが設定しているScreenshots既知フォルダーへPNGを保存します。
+- フォルダーアイコンを有効にした場合だけ、Windowsが設定しているScreenshots既知フォルダーへPNGを保存します。
 - 保存トグルの初期値はオフです。
 - 保存設定は`%LOCALAPPDATA%\Snapbar\settings.conf`へ保持します。
 - 撮影成功後、実際に取得した共有領域へ短い白いフラッシュを表示します。
@@ -94,19 +114,19 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
 - 最新の切り抜き画像は1枚だけ保持し、同じ`Vec<u8>`を再利用します。フレームごとの大規模なヒープ確保を避けます。
 - 待機時のバックアップ更新は約750ms間隔です。撮影ボタンを押したときだけ次の新しいフレームを最大約45ms待ち、来なければ直近のバックアップを使います。
 - UIAの全走査は共有開始・レイアウト変更時と低頻度の整合性確認に限定します。
-- 操作バーのTeams追従は位置が変化した場合だけ`SetWindowPos`を実行します。
+- タイトルバーUIのTeams追従は位置が変化した場合だけ`SetWindowPos`を実行します。
 
 GPUIとWindows Graphics Capture自体の基礎メモリは必要ですが、旧実装にあったフルフレーム二重コピー、20fpsのCPUキャッシュ、共有前のWGC起動を廃止しています。
 
 ## 操作
 
-1. `Snapbar.exe`を起動します。操作バーは表示されず、通知領域で待機します。
+1. `Snapbar.exe`を起動します。タイトルバーUIは表示されず、通知領域で待機します。
 2. Teams会議へ参加します。
-3. 会議参加が確定すると、Teams会議画面上部へ操作バーが自動表示されます。
-4. 他の参加者が画面共有を開始すると、共有領域の確定後に撮影ボタンが有効になります。
-5. 赤いカメラボタンを押します。
+3. 会議参加が確定すると、Teamsタイトルバー中央へ小さなSnapbarピルが表示されます。
+4. ピルへ約180msホバーし、横に展開した操作列を表示します。
+5. 他の参加者が画面共有を開始し、カメラボタンが赤くなったらクリックします。
 6. PowerPoint、OneNote、Teamsチャットなどへ`Ctrl + V`で貼り付けます。
-7. 会議退出後は操作バーが自動で消え、Snapbarは通知領域で次の会議を待ちます。
+7. 会議退出後はタイトルバーUIが自動で消え、Snapbarは通知領域で次の会議を待ちます。
 
 ## ビルド
 
@@ -155,9 +175,10 @@ Resident Snapbar process
 │  ├─ TeamsWebView / TeamsVideo child-window evidence
 │  ├─ UIA leave-call evidence
 │  └─ debounced join / leave state
-└─ hidden GPUI control bar
-   └─ active meeting detected → follow Teams window and show
-      ├─ debounced hover menu + visible-shape input region
+└─ hidden GPUI title-bar control
+   └─ active meeting detected → follow Teams title bar and show 92 × 30 trigger
+      ├─ 180 ms hover → horizontal 272 × 36 control strip
+      ├─ narrow title bar → camera-only compact mode
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle
          ├─ cropped-only reusable CPU buffer
