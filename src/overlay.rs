@@ -17,11 +17,11 @@ use windows::Win32::{
         DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
-        ClientToScreen, GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongW, GetWindowRect,
-        HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
-        WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongW, GetWindowRect, HWND_TOPMOST,
+        IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
@@ -54,6 +54,7 @@ unsafe extern "system" {
 
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn ClientToScreen(hwnd: *mut c_void, point: *mut POINT) -> i32;
     fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
 }
 
@@ -222,7 +223,9 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     unsafe {
         GetClientRect(hwnd, &mut client_rect).ok()?;
         GetWindowRect(hwnd, &mut window_rect).ok()?;
-        ClientToScreen(hwnd, &mut client_origin).ok()?;
+        if ClientToScreen(hwnd.0, &mut client_origin) == 0 {
+            return None;
+        }
     }
 
     let client_width = client_rect.right.saturating_sub(client_rect.left);
