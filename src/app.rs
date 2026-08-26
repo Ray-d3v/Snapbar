@@ -513,6 +513,7 @@ impl Render for Snapbar {
             .shadow_sm()
             .child(
                 div()
+                    .id("compact-capture-button")
                     .flex()
                     .items_center()
                     .justify_center()
