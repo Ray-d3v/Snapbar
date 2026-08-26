@@ -12,5 +12,7 @@ The Snapbar control surface is a fixed-size transparent GPUI window whose native
 - `ClientToScreen` is bound directly from `user32` so the client origin can be converted without depending on a generated windows-rs module placement.
 - The native region must match the current collapsed, expanded, or compact silhouette. Transparent pixels outside that region must remain click-through so Teams title-bar dragging still works.
 - Expansion begins only after a stable hover. Collapse occurs after the pointer remains outside the visible surface for the configured delay.
-- Native cursor-position checks are the source of truth when GPUI misses a mouse-leave event. There is no click-to-pin state that can leave the strip permanently open.
+- GPUI `on_hover` and its Windows `TrackMouseEvent` / `WM_MOUSELEAVE` path are the source of truth. A single stored `Task` provides cancellable expand/collapse debounce; do not add cursor polling or detached timer generations.
+- Collapsed, expanded, and compact dimensions come from one shared geometry source, and only the follower worker writes the native Win32 region.
+- There is no click-to-pin state that can leave the strip permanently open.
 - The overlay keeps `WS_EX_TOOLWINDOW` and `WS_EX_NOACTIVATE`, remains topmost relative to Teams, and is excluded from screen capture.
