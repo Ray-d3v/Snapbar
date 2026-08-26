@@ -22,34 +22,9 @@ jobs:
       - name: Add stateful ID to compact capture button
         shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-
-          path = Path("src/app.rs")
-          text = path.read_text(encoding="utf-8")
-          old = '''            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(30.0))
-                    .rounded_full()
-                    .bg(capture_background)
-'''
-          new = '''            .child(
-                div()
-                    .id("compact-capture-button")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(30.0))
-                    .rounded_full()
-                    .bg(capture_background)
-'''
-          if old not in text:
-              raise RuntimeError("compact capture button block was not found")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
-          '@ | python -
+          $encoded = 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgic3JjL2FwcC5ycyIpCnRleHQgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQpvbGQgPSAiIiIgICAgICAgICAgICAuY2hpbGQoCiAgICAgICAgICAgICAgICBkaXYoKQogICAgICAgICAgICAgICAgICAgIC5mbGV4KCkKICAgICAgICAgICAgICAgICAgICAuaXRlbXNfY2VudGVyKCkKICAgICAgICAgICAgICAgICAgICAuanVzdGlmeV9jZW50ZXIoKQogICAgICAgICAgICAgICAgICAgIC5zaXplKHB4KDMwLjApKQogICAgICAgICAgICAgICAgICAgIC5yb3VuZGVkX2Z1bGwoKQogICAgICAgICAgICAgICAgICAgIC5iZyhjYXB0dXJlX2JhY2tncm91bmQpCiIiIgpuZXcgPSAiIiIgICAgICAgICAgICAuY2hpbGQoCiAgICAgICAgICAgICAgICBkaXYoKQogICAgICAgICAgICAgICAgICAgIC5pZCgiY29tcGFjdC1jYXB0dXJlLWJ1dHRvbiIpCiAgICAgICAgICAgICAgICAgICAgLmZsZXgoKQogICAgICAgICAgICAgICAgICAgIC5pdGVtc19jZW50ZXIoKQogICAgICAgICAgICAgICAgICAgIC5qdXN0aWZ5X2NlbnRlcigpCiAgICAgICAgICAgICAgICAgICAgLnNpemUocHgoMzAuMCkpCiAgICAgICAgICAgICAgICAgICAgLnJvdW5kZWRfZnVsbCgpCiAgICAgICAgICAgICAgICAgICAgLmJnKGNhcHR1cmVfYmFja2dyb3VuZCkKIiIiCmlmIG9sZCBub3QgaW4gdGV4dDoKICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigiY29tcGFjdCBjYXB0dXJlIGJ1dHRvbiBibG9jayB3YXMgbm90IGZvdW5kIikKcGF0aC53cml0ZV90ZXh0KHRleHQucmVwbGFjZShvbGQsIG5ldywgMSksIGVuY29kaW5nPSJ1dGYtOCIpCg=='
+          $script = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+          $script | python -
 
       - name: Format and commit repair
         shell: pwsh
