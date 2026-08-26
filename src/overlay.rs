@@ -379,11 +379,29 @@ fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement 
         return OverlayPlacement::Hidden;
     }
 
+    let Some(overlay_metrics) = window_metrics(overlay_hwnd) else {
+        return OverlayPlacement::Hidden;
+    };
+    let visible_surface = surface_rect(
+        overlay_metrics.client_width,
+        overlay_metrics.client_height,
+        false,
+        false,
+    );
+    let visible_top_offset = overlay_metrics
+        .client_screen_top
+        .saturating_sub(overlay_metrics.window_top)
+        .saturating_add(visible_surface.top);
+    let visible_height = visible_surface.bottom.saturating_sub(visible_surface.top);
+    if visible_height <= 0 {
+        return OverlayPlacement::Hidden;
+    }
+
     let caption = caption_button_bounds(target_hwnd);
     let caption_height = caption
         .map(|rect| rect.bottom.saturating_sub(rect.top))
-        .filter(|height| *height >= overlay_height && *height <= 96)
-        .unwrap_or(overlay_height + 6);
+        .filter(|height| *height >= 24 && *height <= 96)
+        .unwrap_or(visible_height + 4);
     let caption_top = caption
         .map(|rect| rect.top)
         .filter(|top| *top >= 0 && *top <= 32)
@@ -409,7 +427,8 @@ fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement 
     let min_x = target_rect.left;
     let max_x = target_rect.right.saturating_sub(overlay_width).max(min_x);
     let x = (target_rect.left + safe_center - overlay_width / 2).clamp(min_x, max_x);
-    let y = target_rect.top + caption_top + (caption_height - overlay_height).max(0) / 2;
+    let visible_y = target_rect.top + caption_top + (caption_height - visible_height).max(0) / 2;
+    let y = visible_y.saturating_sub(visible_top_offset);
 
     OverlayPlacement::Visible { x, y, compact }
 }
