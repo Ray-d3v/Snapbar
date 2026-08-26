@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     assets::Assets,
@@ -22,6 +22,7 @@ const EXPANDED_HEIGHT: f32 = 246.0;
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const MENU_OPEN_DELAY: Duration = Duration::from_millis(110);
 const MENU_CLOSE_DELAY: Duration = Duration::from_millis(220);
+const MENU_HOVER_WATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -84,6 +85,7 @@ impl Snapbar {
         };
         snapbar.apply_meeting_snapshot(snapbar.meeting_monitor.snapshot());
         snapbar.start_resident_sync(window, cx);
+        snapbar.start_menu_hover_watch(window, cx);
         snapbar
     }
 
@@ -107,6 +109,57 @@ impl Snapbar {
                 {
                     break;
                 }
+            }
+        })
+        .detach();
+    }
+
+    fn start_menu_hover_watch(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut outside_since = None;
+            loop {
+                cx.background_executor()
+                    .timer(MENU_HOVER_WATCH_INTERVAL)
+                    .await;
+
+                let state = this.update(cx, |this, _| {
+                    let pointer_over = this
+                        .follower
+                        .as_ref()
+                        .is_some_and(|follower| follower.cursor_over_surface());
+                    (this.menu_open, this.menu_pinned, pointer_over)
+                });
+                let Ok((menu_open, menu_pinned, pointer_over)) = state else {
+                    break;
+                };
+
+                if !menu_open || menu_pinned || pointer_over {
+                    outside_since = None;
+                    continue;
+                }
+
+                let started = *outside_since.get_or_insert_with(Instant::now);
+                if started.elapsed() < MENU_CLOSE_DELAY {
+                    continue;
+                }
+
+                if this
+                    .update(cx, |this, cx| {
+                        let still_outside = this
+                            .follower
+                            .as_ref()
+                            .is_none_or(|follower| !follower.cursor_over_surface());
+                        if this.menu_open && !this.menu_pinned && still_outside {
+                            this.root_hovered = false;
+                            this.cancel_menu_open();
+                            this.set_menu_open(false, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                outside_since = None;
             }
         })
         .detach();

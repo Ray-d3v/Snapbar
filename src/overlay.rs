@@ -11,17 +11,17 @@ use std::{
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{HWND, RECT},
+    Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{
         DWMWA_BORDER_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
         DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic,
-        IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        ClientToScreen, GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongW, GetWindowRect,
+        HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
+        WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
@@ -145,6 +145,13 @@ impl TeamsWindowFollower {
         self.menu_open.store(open, Ordering::Release);
         apply_window_region(HWND(self.overlay_hwnd as *mut c_void), open);
     }
+
+    pub fn cursor_over_surface(&self) -> bool {
+        cursor_over_visible_surface(
+            HWND(self.overlay_hwnd as *mut c_void),
+            self.menu_open.load(Ordering::Acquire),
+        )
+    }
 }
 
 impl Drop for TeamsWindowFollower {
@@ -198,14 +205,45 @@ fn suppress_window_border(hwnd: HWND) {
     }
 }
 
-fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
+#[derive(Clone, Copy, Debug)]
+struct WindowMetrics {
+    window_left: i32,
+    window_top: i32,
+    client_screen_left: i32,
+    client_screen_top: i32,
+    client_width: i32,
+    client_height: i32,
+}
+
+fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
+    let mut client_rect = RECT::default();
+    let mut window_rect = RECT::default();
+    let mut client_origin = POINT::default();
     unsafe {
-        GetClientRect(hwnd, &mut rect).ok()?;
+        GetClientRect(hwnd, &mut client_rect).ok()?;
+        GetWindowRect(hwnd, &mut window_rect).ok()?;
+        ClientToScreen(hwnd, &mut client_origin).ok()?;
     }
-    let width = rect.right.saturating_sub(rect.left);
-    let height = rect.bottom.saturating_sub(rect.top);
-    (width > 0 && height > 0).then_some((width, height))
+
+    let client_width = client_rect.right.saturating_sub(client_rect.left);
+    let client_height = client_rect.bottom.saturating_sub(client_rect.top);
+    if client_width <= 0 || client_height <= 0 {
+        return None;
+    }
+
+    Some(WindowMetrics {
+        window_left: window_rect.left,
+        window_top: window_rect.top,
+        client_screen_left: client_origin.x,
+        client_screen_top: client_origin.y,
+        client_width,
+        client_height,
+    })
+}
+
+fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let metrics = window_metrics(hwnd)?;
+    Some((metrics.client_width, metrics.client_height))
 }
 
 fn scale_logical(value: i32, actual: i32, logical: i32) -> i32 {
@@ -213,27 +251,50 @@ fn scale_logical(value: i32, actual: i32, logical: i32) -> i32 {
 }
 
 fn apply_window_region(hwnd: HWND, menu_open: bool) {
-    let Some((width, height)) = client_size(hwnd) else {
+    let Some(metrics) = window_metrics(hwnd) else {
         return;
     };
 
-    let left = scale_logical(4, width, LOGICAL_WINDOW_WIDTH);
-    let right = scale_logical(282, width, LOGICAL_WINDOW_WIDTH);
-    let bar_top = scale_logical(4, height, LOGICAL_WINDOW_HEIGHT);
-    let bar_bottom = scale_logical(64, height, LOGICAL_WINDOW_HEIGHT);
-    let bar_radius = scale_logical(60, height, LOGICAL_WINDOW_HEIGHT).max(1);
-    let bar_region =
-        unsafe { CreateRoundRectRgn(left, bar_top, right, bar_bottom, bar_radius, bar_radius) };
+    // SetWindowRgn is window-relative, while the GPUI layout is client-relative.
+    let client_left = metrics.client_screen_left - metrics.window_left;
+    let client_top = metrics.client_screen_top - metrics.window_top;
+    let right = client_left + metrics.client_width + 1;
+
+    // Include the complete 68 px control-bar surface instead of clipping to the inner 60 px pill.
+    // This preserves button bottoms, antialiasing, and the shadow at every DPI.
+    let bar_height = scale_logical(68, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
+        .clamp(1, metrics.client_height);
+    let bar_bottom = client_top + bar_height + 1;
+    let bar_region = unsafe {
+        CreateRoundRectRgn(
+            client_left,
+            client_top,
+            right,
+            bar_bottom,
+            bar_height,
+            bar_height,
+        )
+    };
     if bar_region.is_null() {
         return;
     }
 
     if menu_open {
-        let menu_top = scale_logical(68, height, LOGICAL_WINDOW_HEIGHT);
-        let menu_bottom = scale_logical(238, height, LOGICAL_WINDOW_HEIGHT);
-        let menu_radius = scale_logical(40, height, LOGICAL_WINDOW_HEIGHT).max(1);
+        // Overlap by 4 logical pixels so there is no native dead strip between bar and menu.
+        let menu_top = client_top
+            + scale_logical(64, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
+                .clamp(0, metrics.client_height);
+        let menu_bottom = client_top + metrics.client_height + 1;
+        let menu_radius = scale_logical(40, metrics.client_height, LOGICAL_WINDOW_HEIGHT).max(1);
         let menu_region = unsafe {
-            CreateRoundRectRgn(left, menu_top, right, menu_bottom, menu_radius, menu_radius)
+            CreateRoundRectRgn(
+                client_left,
+                menu_top,
+                right,
+                menu_bottom,
+                menu_radius,
+                menu_radius,
+            )
         };
         if !menu_region.is_null() {
             let combined = unsafe { CombineRgn(bar_region, bar_region, menu_region, RGN_OR) };
@@ -255,6 +316,36 @@ fn apply_window_region(hwnd: HWND, menu_open: bool) {
             let _ = DeleteObject(bar_region);
         }
     }
+}
+
+fn cursor_over_visible_surface(hwnd: HWND, menu_open: bool) -> bool {
+    let Some(metrics) = window_metrics(hwnd) else {
+        return false;
+    };
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        return false;
+    }
+
+    let local_x = cursor.x - metrics.client_screen_left;
+    let local_y = cursor.y - metrics.client_screen_top;
+    if local_x < 0
+        || local_y < 0
+        || local_x >= metrics.client_width
+        || local_y >= metrics.client_height
+    {
+        return false;
+    }
+
+    let bar_bottom = scale_logical(68, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
+        .clamp(1, metrics.client_height);
+    if local_y < bar_bottom {
+        return true;
+    }
+
+    let menu_top = scale_logical(64, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
+        .clamp(0, metrics.client_height);
+    menu_open && local_y >= menu_top
 }
 
 fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement {
