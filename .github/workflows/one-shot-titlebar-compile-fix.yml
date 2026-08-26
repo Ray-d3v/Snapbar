@@ -1,0 +1,64 @@
+name: Apply title-bar compile repair
+
+on:
+  push:
+    branches: [feat/titlebar-hover-controls]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/titlebar-hover-controls
+          fetch-depth: 0
+
+      - name: Add stateful ID to compact capture button
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          path = Path("src/app.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '''            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded_full()
+                    .bg(capture_background)
+'''
+          new = '''            .child(
+                div()
+                    .id("compact-capture-button")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded_full()
+                    .bg(capture_background)
+'''
+          if old not in text:
+              raise RuntimeError("compact capture button block was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          '@ | python -
+
+      - name: Format and commit repair
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --force .github/workflows/one-shot-titlebar-compile-fix.yml
+          git add src/app.rs
+          git commit -m "fix: make compact capture control stateful"
+          git push origin HEAD:feat/titlebar-hover-controls
