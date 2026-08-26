@@ -17,8 +17,11 @@ def main() -> None:
     for source_name, target_name in MAPPING.items():
         source = Path(source_name)
         target = Path(target_name)
-        encoded = source.read_text(encoding="utf-8").strip()
-        decoded = gzip.decompress(base64.b64decode(encoded, validate=True))
+        encoded = "".join(source.read_text(encoding="utf-8").split())
+        try:
+            decoded = gzip.decompress(base64.b64decode(encoded))
+        except Exception as error:
+            raise RuntimeError(f"Could not decode {source_name}: {error}") from error
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(decoded)
 
