@@ -29,7 +29,6 @@ const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const TARGET_TOP_INSET: i32 = 12;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
-const LOGICAL_WINDOW_WIDTH: i32 = 286;
 const LOGICAL_WINDOW_HEIGHT: i32 = 246;
 const RGN_OR: i32 = 2;
 
