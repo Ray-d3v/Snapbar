@@ -1,0 +1,46 @@
+name: Apply native hover clippy cleanup
+
+on:
+  push:
+    branches: [fix/native-hover-titlebar-placement]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/native-hover-titlebar-placement
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fix and validate
+        shell: pwsh
+        run: |
+          $path = "src/overlay.rs"
+          $content = Get-Content $path -Raw
+          $content = $content.Replace("0x534e_01", "0x0053_4e01")
+          $content = $content.Replace("0x534e_02", "0x0053_4e02")
+          $content = $content.Replace("0x534e_03", "0x0053_4e03")
+          Set-Content $path $content -NoNewline
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          git diff --check
+      - name: Commit cleanup
+        shell: pwsh
+        run: |
+          Remove-Item ".github/workflows/one-shot-clippy-fix.yml" -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/overlay.rs .github/workflows/one-shot-clippy-fix.yml
+          git commit -m "fix: normalize native timer identifiers"
+          git push origin HEAD:fix/native-hover-titlebar-placement
