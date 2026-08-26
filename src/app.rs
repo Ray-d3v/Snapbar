@@ -17,12 +17,16 @@ use gpui::{
 };
 use gpui_platform::application;
 
-const WINDOW_WIDTH: f32 = 286.0;
-const EXPANDED_HEIGHT: f32 = 246.0;
-const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
-const MENU_OPEN_DELAY: Duration = Duration::from_millis(110);
-const MENU_CLOSE_DELAY: Duration = Duration::from_millis(220);
-const MENU_HOVER_WATCH_INTERVAL: Duration = Duration::from_millis(50);
+const WINDOW_WIDTH: f32 = 280.0;
+const WINDOW_HEIGHT: f32 = 40.0;
+const COLLAPSED_WIDTH: f32 = 92.0;
+const EXPANDED_WIDTH: f32 = 272.0;
+const COMPACT_WIDTH: f32 = 40.0;
+const SURFACE_HEIGHT: f32 = 36.0;
+const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const EXPAND_DELAY: Duration = Duration::from_millis(180);
+const COLLAPSE_DELAY: Duration = Duration::from_millis(400);
+const HOVER_WATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -43,18 +47,14 @@ struct Snapbar {
     resident: ResidentController,
     last_monitor_generation: u64,
     shared_content_hint: bool,
+    compact_layout: bool,
     settings: AppSettings,
-    menu_open: bool,
-    menu_pinned: bool,
-    menu_button_hovered: bool,
-    root_hovered: bool,
-    menu_open_generation: u64,
-    menu_close_generation: u64,
+    expanded: bool,
+    surface_hovered: bool,
+    expand_generation: u64,
+    collapse_generation: u64,
     capture_state: CaptureState,
-    capture_count: u64,
     capture_generation: u64,
-    last_latency_ms: Option<u128>,
-    last_saved_path: Option<String>,
     last_error: Option<String>,
 }
 
@@ -69,23 +69,19 @@ impl Snapbar {
             resident: ResidentController::start(),
             last_monitor_generation: u64::MAX,
             shared_content_hint: false,
+            compact_layout: false,
             settings: AppSettings::load(),
-            menu_open: false,
-            menu_pinned: false,
-            menu_button_hovered: false,
-            root_hovered: false,
-            menu_open_generation: 0,
-            menu_close_generation: 0,
+            expanded: false,
+            surface_hovered: false,
+            expand_generation: 0,
+            collapse_generation: 0,
             capture_state: CaptureState::NoTarget,
-            capture_count: 0,
             capture_generation: 0,
-            last_latency_ms: None,
-            last_saved_path: None,
             last_error: None,
         };
         snapbar.apply_meeting_snapshot(snapbar.meeting_monitor.snapshot());
         snapbar.start_resident_sync(window, cx);
-        snapbar.start_menu_hover_watch(window, cx);
+        snapbar.start_hover_watch(window, cx);
         snapbar
     }
 
@@ -114,32 +110,30 @@ impl Snapbar {
         .detach();
     }
 
-    fn start_menu_hover_watch(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_hover_watch(&self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let mut outside_since = None;
             loop {
-                cx.background_executor()
-                    .timer(MENU_HOVER_WATCH_INTERVAL)
-                    .await;
+                cx.background_executor().timer(HOVER_WATCH_INTERVAL).await;
 
                 let state = this.update(cx, |this, _| {
                     let pointer_over = this
                         .follower
                         .as_ref()
                         .is_some_and(|follower| follower.cursor_over_surface());
-                    (this.menu_open, this.menu_pinned, pointer_over)
+                    (this.expanded, this.compact_layout, pointer_over)
                 });
-                let Ok((menu_open, menu_pinned, pointer_over)) = state else {
+                let Ok((expanded, compact, pointer_over)) = state else {
                     break;
                 };
 
-                if !menu_open || menu_pinned || pointer_over {
+                if !expanded || compact || pointer_over {
                     outside_since = None;
                     continue;
                 }
 
                 let started = *outside_since.get_or_insert_with(Instant::now);
-                if started.elapsed() < MENU_CLOSE_DELAY {
+                if started.elapsed() < COLLAPSE_DELAY {
                     continue;
                 }
 
@@ -149,10 +143,10 @@ impl Snapbar {
                             .follower
                             .as_ref()
                             .is_none_or(|follower| !follower.cursor_over_surface());
-                        if this.menu_open && !this.menu_pinned && still_outside {
-                            this.root_hovered = false;
-                            this.cancel_menu_open();
-                            this.set_menu_open(false, cx);
+                        if this.expanded && !this.compact_layout && still_outside {
+                            this.surface_hovered = false;
+                            this.cancel_expand();
+                            this.set_expanded(false, cx);
                         }
                     })
                     .is_err()
@@ -180,6 +174,21 @@ impl Snapbar {
         let snapshot = self.meeting_monitor.snapshot();
         if snapshot.generation != self.last_monitor_generation {
             self.apply_meeting_snapshot(snapshot);
+            changed = true;
+        }
+
+        let compact_layout = self
+            .follower
+            .as_ref()
+            .is_some_and(TeamsWindowFollower::is_compact);
+        if compact_layout != self.compact_layout {
+            self.compact_layout = compact_layout;
+            if compact_layout {
+                self.expanded = false;
+                if let Some(follower) = &self.follower {
+                    follower.set_expanded(false);
+                }
+            }
             changed = true;
         }
 
@@ -245,6 +254,10 @@ impl Snapbar {
                 self.capture_state = CaptureState::NoTarget;
                 self.last_error = None;
                 self.shared_content_hint = false;
+                self.expanded = false;
+                if let Some(follower) = &self.follower {
+                    follower.set_expanded(false);
+                }
                 self.sync_follower();
             }
         }
@@ -285,100 +298,82 @@ impl Snapbar {
         }
     }
 
-    fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.menu_open == open {
+    fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        let expanded = expanded && !self.compact_layout;
+        if self.expanded == expanded {
             return;
         }
-        self.menu_open = open;
+        self.expanded = expanded;
         if let Some(follower) = &self.follower {
-            follower.set_menu_open(open);
+            follower.set_expanded(expanded);
         }
         cx.notify();
     }
 
-    fn cancel_menu_open(&mut self) {
-        self.menu_open_generation = self.menu_open_generation.wrapping_add(1);
+    fn cancel_expand(&mut self) {
+        self.expand_generation = self.expand_generation.wrapping_add(1);
     }
 
-    fn cancel_menu_close(&mut self) {
-        self.menu_close_generation = self.menu_close_generation.wrapping_add(1);
+    fn cancel_collapse(&mut self) {
+        self.collapse_generation = self.collapse_generation.wrapping_add(1);
     }
 
-    fn schedule_menu_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu_open || self.menu_pinned {
+    fn schedule_expand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.expanded || self.compact_layout {
             return;
         }
-        self.cancel_menu_open();
-        let generation = self.menu_open_generation;
+        self.cancel_expand();
+        let generation = self.expand_generation;
         cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(MENU_OPEN_DELAY).await;
+            cx.background_executor().timer(EXPAND_DELAY).await;
             let _ = this.update(cx, |this, cx| {
-                if this.menu_open_generation == generation
-                    && this.menu_button_hovered
-                    && !this.menu_pinned
+                if this.expand_generation == generation
+                    && this.surface_hovered
+                    && !this.compact_layout
                 {
-                    this.set_menu_open(true, cx);
+                    this.set_expanded(true, cx);
                 }
             });
         })
         .detach();
     }
 
-    fn schedule_menu_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu_pinned || !self.menu_open {
+    fn schedule_collapse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.expanded {
             return;
         }
-        self.cancel_menu_close();
-        let generation = self.menu_close_generation;
+        self.cancel_collapse();
+        let generation = self.collapse_generation;
         cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(MENU_CLOSE_DELAY).await;
+            cx.background_executor().timer(COLLAPSE_DELAY).await;
             let _ = this.update(cx, |this, cx| {
-                if this.menu_close_generation == generation
-                    && !this.root_hovered
-                    && !this.menu_pinned
+                let pointer_over = this
+                    .follower
+                    .as_ref()
+                    .is_some_and(|follower| follower.cursor_over_surface());
+                if this.collapse_generation == generation && !this.surface_hovered && !pointer_over
                 {
-                    this.set_menu_open(false, cx);
+                    this.set_expanded(false, cx);
                 }
             });
         })
         .detach();
     }
 
-    fn on_target_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.request_redetection();
-        cx.notify();
+    fn on_surface_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.surface_hovered = *hovered;
+        if *hovered {
+            self.cancel_collapse();
+            self.schedule_expand(window, cx);
+        } else {
+            self.cancel_expand();
+            self.schedule_collapse(window, cx);
+        }
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.request_redetection();
         cx.notify();
-    }
-
-    fn on_menu_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_menu_open();
-        self.cancel_menu_close();
-        self.menu_pinned = !self.menu_pinned;
-        self.set_menu_open(self.menu_pinned, cx);
-    }
-
-    fn on_menu_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu_button_hovered = *hovered;
-        if *hovered {
-            self.cancel_menu_close();
-            self.schedule_menu_open(window, cx);
-        } else {
-            self.cancel_menu_open();
-        }
-    }
-
-    fn on_root_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.root_hovered = *hovered;
-        if *hovered {
-            self.cancel_menu_close();
-        } else {
-            self.cancel_menu_open();
-            self.schedule_menu_close(window, cx);
-        }
     }
 
     fn on_save_toggle_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -443,22 +438,13 @@ impl Snapbar {
                     Ok((receipt, save_result)) => {
                         show_capture_flash(receipt.screen_rect);
                         let _ = receipt.frame_age;
-                        this.capture_count = this.capture_count.saturating_add(1);
+                        let _ = receipt.latency;
                         this.capture_state = CaptureState::Copied;
-                        this.last_latency_ms = Some(receipt.latency.as_millis());
-                        this.last_saved_path = None;
                         this.last_error = None;
 
-                        if let Some(save_result) = save_result {
-                            match save_result {
-                                Ok(path) => {
-                                    this.last_saved_path = Some(path.display().to_string());
-                                }
-                                Err(error) => {
-                                    this.last_error =
-                                        Some(format!("コピー済み / ファイル保存失敗: {error}"));
-                                }
-                            }
+                        if let Some(Err(error)) = save_result {
+                            this.last_error =
+                                Some(format!("コピー済み / ファイル保存失敗: {error}"));
                         }
                     }
                     Err(error) => {
@@ -473,63 +459,41 @@ impl Snapbar {
         .detach();
     }
 
-    fn target_label(&self) -> String {
-        if self.current_target().is_none() {
-            return "会議待機中".to_string();
+    fn status_label(&self) -> &'static str {
+        if self.last_error.is_some() {
+            return "要確認";
         }
-        if self
-            .capture_engine
-            .as_ref()
-            .is_some_and(CaptureEngine::is_ready)
-        {
-            "Teams".to_string()
-        } else {
-            "共有待ち".to_string()
-        }
-    }
-
-    fn menu_summary(&self) -> String {
-        if let Some(error) = &self.last_error {
-            return truncate(error, 38);
-        }
-        if let Some(path) = &self.last_saved_path {
-            return format!("保存: {}", truncate(path, 31));
-        }
-        let state = match self.capture_state {
+        match self.capture_state {
             CaptureState::Idle => "準備完了",
             CaptureState::WaitingForShare => "共有待ち",
             CaptureState::Capturing => "撮影中",
-            CaptureState::Copied if self.settings.save_to_screenshots => "コピー・保存済み",
-            CaptureState::Copied => "コピー済み",
-            CaptureState::NoTarget => "会議待機中",
+            CaptureState::Copied => "コピー済",
+            CaptureState::NoTarget => "会議待ち",
             CaptureState::Error => "要確認",
-        };
-        let latency = self
-            .last_latency_ms
-            .map(|value| format!(" · {value}ms"))
-            .unwrap_or_default();
-        format!("{state} · {}枚{latency}", self.capture_count)
+        }
+    }
+
+    fn status_color(&self) -> gpui::Rgba {
+        match self.capture_state {
+            CaptureState::Idle | CaptureState::Copied => rgb(0x55c27c),
+            CaptureState::Capturing => rgb(0xe5484d),
+            CaptureState::WaitingForShare | CaptureState::NoTarget => rgb(0xe0a24a),
+            CaptureState::Error => rgb(0xf07178),
+        }
     }
 }
 
 impl Render for Snapbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_target = self.current_target().is_some();
         let can_capture = self
             .capture_engine
             .as_ref()
             .is_some_and(CaptureEngine::is_ready)
             && self.capture_state != CaptureState::Capturing;
-        let menu_open = self.menu_open;
         let save_to_screenshots = self.settings.save_to_screenshots;
+        let status_color = self.status_color();
         let primary_text = rgb(0xf5f5f6);
-        let secondary_text = rgb(0x96969d);
-        let target_icon_color = match self.capture_state {
-            CaptureState::Error => rgb(0xf07178),
-            CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0xe0a24a),
-            _ if has_target => rgb(0xd7d7dc),
-            _ => secondary_text,
-        };
+        let secondary_text = rgb(0x9b9ba2);
         let capture_background = match self.capture_state {
             CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0x35353a),
             CaptureState::Capturing => rgb(0xc83f47),
@@ -537,39 +501,91 @@ impl Render for Snapbar {
             CaptureState::Idle | CaptureState::Copied => rgb(0xe5484d),
         };
 
-        let target_button = div()
-            .id("target-button")
+        let compact_camera = div()
+            .id("compact-capture")
             .flex()
             .items_center()
-            .gap(px(9.0))
-            .w(px(126.0))
-            .h(px(44.0))
-            .px(px(11.0))
-            .rounded(px(15.0))
+            .justify_center()
+            .w(px(COMPACT_WIDTH))
+            .h(px(SURFACE_HEIGHT))
+            .rounded_full()
+            .bg(rgb(0x0b0b0d))
+            .shadow_sm()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded_full()
+                    .bg(capture_background)
+                    .when(can_capture, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|button| button.opacity(0.91))
+                            .active(|button| button.opacity(0.68))
+                            .on_click(cx.listener(Self::on_capture_clicked))
+                    })
+                    .when(!can_capture, |button| button.opacity(0.66))
+                    .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
+                        if can_capture {
+                            rgb(0xffffff)
+                        } else {
+                            rgb(0xa7a7ac)
+                        },
+                    )),
+            );
+
+        let collapsed = div()
+            .id("titlebar-trigger")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(7.0))
+            .w(px(COLLAPSED_WIDTH))
+            .h(px(30.0))
+            .rounded_full()
+            .bg(rgb(0x0b0b0d))
+            .shadow_sm()
             .cursor_pointer()
-            .text_sm()
-            .text_color(if has_target {
-                primary_text
-            } else {
-                secondary_text
-            })
-            .hover(|button| button.bg(rgb(0x18181b)))
-            .active(|button| button.opacity(0.72))
-            .on_click(cx.listener(Self::on_target_clicked))
+            .on_hover(cx.listener(Self::on_surface_hovered))
+            .child(div().size(px(7.0)).rounded_full().bg(status_color))
             .child(
                 svg()
-                    .path("icons/window.svg")
-                    .size(px(18.0))
-                    .text_color(target_icon_color),
+                    .path("icons/camera.svg")
+                    .size(px(15.0))
+                    .text_color(if can_capture {
+                        primary_text
+                    } else {
+                        secondary_text
+                    }),
             )
-            .child(self.target_label());
+            .child(div().text_xs().text_color(primary_text).child("Snapbar"));
 
-        let capture_button = div()
+        let status = div()
+            .id("status-button")
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .w(px(82.0))
+            .h(px(28.0))
+            .px(px(8.0))
+            .rounded(px(11.0))
+            .cursor_pointer()
+            .text_xs()
+            .text_color(primary_text)
+            .hover(|button| button.bg(rgb(0x1a1a1e)))
+            .active(|button| button.opacity(0.72))
+            .on_click(cx.listener(Self::on_refresh_clicked))
+            .child(div().size(px(7.0)).rounded_full().bg(status_color))
+            .child(self.status_label());
+
+        let capture = div()
             .id("capture-button")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(46.0))
+            .size(px(32.0))
             .rounded_full()
             .bg(capture_background)
             .shadow_sm()
@@ -581,13 +597,10 @@ impl Render for Snapbar {
                     .on_click(cx.listener(Self::on_capture_clicked))
             })
             .when(!can_capture, |button| button.opacity(0.66))
-            .when(self.capture_state == CaptureState::Capturing, |button| {
-                button.opacity(0.76)
-            })
             .child(
                 svg()
                     .path("icons/camera.svg")
-                    .size(px(20.0))
+                    .size(px(17.0))
                     .text_color(if can_capture {
                         rgb(0xffffff)
                     } else {
@@ -595,192 +608,115 @@ impl Render for Snapbar {
                     }),
             );
 
-        let menu_icon_color = if menu_open {
-            primary_text
-        } else {
-            rgb(0xc8c8ce)
-        };
-        let menu_button = div()
-            .id("menu-button")
+        let save = div()
+            .id("save-toggle")
             .flex()
             .items_center()
             .justify_center()
-            .size(px(42.0))
-            .rounded(px(14.0))
+            .size(px(30.0))
+            .rounded(px(10.0))
             .cursor_pointer()
-            .bg(if menu_open {
-                rgb(0x242428)
+            .bg(if save_to_screenshots {
+                rgb(0x285d40)
             } else {
-                rgb(0x17171a)
+                rgb(0x18181b)
             })
-            .hover(|button| button.bg(rgb(0x28282d)))
+            .hover(|button| {
+                button.bg(if save_to_screenshots {
+                    rgb(0x347451)
+                } else {
+                    rgb(0x28282d)
+                })
+            })
             .active(|button| button.opacity(0.72))
-            .on_hover(cx.listener(Self::on_menu_hovered))
-            .on_click(cx.listener(Self::on_menu_clicked))
-            .child(
-                svg()
-                    .path("icons/menu.svg")
-                    .size(px(20.0))
-                    .text_color(menu_icon_color),
-            );
+            .on_click(cx.listener(Self::on_save_toggle_clicked))
+            .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
+                if save_to_screenshots {
+                    rgb(0xe8fff0)
+                } else {
+                    rgb(0xc8c8cd)
+                },
+            ));
 
-        let bar = div()
-            .id("snapbar")
+        let refresh = div()
+            .id("refresh-button")
             .flex()
             .items_center()
-            .gap(px(12.0))
-            .w_full()
-            .h(px(60.0))
-            .px(px(14.0))
+            .justify_center()
+            .size(px(30.0))
+            .rounded(px(10.0))
+            .cursor_pointer()
+            .bg(rgb(0x18181b))
+            .hover(|button| button.bg(rgb(0x28282d)))
+            .active(|button| button.opacity(0.72))
+            .on_click(cx.listener(Self::on_refresh_clicked))
+            .child(
+                svg()
+                    .path("icons/refresh.svg")
+                    .size(px(16.0))
+                    .text_color(rgb(0xc8c8cd)),
+            );
+
+        let quit = div()
+            .id("quit-button")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(30.0))
+            .rounded(px(10.0))
+            .cursor_pointer()
+            .bg(rgb(0x18181b))
+            .hover(|button| button.bg(rgb(0x3a2025)))
+            .active(|button| button.opacity(0.72))
+            .on_click(|_, _, cx| cx.quit())
+            .child(
+                svg()
+                    .path("icons/power.svg")
+                    .size(px(16.0))
+                    .text_color(rgb(0xf07178)),
+            );
+
+        let expanded = div()
+            .id("titlebar-controls")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .w(px(EXPANDED_WIDTH))
+            .h(px(SURFACE_HEIGHT))
+            .px(px(7.0))
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_lg()
-            .child(target_button)
-            .child(capture_button)
-            .child(menu_button);
+            .on_hover(cx.listener(Self::on_surface_hovered))
+            .child(status)
+            .child(capture)
+            .child(save)
+            .child(refresh)
+            .child(quit);
 
-        let toggle = div()
-            .flex()
-            .items_center()
-            .w(px(38.0))
-            .h(px(22.0))
-            .px(px(2.0))
-            .rounded_full()
-            .bg(if save_to_screenshots {
-                rgb(0x2f8f5b)
-            } else {
-                rgb(0x343439)
-            })
-            .when(save_to_screenshots, |toggle| toggle.justify_end())
-            .when(!save_to_screenshots, |toggle| toggle.justify_start())
-            .child(div().size(px(18.0)).rounded_full().bg(rgb(0xf4f4f5)));
-
-        let save_row = div()
-            .id("save-toggle-row")
-            .flex()
-            .items_center()
-            .justify_between()
-            .w_full()
-            .h(px(56.0))
-            .px(px(12.0))
-            .rounded(px(14.0))
-            .cursor_pointer()
-            .hover(|row| row.bg(rgb(0x1a1a1e)))
-            .active(|row| row.opacity(0.76))
-            .on_click(cx.listener(Self::on_save_toggle_clicked))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        svg()
-                            .path("icons/folder.svg")
-                            .size(px(18.0))
-                            .text_color(rgb(0xc8c8cd)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(primary_text)
-                                    .child("ファイルにも保存"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(secondary_text)
-                                    .child("Windows スクリーンショット"),
-                            ),
-                    ),
-            )
-            .child(toggle);
-
-        let refresh_row = menu_action(
-            "refresh-row",
-            "icons/refresh.svg",
-            "会議・共有を再検出",
-            primary_text,
-        )
-        .on_click(cx.listener(Self::on_refresh_clicked));
-
-        let quit_row = menu_action(
-            "quit-row",
-            "icons/power.svg",
-            "Snapbarを終了",
-            rgb(0xf07178),
-        )
-        .on_click(|_, _, cx| cx.quit());
-
-        let menu = div()
-            .id("hover-menu")
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .w_full()
-            .h(px(170.0))
-            .p(px(10.0))
-            .rounded(px(20.0))
-            .bg(rgb(0x0d0d0f))
-            .shadow_lg()
-            .child(save_row)
-            .child(refresh_row)
-            .child(quit_row)
-            .child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .pt(px(2.0))
-                    .text_xs()
-                    .text_color(rgb(0x7e7e85))
-                    .child(self.menu_summary()),
-            );
+        let surface = if self.compact_layout {
+            compact_camera
+        } else if self.expanded {
+            expanded
+        } else {
+            collapsed
+        };
 
         div()
-            .id("root-hover-region")
+            .id("titlebar-overlay-root")
             .flex()
-            .flex_col()
-            .gap(px(4.0))
+            .items_center()
+            .justify_center()
             .size_full()
-            .p(px(4.0))
             .bg(transparent_black())
-            .on_hover(cx.listener(Self::on_root_hovered))
-            .child(bar)
-            .when(menu_open, |root| root.child(menu))
+            .child(surface)
     }
-}
-
-fn menu_action(
-    id: &'static str,
-    icon: &'static str,
-    label: &'static str,
-    color: gpui::Rgba,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .w_full()
-        .h(px(38.0))
-        .px(px(12.0))
-        .rounded(px(12.0))
-        .cursor_pointer()
-        .text_sm()
-        .text_color(color)
-        .hover(|row| row.bg(rgb(0x1a1a1e)))
-        .active(|row| row.opacity(0.76))
-        .child(svg().path(icon).size(px(18.0)))
-        .child(label)
 }
 
 pub fn run() {
     application().with_assets(Assets).run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(EXPANDED_HEIGHT)), cx);
+        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -800,14 +736,4 @@ pub fn run() {
 
         cx.activate(true);
     });
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let shortened: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
-    }
 }

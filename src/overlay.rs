@@ -13,8 +13,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
-        DwmSetWindowAttribute,
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_EXTENDED_FRAME_BOUNDS,
+        DwmGetWindowAttribute, DwmSetWindowAttribute,
     },
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongW, GetWindowRect, HWND_TOPMOST,
@@ -27,10 +27,14 @@ use windows::Win32::{
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
-const TARGET_TOP_INSET: i32 = 12;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
-const LOGICAL_WINDOW_HEIGHT: i32 = 246;
-const RGN_OR: i32 = 2;
+const LOGICAL_WINDOW_WIDTH: i32 = 280;
+const LOGICAL_WINDOW_HEIGHT: i32 = 40;
+const LOGICAL_COLLAPSED_WIDTH: i32 = 92;
+const LOGICAL_EXPANDED_WIDTH: i32 = 272;
+const LOGICAL_COMPACT_WIDTH: i32 = 40;
+const LOGICAL_SURFACE_HEIGHT: i32 = 36;
+const LOGICAL_SURFACE_TOP: i32 = 2;
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
@@ -42,12 +46,6 @@ unsafe extern "system" {
         width: i32,
         height: i32,
     ) -> *mut c_void;
-    fn CombineRgn(
-        destination: *mut c_void,
-        source1: *mut c_void,
-        source2: *mut c_void,
-        mode: i32,
-    ) -> i32;
     fn DeleteObject(object: *mut c_void) -> i32;
 }
 
@@ -60,12 +58,13 @@ unsafe extern "system" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverlayPlacement {
     Hidden,
-    Visible { x: i32, y: i32 },
+    Visible { x: i32, y: i32, compact: bool },
 }
 
 pub struct TeamsWindowFollower {
     target_id: Arc<AtomicU32>,
-    menu_open: Arc<AtomicBool>,
+    expanded: Arc<AtomicBool>,
+    compact: Arc<AtomicBool>,
     overlay_hwnd: isize,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -75,16 +74,18 @@ impl TeamsWindowFollower {
     pub fn start(window: &Window) -> Option<Self> {
         let overlay_hwnd = window_hwnd(window)?;
         configure_overlay_window(overlay_hwnd);
-        apply_window_region(overlay_hwnd, false);
+        apply_window_region(overlay_hwnd, false, false);
         unsafe {
             let _ = ShowWindow(overlay_hwnd, SW_HIDE);
         }
 
         let target_id = Arc::new(AtomicU32::new(0));
-        let menu_open = Arc::new(AtomicBool::new(false));
+        let expanded = Arc::new(AtomicBool::new(false));
+        let compact = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_target_id = Arc::clone(&target_id);
-        let thread_menu_open = Arc::clone(&menu_open);
+        let thread_expanded = Arc::clone(&expanded);
+        let thread_compact = Arc::clone(&compact);
         let thread_stop = Arc::clone(&stop);
         let overlay_value = overlay_hwnd.0 as isize;
         let worker = thread::Builder::new()
@@ -95,15 +96,9 @@ impl TeamsWindowFollower {
                     let _ = SetWindowDisplayAffinity(overlay_hwnd, WDA_EXCLUDEFROMCAPTURE);
                 }
 
-                let mut previous = None;
-                let mut previous_client_size = None;
+                let mut previous_placement = None;
+                let mut previous_region_state = None;
                 while !thread_stop.load(Ordering::Acquire) {
-                    let client_size = client_size(overlay_hwnd);
-                    if client_size != previous_client_size {
-                        apply_window_region(overlay_hwnd, thread_menu_open.load(Ordering::Acquire));
-                        previous_client_size = client_size;
-                    }
-
                     let target_id = thread_target_id.load(Ordering::Acquire);
                     let placement = if target_id == 0 {
                         OverlayPlacement::Hidden
@@ -112,9 +107,20 @@ impl TeamsWindowFollower {
                         desired_placement(overlay_hwnd, target_hwnd)
                     };
 
-                    if previous != Some(placement) {
+                    let compact_layout =
+                        matches!(placement, OverlayPlacement::Visible { compact: true, .. });
+                    thread_compact.store(compact_layout, Ordering::Release);
+                    let expanded_layout =
+                        thread_expanded.load(Ordering::Acquire) && !compact_layout;
+                    let region_state = (client_size(overlay_hwnd), expanded_layout, compact_layout);
+                    if previous_region_state != Some(region_state) {
+                        apply_window_region(overlay_hwnd, expanded_layout, compact_layout);
+                        previous_region_state = Some(region_state);
+                    }
+
+                    if previous_placement != Some(placement) {
                         apply_placement(overlay_hwnd, placement);
-                        previous = Some(placement);
+                        previous_placement = Some(placement);
                     }
 
                     thread::sleep(if target_id == 0 {
@@ -129,7 +135,8 @@ impl TeamsWindowFollower {
 
         Some(Self {
             target_id,
-            menu_open,
+            expanded,
+            compact,
             overlay_hwnd: overlay_value,
             stop,
             worker: Some(worker),
@@ -141,15 +148,26 @@ impl TeamsWindowFollower {
             .store(target_id.unwrap_or_default(), Ordering::Release);
     }
 
-    pub fn set_menu_open(&self, open: bool) {
-        self.menu_open.store(open, Ordering::Release);
-        apply_window_region(HWND(self.overlay_hwnd as *mut c_void), open);
+    pub fn set_expanded(&self, expanded: bool) {
+        self.expanded.store(expanded, Ordering::Release);
+        let compact = self.compact.load(Ordering::Acquire);
+        apply_window_region(
+            HWND(self.overlay_hwnd as *mut c_void),
+            expanded && !compact,
+            compact,
+        );
+    }
+
+    pub fn is_compact(&self) -> bool {
+        self.compact.load(Ordering::Acquire)
     }
 
     pub fn cursor_over_surface(&self) -> bool {
+        let compact = self.compact.load(Ordering::Acquire);
         cursor_over_visible_surface(
             HWND(self.overlay_hwnd as *mut c_void),
-            self.menu_open.load(Ordering::Acquire),
+            self.expanded.load(Ordering::Acquire) && !compact,
+            compact,
         )
     }
 }
@@ -252,75 +270,66 @@ fn scale_logical(value: i32, actual: i32, logical: i32) -> i32 {
     ((i64::from(value) * i64::from(actual)) / i64::from(logical)) as i32
 }
 
-fn apply_window_region(hwnd: HWND, menu_open: bool) {
+fn surface_rect(width: i32, height: i32, expanded: bool, compact: bool) -> RECT {
+    let logical_width = if compact {
+        LOGICAL_COMPACT_WIDTH
+    } else if expanded {
+        LOGICAL_EXPANDED_WIDTH
+    } else {
+        LOGICAL_COLLAPSED_WIDTH
+    };
+    let surface_width = scale_logical(logical_width, width, LOGICAL_WINDOW_WIDTH).clamp(1, width);
+    let surface_height =
+        scale_logical(LOGICAL_SURFACE_HEIGHT, height, LOGICAL_WINDOW_HEIGHT).clamp(1, height);
+    let surface_top = scale_logical(LOGICAL_SURFACE_TOP, height, LOGICAL_WINDOW_HEIGHT)
+        .clamp(0, height.saturating_sub(surface_height));
+    let surface_left = (width - surface_width) / 2;
+
+    RECT {
+        left: surface_left,
+        top: surface_top,
+        right: surface_left + surface_width,
+        bottom: surface_top + surface_height,
+    }
+}
+
+fn apply_window_region(hwnd: HWND, expanded: bool, compact: bool) {
     let Some(metrics) = window_metrics(hwnd) else {
         return;
     };
 
-    // SetWindowRgn is window-relative, while the GPUI layout is client-relative.
     let client_left = metrics.client_screen_left - metrics.window_left;
     let client_top = metrics.client_screen_top - metrics.window_top;
-    let right = client_left + metrics.client_width + 1;
-
-    // Include the complete 68 px control-bar surface instead of clipping to the inner 60 px pill.
-    // This preserves button bottoms, antialiasing, and the shadow at every DPI.
-    let bar_height = scale_logical(68, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
-        .clamp(1, metrics.client_height);
-    let bar_bottom = client_top + bar_height + 1;
-    let bar_region = unsafe {
+    let surface = surface_rect(
+        metrics.client_width,
+        metrics.client_height,
+        expanded,
+        compact,
+    );
+    let height = surface.bottom.saturating_sub(surface.top).max(1);
+    let region = unsafe {
         CreateRoundRectRgn(
-            client_left,
-            client_top,
-            right,
-            bar_bottom,
-            bar_height,
-            bar_height,
+            client_left + surface.left,
+            client_top + surface.top,
+            client_left + surface.right + 1,
+            client_top + surface.bottom + 1,
+            height,
+            height,
         )
     };
-    if bar_region.is_null() {
+    if region.is_null() {
         return;
     }
 
-    if menu_open {
-        // Overlap by 4 logical pixels so there is no native dead strip between bar and menu.
-        let menu_top = client_top
-            + scale_logical(64, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
-                .clamp(0, metrics.client_height);
-        let menu_bottom = client_top + metrics.client_height + 1;
-        let menu_radius = scale_logical(40, metrics.client_height, LOGICAL_WINDOW_HEIGHT).max(1);
-        let menu_region = unsafe {
-            CreateRoundRectRgn(
-                client_left,
-                menu_top,
-                right,
-                menu_bottom,
-                menu_radius,
-                menu_radius,
-            )
-        };
-        if !menu_region.is_null() {
-            let combined = unsafe { CombineRgn(bar_region, bar_region, menu_region, RGN_OR) };
-            unsafe {
-                let _ = DeleteObject(menu_region);
-            }
-            if combined == 0 {
-                unsafe {
-                    let _ = DeleteObject(bar_region);
-                }
-                return;
-            }
-        }
-    }
-
-    let applied = unsafe { SetWindowRgn(hwnd.0, bar_region, 1) };
+    let applied = unsafe { SetWindowRgn(hwnd.0, region, 1) };
     if applied == 0 {
         unsafe {
-            let _ = DeleteObject(bar_region);
+            let _ = DeleteObject(region);
         }
     }
 }
 
-fn cursor_over_visible_surface(hwnd: HWND, menu_open: bool) -> bool {
+fn cursor_over_visible_surface(hwnd: HWND, expanded: bool, compact: bool) -> bool {
     let Some(metrics) = window_metrics(hwnd) else {
         return false;
     };
@@ -331,23 +340,16 @@ fn cursor_over_visible_surface(hwnd: HWND, menu_open: bool) -> bool {
 
     let local_x = cursor.x - metrics.client_screen_left;
     let local_y = cursor.y - metrics.client_screen_top;
-    if local_x < 0
-        || local_y < 0
-        || local_x >= metrics.client_width
-        || local_y >= metrics.client_height
-    {
-        return false;
-    }
-
-    let bar_bottom = scale_logical(68, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
-        .clamp(1, metrics.client_height);
-    if local_y < bar_bottom {
-        return true;
-    }
-
-    let menu_top = scale_logical(64, metrics.client_height, LOGICAL_WINDOW_HEIGHT)
-        .clamp(0, metrics.client_height);
-    menu_open && local_y >= menu_top
+    let surface = surface_rect(
+        metrics.client_width,
+        metrics.client_height,
+        expanded,
+        compact,
+    );
+    local_x >= surface.left
+        && local_x < surface.right
+        && local_y >= surface.top
+        && local_y < surface.bottom
 }
 
 fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement {
@@ -372,14 +374,44 @@ fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement 
 
     let target_width = target_rect.right.saturating_sub(target_rect.left);
     let overlay_width = overlay_rect.right.saturating_sub(overlay_rect.left);
-    if target_width <= 0 || overlay_width <= 0 {
+    let overlay_height = overlay_rect.bottom.saturating_sub(overlay_rect.top);
+    if target_width <= 0 || overlay_width <= 0 || overlay_height <= 0 {
         return OverlayPlacement::Hidden;
     }
 
-    OverlayPlacement::Visible {
-        x: target_rect.left + (target_width - overlay_width) / 2,
-        y: target_rect.top + TARGET_TOP_INSET,
-    }
+    let caption = caption_button_bounds(target_hwnd);
+    let caption_height = caption
+        .map(|rect| rect.bottom.saturating_sub(rect.top))
+        .filter(|height| *height >= overlay_height && *height <= 96)
+        .unwrap_or(overlay_height + 6);
+    let caption_top = caption
+        .map(|rect| rect.top)
+        .filter(|top| *top >= 0 && *top <= 32)
+        .unwrap_or_default();
+    let caption_left = caption
+        .map(|rect| rect.left)
+        .filter(|left| *left > target_width / 2 && *left < target_width)
+        .unwrap_or(target_width * 7 / 8);
+
+    let safe_left = target_width / 6;
+    let safe_right = caption_left.saturating_sub(8).max(target_width / 2);
+    let available_width = safe_right.saturating_sub(safe_left);
+    let compact = available_width < overlay_width;
+    let window_center = target_width / 2;
+    let safe_center = if compact {
+        window_center
+    } else {
+        let minimum_center = safe_left.saturating_add(overlay_width / 2);
+        let maximum_center = safe_right.saturating_sub(overlay_width / 2);
+        window_center.clamp(minimum_center, maximum_center.max(minimum_center))
+    };
+
+    let min_x = target_rect.left;
+    let max_x = target_rect.right.saturating_sub(overlay_width).max(min_x);
+    let x = (target_rect.left + safe_center - overlay_width / 2).clamp(min_x, max_x);
+    let y = target_rect.top + caption_top + (caption_height - overlay_height).max(0) / 2;
+
+    OverlayPlacement::Visible { x, y, compact }
 }
 
 fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
@@ -388,7 +420,7 @@ fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
             OverlayPlacement::Hidden => {
                 let _ = ShowWindow(overlay_hwnd, SW_HIDE);
             }
-            OverlayPlacement::Visible { x, y } => {
+            OverlayPlacement::Visible { x, y, .. } => {
                 let _ = SetWindowPos(
                     overlay_hwnd,
                     Some(HWND_TOPMOST),
@@ -402,6 +434,20 @@ fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
             }
         }
     }
+}
+
+fn caption_button_bounds(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_BUTTON_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()?;
+    }
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
 }
 
 fn extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
