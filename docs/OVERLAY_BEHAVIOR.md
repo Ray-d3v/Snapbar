@@ -5,6 +5,7 @@ The Snapbar control surface is a fixed-size transparent GPUI window whose native
 - The overlay window follows the center-safe area of the active Teams title bar. It must not sit over the meeting content or the Teams meeting control row.
 - `DWMWA_EXTENDED_FRAME_BOUNDS` provides the Teams frame in screen coordinates. `DWMWA_CAPTION_BUTTON_BOUNDS` limits the usable right side of the title bar.
 - The idle surface is a centered 92 × 30 logical-pixel pill. It expands horizontally to a 272 × 36 logical-pixel control strip after the configured hover delay.
+- The visible surface, rather than the larger transparent GPUI window, is vertically centered inside the measured caption band so DPI scaling cannot push controls into the meeting UI.
 - The window never expands downward. Capture, save, rescan, and exit actions remain on one horizontal row.
 - When the title-bar safe span is too narrow for the full strip, only the centered camera control is exposed; the compact camera remains a stateful, directly clickable control.
 - The native region must be expressed in window-relative coordinates, including the client-area origin offset.
