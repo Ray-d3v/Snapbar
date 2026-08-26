@@ -1,0 +1,67 @@
+name: Repair and apply GPUI hover refactor
+
+on:
+  push:
+    branches: [fix/gpui-hover-disclosure]
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gpui-hover-disclosure
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Execute repaired refactor script
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path(".github/workflows/one-shot-gpui-hover-refactor-v2.yml").read_text(encoding="utf-8")
+          start_marker = "          @'\n"
+          end_marker = "          '@ | python -\n"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          script = textwrap.dedent(workflow[start:end])
+
+          old = r'''r"    pub fn set_target\(&self, target_id: Option<u32>\) \{.*?\n    \}\n\n(?=impl Drop for TeamsWindowFollower)"'''
+          new = r'''r"    pub fn set_target\(&self, target_id: Option<u32>\) \{.*?\n\}\n\n(?=impl Drop for TeamsWindowFollower)"'''
+          if script.count(old) != 1:
+              raise RuntimeError(f"expected one follower-method pattern, found {script.count(old)}")
+          script = script.replace(old, new, 1)
+          exec(compile(script, "hover-refactor-v2.py", "exec"), {"__name__": "__main__"})
+          '@ | python -
+
+      - name: Format and compile-check
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo check --all-targets
+          git diff --check
+
+      - name: Commit refactor
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --force .github/workflows/one-shot-gpui-hover-refactor.yml .github/workflows/one-shot-gpui-hover-refactor-v2.yml .github/workflows/one-shot-gpui-hover-refactor-v3.yml
+          git add AGENTS.md README.md docs/OVERLAY_BEHAVIOR.md src/app.rs src/overlay.rs
+          git commit -m "fix: simplify title-bar hover disclosure"
+          git push origin HEAD:fix/gpui-hover-disclosure
