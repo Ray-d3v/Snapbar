@@ -14,6 +14,7 @@ The Snapbar control surface is a fixed-size transparent GPUI window whose native
 - Expansion begins only after a stable hover. Collapse occurs after the pointer remains outside the visible surface for the configured delay.
 - A window-level Win32 disclosure controller installed with `SetWindowSubclass` is the source of truth. It owns one explicit Collapsed / ExpandPending / Expanded / CollapsePending state machine, uses `TrackMouseEvent` / `WM_MOUSELEAVE`, and verifies the pointer with `WindowFromPoint` at timer boundaries. GPUI only renders the published mode.
 - The expanded-only safety timer is a bounded fallback for missed leave messages; never restore permanent cursor polling.
+- The subclass returns `MA_NOACTIVATE` for `WM_MOUSEACTIVATE`; operating the Snapbar controls must not activate the overlay or take focus from Teams.
 - Collapsed, expanded, and compact dimensions come from one shared geometry source, and only the follower worker writes the native Win32 region.
 - There is no click-to-pin state that can leave the strip permanently open.
 - The overlay keeps `WS_EX_TOOLWINDOW` and `WS_EX_NOACTIVATE`, remains topmost relative to Teams, and is excluded from screen capture.
