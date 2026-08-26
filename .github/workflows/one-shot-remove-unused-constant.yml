@@ -1,0 +1,40 @@
+name: Apply overlay lint repair
+
+on:
+  push:
+    branches: [fix/overlay-hover-clipping]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/overlay-hover-clipping
+          fetch-depth: 0
+
+      - name: Remove obsolete logical-width constant
+        shell: pwsh
+        run: |
+          $path = "src/overlay.rs"
+          $text = Get-Content $path -Raw
+          $text = $text.Replace("const LOGICAL_WINDOW_WIDTH: i32 = 286;`n", "")
+          Set-Content $path $text -Encoding utf8 -NoNewline
+          cargo fmt --all
+          git diff --check
+
+      - name: Commit repair
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --force .github/workflows/one-shot-remove-unused-constant.yml
+          git add src/overlay.rs
+          git commit -m "fix: remove obsolete overlay geometry constant"
+          git push origin HEAD:fix/overlay-hover-clipping
