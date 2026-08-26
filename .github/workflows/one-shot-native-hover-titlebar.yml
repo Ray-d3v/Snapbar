@@ -1,0 +1,488 @@
+name: Apply native hover and titlebar placement fix
+
+on:
+  push:
+    branches: [fix/native-hover-titlebar-placement]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/native-hover-titlebar-placement
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Patch GPUI view and docs
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+
+          def once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+
+          path = Path("src/app.rs")
+          app = path.read_text(encoding="utf-8")
+
+          app = once(
+              app,
+              '''    overlay::{
+                  COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, EXPANDED_HEIGHT,
+                  EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+              },
+          ''',
+              '''    overlay::{OverlayMode, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH},
+          ''',
+              "overlay import",
+          )
+          app = once(
+              app,
+              '''    App, Bounds, ClickEvent, Context, Task, Window, WindowBackgroundAppearance, WindowBounds,
+          ''',
+              '''    App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
+          ''',
+              "Task import",
+          )
+          app = once(
+              app,
+              '''const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+          const EXPAND_DELAY: Duration = Duration::from_millis(180);
+          const COLLAPSE_DELAY: Duration = Duration::from_millis(400);
+          ''',
+              '''const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+          ''',
+              "hover constants",
+          )
+          app = once(
+              app,
+              '''    expanded: bool,
+              surface_hovered: bool,
+              hover_transition: Option<Task<()>>,
+          ''',
+              '''    expanded: bool,
+          ''',
+              "hover fields",
+          )
+          app = once(
+              app,
+              '''    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+                  let mut snapbar = Self {
+          ''',
+              '''    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+                  let follower = TeamsWindowFollower::start(window);
+                  let overlay_events = follower.as_ref().map(TeamsWindowFollower::subscribe);
+                  let mut snapbar = Self {
+          ''',
+              "new prelude",
+          )
+          app = once(
+              app,
+              '''            follower: TeamsWindowFollower::start(window),
+          ''',
+              '''            follower,
+          ''',
+              "follower init",
+          )
+          app = once(
+              app,
+              '''            expanded: false,
+                  surface_hovered: false,
+                  hover_transition: None,
+          ''',
+              '''            expanded: false,
+          ''',
+              "hover init",
+          )
+          app = once(
+              app,
+              '''        snapbar.start_resident_sync(window, cx);
+                  snapbar
+          ''',
+              '''        snapbar.start_resident_sync(window, cx);
+                  if let Some(events) = overlay_events {
+                      snapbar.start_overlay_sync(events, window, cx);
+                  }
+                  snapbar
+          ''',
+              "overlay sync start",
+          )
+
+          insert = '''    fn start_overlay_sync(
+              &self,
+              events: async_channel::Receiver<()>,
+              window: &mut Window,
+              cx: &mut Context<Self>,
+          ) {
+              cx.spawn_in(window, async move |this, cx| {
+                  while events.recv().await.is_ok() {
+                      if this
+                          .update(cx, |this, cx| {
+                              if this.sync_overlay_state() {
+                                  cx.notify();
+                              }
+                          })
+                          .is_err()
+                      {
+                          break;
+                      }
+                  }
+              })
+              .detach();
+          }
+
+          '''
+          app = once(
+              app,
+              '''    fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
+          ''',
+              insert + '''    fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
+          ''',
+              "overlay sync method",
+          )
+          app = once(
+              app,
+              '''        let compact_layout = self
+                  .follower
+                  .as_ref()
+                  .is_some_and(TeamsWindowFollower::is_compact);
+              if compact_layout != self.compact_layout {
+                  self.compact_layout = compact_layout;
+                  if compact_layout {
+                      self.reset_disclosure(cx);
+                  }
+                  changed = true;
+              }
+
+              let follower_visible = self
+                  .follower
+                  .as_ref()
+                  .is_some_and(TeamsWindowFollower::is_visible);
+              if !follower_visible
+                  && (self.expanded || self.surface_hovered || self.hover_transition.is_some())
+              {
+                  self.reset_disclosure(cx);
+                  changed = true;
+              }
+          ''',
+              '''        changed |= self.sync_overlay_state();
+          ''',
+              "resident overlay state",
+          )
+          app = once(
+              app,
+              '''        if previous_id != next_id {
+                  self.reset_disclosure(cx);
+              }
+          ''',
+              '''        if previous_id != next_id {
+                  self.expanded = false;
+                  self.compact_layout = false;
+                  cx.notify();
+              }
+          ''',
+              "target reset",
+          )
+          app = once(
+              app,
+              '''                self.shared_content_hint = false;
+                  self.reset_disclosure(cx);
+                  self.sync_follower();
+          ''',
+              '''                self.shared_content_hint = false;
+                  self.expanded = false;
+                  self.compact_layout = false;
+                  cx.notify();
+                  self.sync_follower();
+          ''',
+              "meeting exit reset",
+          )
+
+          replacement = '''    fn sync_overlay_state(&mut self) -> bool {
+              let Some(follower) = self.follower.as_ref() else {
+                  let changed = self.expanded || self.compact_layout;
+                  self.expanded = false;
+                  self.compact_layout = false;
+                  return changed;
+              };
+
+              let compact = follower.is_compact();
+              let expanded = follower.is_visible() && follower.is_expanded() && !compact;
+              let changed = self.compact_layout != compact || self.expanded != expanded;
+              self.compact_layout = compact;
+              self.expanded = expanded;
+              changed
+          }
+
+          '''
+          app, count = re.subn(
+              r'''    fn reset_disclosure\(&mut self, cx: &mut Context<Self>\) \{.*?\n    fn on_refresh_clicked''',
+              replacement + '''    fn on_refresh_clicked''',
+              app,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise RuntimeError(f"hover method removal: expected one match, found {count}")
+
+          render_start = app.index("        let compact_camera = div()")
+          render_end = app.index(
+              '\n\n        div()\n            .id("titlebar-overlay-root")',
+              render_start,
+          )
+          render = '''        let mode = OverlayMode::from_state(self.expanded, self.compact_layout);
+
+          let compact_capture = div()
+              .id("compact-capture-button")
+              .flex()
+              .items_center()
+              .justify_center()
+              .size(px(30.0))
+              .rounded_full()
+              .bg(capture_background)
+              .when(can_capture, |button| {
+                  button
+                      .cursor_pointer()
+                      .hover(|button| button.opacity(0.91))
+                      .active(|button| button.opacity(0.68))
+                      .on_click(cx.listener(Self::on_capture_clicked))
+              })
+              .when(!can_capture, |button| button.opacity(0.66))
+              .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
+                  if can_capture {
+                      rgb(0xffffff)
+                  } else {
+                      rgb(0xa7a7ac)
+                  },
+              ));
+
+          let status = div()
+              .id("status-button")
+              .flex()
+              .items_center()
+              .gap(px(7.0))
+              .w(px(82.0))
+              .h(px(28.0))
+              .px(px(8.0))
+              .rounded(px(11.0))
+              .cursor_pointer()
+              .text_xs()
+              .text_color(primary_text)
+              .hover(|button| button.bg(rgb(0x1a1a1e)))
+              .active(|button| button.opacity(0.72))
+              .on_click(cx.listener(Self::on_refresh_clicked))
+              .child(div().size(px(7.0)).rounded_full().bg(status_color))
+              .child(self.status_label());
+
+          let capture = div()
+              .id("capture-button")
+              .flex()
+              .items_center()
+              .justify_center()
+              .size(px(32.0))
+              .rounded_full()
+              .bg(capture_background)
+              .when(can_capture, |button| {
+                  button
+                      .cursor_pointer()
+                      .hover(|button| button.opacity(0.91))
+                      .active(|button| button.opacity(0.68))
+                      .on_click(cx.listener(Self::on_capture_clicked))
+              })
+              .when(!can_capture, |button| button.opacity(0.66))
+              .child(
+                  svg()
+                      .path("icons/camera.svg")
+                      .size(px(17.0))
+                      .text_color(if can_capture {
+                          rgb(0xffffff)
+                      } else {
+                          rgb(0xa7a7ac)
+                      }),
+              );
+
+          let save = div()
+              .id("save-toggle")
+              .flex()
+              .items_center()
+              .justify_center()
+              .size(px(30.0))
+              .rounded(px(10.0))
+              .cursor_pointer()
+              .bg(if save_to_screenshots {
+                  rgb(0x285d40)
+              } else {
+                  rgb(0x18181b)
+              })
+              .hover(|button| {
+                  button.bg(if save_to_screenshots {
+                      rgb(0x347451)
+                  } else {
+                      rgb(0x28282d)
+                  })
+              })
+              .active(|button| button.opacity(0.72))
+              .on_click(cx.listener(Self::on_save_toggle_clicked))
+              .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
+                  if save_to_screenshots {
+                      rgb(0xe8fff0)
+                  } else {
+                      rgb(0xc8c8cd)
+                  },
+              ));
+
+          let refresh = div()
+              .id("refresh-button")
+              .flex()
+              .items_center()
+              .justify_center()
+              .size(px(30.0))
+              .rounded(px(10.0))
+              .cursor_pointer()
+              .bg(rgb(0x18181b))
+              .hover(|button| button.bg(rgb(0x28282d)))
+              .active(|button| button.opacity(0.72))
+              .on_click(cx.listener(Self::on_refresh_clicked))
+              .child(
+                  svg()
+                      .path("icons/refresh.svg")
+                      .size(px(16.0))
+                      .text_color(rgb(0xc8c8cd)),
+              );
+
+          let quit = div()
+              .id("quit-button")
+              .flex()
+              .items_center()
+              .justify_center()
+              .size(px(30.0))
+              .rounded(px(10.0))
+              .cursor_pointer()
+              .bg(rgb(0x18181b))
+              .hover(|button| button.bg(rgb(0x3a2025)))
+              .active(|button| button.opacity(0.72))
+              .on_click(|_, _, cx| cx.quit())
+              .child(
+                  svg()
+                      .path("icons/power.svg")
+                      .size(px(16.0))
+                      .text_color(rgb(0xf07178)),
+              );
+
+          let surface = div()
+              .id("titlebar-surface")
+              .flex()
+              .items_center()
+              .justify_center()
+              .w(px(mode.logical_width()))
+              .h(px(mode.logical_height()))
+              .rounded_full()
+              .bg(rgb(0x0b0b0d))
+              .when(mode == OverlayMode::Compact, |surface| {
+                  surface.child(compact_capture)
+              })
+              .when(mode == OverlayMode::Collapsed, |surface| {
+                  surface
+                      .cursor_pointer()
+                      .gap(px(7.0))
+                      .child(div().size(px(7.0)).rounded_full().bg(status_color))
+                      .child(
+                          svg()
+                              .path("icons/camera.svg")
+                              .size(px(15.0))
+                              .text_color(if can_capture {
+                                  primary_text
+                              } else {
+                                  secondary_text
+                              }),
+                      )
+                      .child(div().text_xs().text_color(primary_text).child("Snapbar"))
+              })
+              .when(mode == OverlayMode::Expanded, |surface| {
+                  surface
+                      .gap(px(6.0))
+                      .px(px(7.0))
+                      .child(status)
+                      .child(capture)
+                      .child(save)
+                      .child(refresh)
+                      .child(quit)
+              });'''
+          app = app[:render_start] + render + app[render_end:]
+          path.write_text(app, encoding="utf-8")
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text(encoding="utf-8")
+          readme = readme.replace("約`92 × 30px`", "約`92 × 28px`")
+          readme = readme.replace("約`272 × 36px`", "約`272 × 34px`")
+          readme = readme.replace(
+              "カーソルが操作列から外れて約400ms経過すると自動で縮みます。GPUIがWindowsの`TrackMouseEvent`／`WM_MOUSELEAVE`を処理して離脱を通知し、展開・縮小の待機処理は1つのキャンセル可能な`Task`として管理します。常時カーソルポーリングとクリック固定はありません。",
+              "カーソルが操作列から外れて約400ms経過すると自動で縮みます。ホバー判定はGPUI要素ではなく、オーバーレイHWNDへ`SetWindowSubclass`で追加した単一のWin32状態機械が`TrackMouseEvent`／`WM_MOUSELEAVE`とウィンドウタイマーを処理します。タイマー発火時には`WindowFromPoint`でも実際のポインター位置を再確認し、展開中だけ低頻度の安全確認を行います。クリック固定と常時カーソルポーリングはありません。",
+          )
+          readme_path.write_text(readme, encoding="utf-8")
+
+          docs_path = Path("docs/OVERLAY_BEHAVIOR.md")
+          docs = docs_path.read_text(encoding="utf-8")
+          docs = docs.replace("92 × 30", "92 × 28")
+          docs = docs.replace("272 × 36", "272 × 34")
+          docs = docs.replace(
+              "- GPUI `on_hover` and its Windows `TrackMouseEvent` / `WM_MOUSELEAVE` path are the source of truth. A single stored `Task` provides cancellable expand/collapse debounce; do not add cursor polling or detached timer generations.\n",
+              "- A window-level Win32 disclosure controller installed with `SetWindowSubclass` is the source of truth. It owns one explicit Collapsed / ExpandPending / Expanded / CollapsePending state machine, uses `TrackMouseEvent` / `WM_MOUSELEAVE`, and verifies the pointer with `WindowFromPoint` at timer boundaries. GPUI only renders the published mode.\n- The expanded-only safety timer is a bounded fallback for missed leave messages; never restore permanent cursor polling.\n",
+          )
+          docs = docs.replace(
+              "- The visible surface, rather than the larger transparent GPUI window, is vertically centered inside the measured caption band so DPI scaling cannot push controls into the meeting UI.\n",
+              "- Convert `DWMWA_CAPTION_BUTTON_BOUNDS` from window-relative coordinates using `GetWindowRect`, then clamp against screen-space `DWMWA_EXTENDED_FRAME_BOUNDS`. Position the window from the maximum expanded surface and reject any placement whose visible surface is not fully contained in the resulting caption band.\n",
+          )
+          docs_path.write_text(docs, encoding="utf-8")
+
+          agents_path = Path("AGENTS.md")
+          agents = agents_path.read_text(encoding="utf-8")
+          agents = agents.replace(
+              "- Use GPUI's `on_hover` / Windows mouse-leave path and a stored cancellable `Task` for hover disclosure. Do not add periodic cursor polling or detached timer-generation schemes.\n",
+              "- Keep hover disclosure at the native overlay-window level: one `SetWindowSubclass` controller, one explicit state machine, `TrackMouseEvent` / `WM_MOUSELEAVE`, and pointer verification at timer boundaries. GPUI must only render the published mode. Do not use element-level hover as the source of truth, detached timer generations, or permanent cursor polling.\n",
+          )
+          agents = agents.replace(
+              "- Use DWM frame and caption-button bounds to avoid the Windows caption controls. When the available title-bar span is too narrow, reduce to a single camera control.\n",
+              "- Use DWM frame and caption-button bounds to avoid the Windows caption controls. `DWMWA_CAPTION_BUTTON_BOUNDS` is window-relative and must be converted using `GetWindowRect` before combining it with screen-space `DWMWA_EXTENDED_FRAME_BOUNDS`. When the available title-bar span is too narrow, reduce to a single camera control.\n",
+          )
+          agents_path.write_text(agents, encoding="utf-8")
+          '@ | python -
+
+      - name: Validate
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          git diff --check
+
+      - name: Commit implementation
+        shell: pwsh
+        run: |
+          Remove-Item ".github/workflows/one-shot-native-hover-titlebar.yml" -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock src/app.rs src/overlay.rs README.md AGENTS.md docs/OVERLAY_BEHAVIOR.md .github/workflows/one-shot-native-hover-titlebar.yml
+          git commit -m "fix: rebuild native hover and titlebar placement"
+          git push origin HEAD:fix/native-hover-titlebar-placement
