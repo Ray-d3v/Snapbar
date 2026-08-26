@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{
     assets::Assets,
@@ -6,27 +6,23 @@ use crate::{
         CaptureEngine, CaptureTarget, save_clipboard_image_to_screenshots, show_capture_flash,
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
-    overlay::TeamsWindowFollower,
+    overlay::{
+        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, EXPANDED_HEIGHT,
+        EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+    },
     resident::ResidentController,
     settings::AppSettings,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
+    App, Bounds, ClickEvent, Context, Task, Window, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
     transparent_black,
 };
 use gpui_platform::application;
 
-const WINDOW_WIDTH: f32 = 280.0;
-const WINDOW_HEIGHT: f32 = 40.0;
-const COLLAPSED_WIDTH: f32 = 92.0;
-const EXPANDED_WIDTH: f32 = 272.0;
-const COMPACT_WIDTH: f32 = 40.0;
-const SURFACE_HEIGHT: f32 = 36.0;
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const EXPAND_DELAY: Duration = Duration::from_millis(180);
 const COLLAPSE_DELAY: Duration = Duration::from_millis(400);
-const HOVER_WATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -51,8 +47,7 @@ struct Snapbar {
     settings: AppSettings,
     expanded: bool,
     surface_hovered: bool,
-    expand_generation: u64,
-    collapse_generation: u64,
+    hover_transition: Option<Task<()>>,
     capture_state: CaptureState,
     capture_generation: u64,
     last_error: Option<String>,
@@ -73,15 +68,14 @@ impl Snapbar {
             settings: AppSettings::load(),
             expanded: false,
             surface_hovered: false,
-            expand_generation: 0,
-            collapse_generation: 0,
+            hover_transition: None,
             capture_state: CaptureState::NoTarget,
             capture_generation: 0,
             last_error: None,
         };
-        snapbar.apply_meeting_snapshot(snapbar.meeting_monitor.snapshot());
+        let snapshot = snapbar.meeting_monitor.snapshot();
+        snapbar.apply_meeting_snapshot(snapshot, cx);
         snapbar.start_resident_sync(window, cx);
-        snapbar.start_hover_watch(window, cx);
         snapbar
     }
 
@@ -110,55 +104,6 @@ impl Snapbar {
         .detach();
     }
 
-    fn start_hover_watch(&self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let mut outside_since = None;
-            loop {
-                cx.background_executor().timer(HOVER_WATCH_INTERVAL).await;
-
-                let state = this.update(cx, |this, _| {
-                    let pointer_over = this
-                        .follower
-                        .as_ref()
-                        .is_some_and(|follower| follower.cursor_over_surface());
-                    (this.expanded, this.compact_layout, pointer_over)
-                });
-                let Ok((expanded, compact, pointer_over)) = state else {
-                    break;
-                };
-
-                if !expanded || compact || pointer_over {
-                    outside_since = None;
-                    continue;
-                }
-
-                let started = *outside_since.get_or_insert_with(Instant::now);
-                if started.elapsed() < COLLAPSE_DELAY {
-                    continue;
-                }
-
-                if this
-                    .update(cx, |this, cx| {
-                        let still_outside = this
-                            .follower
-                            .as_ref()
-                            .is_none_or(|follower| !follower.cursor_over_surface());
-                        if this.expanded && !this.compact_layout && still_outside {
-                            this.surface_hovered = false;
-                            this.cancel_expand();
-                            this.set_expanded(false, cx);
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                outside_since = None;
-            }
-        })
-        .detach();
-    }
-
     fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
         if self.resident.quit_requested() {
             cx.quit();
@@ -173,7 +118,7 @@ impl Snapbar {
 
         let snapshot = self.meeting_monitor.snapshot();
         if snapshot.generation != self.last_monitor_generation {
-            self.apply_meeting_snapshot(snapshot);
+            self.apply_meeting_snapshot(snapshot, cx);
             changed = true;
         }
 
@@ -184,11 +129,19 @@ impl Snapbar {
         if compact_layout != self.compact_layout {
             self.compact_layout = compact_layout;
             if compact_layout {
-                self.expanded = false;
-                if let Some(follower) = &self.follower {
-                    follower.set_expanded(false);
-                }
+                self.reset_disclosure(cx);
             }
+            changed = true;
+        }
+
+        let follower_visible = self
+            .follower
+            .as_ref()
+            .is_some_and(TeamsWindowFollower::is_visible);
+        if !follower_visible
+            && (self.expanded || self.surface_hovered || self.hover_transition.is_some())
+        {
+            self.reset_disclosure(cx);
             changed = true;
         }
 
@@ -222,12 +175,16 @@ impl Snapbar {
         }
     }
 
-    fn apply_meeting_snapshot(&mut self, snapshot: MeetingSnapshot) {
+    fn apply_meeting_snapshot(&mut self, snapshot: MeetingSnapshot, cx: &mut Context<Self>) {
         self.last_monitor_generation = snapshot.generation;
         let previous_id = self.current_target().map(|target| target.id);
         let next_id = snapshot.target.as_ref().map(|target| target.id);
         let was_shared = self.shared_content_hint;
         self.shared_content_hint = snapshot.shared_content_hint;
+
+        if previous_id != next_id {
+            self.reset_disclosure(cx);
+        }
 
         match snapshot.target {
             Some(target) => {
@@ -254,10 +211,7 @@ impl Snapbar {
                 self.capture_state = CaptureState::NoTarget;
                 self.last_error = None;
                 self.shared_content_hint = false;
-                self.expanded = false;
-                if let Some(follower) = &self.follower {
-                    follower.set_expanded(false);
-                }
+                self.reset_disclosure(cx);
                 self.sync_follower();
             }
         }
@@ -298,77 +252,53 @@ impl Snapbar {
         }
     }
 
+    fn reset_disclosure(&mut self, cx: &mut Context<Self>) {
+        self.hover_transition = None;
+        self.surface_hovered = false;
+        self.set_expanded(false, cx);
+    }
+
     fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
         let expanded = expanded && !self.compact_layout;
+        if let Some(follower) = &self.follower {
+            follower.set_expanded(expanded);
+        }
         if self.expanded == expanded {
             return;
         }
         self.expanded = expanded;
-        if let Some(follower) = &self.follower {
-            follower.set_expanded(expanded);
-        }
         cx.notify();
     }
 
-    fn cancel_expand(&mut self) {
-        self.expand_generation = self.expand_generation.wrapping_add(1);
-    }
-
-    fn cancel_collapse(&mut self) {
-        self.collapse_generation = self.collapse_generation.wrapping_add(1);
-    }
-
-    fn schedule_expand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.expanded || self.compact_layout {
-            return;
-        }
-        self.cancel_expand();
-        let generation = self.expand_generation;
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(EXPAND_DELAY).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.expand_generation == generation
-                    && this.surface_hovered
-                    && !this.compact_layout
-                {
-                    this.set_expanded(true, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn schedule_collapse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.expanded {
-            return;
-        }
-        self.cancel_collapse();
-        let generation = self.collapse_generation;
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(COLLAPSE_DELAY).await;
-            let _ = this.update(cx, |this, cx| {
-                let pointer_over = this
-                    .follower
-                    .as_ref()
-                    .is_some_and(|follower| follower.cursor_over_surface());
-                if this.collapse_generation == generation && !this.surface_hovered && !pointer_over
-                {
-                    this.set_expanded(false, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
     fn on_surface_hovered(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.surface_hovered = *hovered;
-        if *hovered {
-            self.cancel_collapse();
-            self.schedule_expand(window, cx);
-        } else {
-            self.cancel_expand();
-            self.schedule_collapse(window, cx);
+        self.hover_transition = None;
+
+        if self.compact_layout {
+            self.surface_hovered = false;
+            self.set_expanded(false, cx);
+            return;
         }
+
+        self.surface_hovered = *hovered;
+        let target_expanded = *hovered;
+        if self.expanded == target_expanded {
+            return;
+        }
+
+        let delay = if target_expanded {
+            EXPAND_DELAY
+        } else {
+            COLLAPSE_DELAY
+        };
+        self.hover_transition = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.compact_layout || this.surface_hovered != target_expanded {
+                    return;
+                }
+                this.set_expanded(target_expanded, cx);
+            });
+        }));
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -502,12 +432,12 @@ impl Render for Snapbar {
         };
 
         let compact_camera = div()
-            .id("compact-capture")
+            .id("titlebar-surface")
             .flex()
             .items_center()
             .justify_center()
             .w(px(COMPACT_WIDTH))
-            .h(px(SURFACE_HEIGHT))
+            .h(px(COMPACT_HEIGHT))
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_sm()
@@ -538,13 +468,13 @@ impl Render for Snapbar {
             );
 
         let collapsed = div()
-            .id("titlebar-trigger")
+            .id("titlebar-surface")
             .flex()
             .items_center()
             .justify_center()
             .gap(px(7.0))
             .w(px(COLLAPSED_WIDTH))
-            .h(px(30.0))
+            .h(px(COLLAPSED_HEIGHT))
             .rounded_full()
             .bg(rgb(0x0b0b0d))
             .shadow_sm()
@@ -678,13 +608,13 @@ impl Render for Snapbar {
             );
 
         let expanded = div()
-            .id("titlebar-controls")
+            .id("titlebar-surface")
             .flex()
             .items_center()
             .justify_center()
             .gap(px(6.0))
             .w(px(EXPANDED_WIDTH))
-            .h(px(SURFACE_HEIGHT))
+            .h(px(EXPANDED_HEIGHT))
             .px(px(7.0))
             .rounded_full()
             .bg(rgb(0x0b0b0d))

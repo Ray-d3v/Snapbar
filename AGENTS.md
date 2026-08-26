@@ -26,6 +26,7 @@
 - The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand controls horizontally only; never open a menu below the title bar.
 - Use DWM frame and caption-button bounds to avoid the Windows caption controls. When the available title-bar span is too narrow, reduce to a single camera control.
 - Hover expansion and collapse must be debounced. The non-pinned control strip must always collapse after the pointer leaves the actual visible surface.
+- Use GPUI's `on_hover` / Windows mouse-leave path and a stored cancellable `Task` for hover disclosure. Do not add periodic cursor polling or detached timer-generation schemes.
 - Invisible transparent window areas must not intercept clicks or title-bar dragging intended for Teams.
 
 ## Architecture
@@ -35,7 +36,7 @@
 - Keep local meeting detection isolated in `src/meeting.rs` and notification-area lifetime control in `src/resident.rs`.
 - Prefer `SetWinEventHook` for prompt local change notification, but retain a low-frequency watchdog scan for missed events.
 - Keep the visible title-bar controls opaque black. Transparency is permitted only outside their rounded silhouette.
-- Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette.
+- Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette. Use one shared geometry source and one native-region writer.
 - Keep the control out of Alt+Tab and the taskbar, do not activate it when shown or clicked, and exclude it from screen capture.
 - Prefer small, direct changes. Do not introduce Electron, Tauri, another webview, a background service, or cloud authentication.
 
