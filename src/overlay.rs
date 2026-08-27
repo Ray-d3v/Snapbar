@@ -30,8 +30,8 @@ use windows::Win32::{
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
-const EXPAND_DELAY_MS: u32 = 180;
-const COLLAPSE_DELAY_MS: u32 = 400;
+const EXPAND_DELAY_MS: u32 = 50;
+const COLLAPSE_DELAY_MS: u32 = 50;
 const SAFETY_INTERVAL_MS: u32 = 250;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
 const SUBCLASS_ID: usize = 0x534e_4150;
@@ -48,7 +48,6 @@ const WM_NCDESTROY: u32 = 0x0082;
 const WM_APP_RESET_DISCLOSURE: u32 = 0x8000 + 0x351;
 const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
 const TME_LEAVE: u32 = 0x0000_0002;
-const TME_CANCEL: u32 = 0x8000_0000;
 const MA_NOACTIVATE: isize = 3;
 
 pub const WINDOW_WIDTH: f32 = 280.0;
@@ -56,9 +55,9 @@ pub const WINDOW_HEIGHT: f32 = 40.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
 pub const COLLAPSED_HEIGHT: f32 = 28.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
-pub const EXPANDED_HEIGHT: f32 = 34.0;
+pub const EXPANDED_HEIGHT: f32 = 30.0;
 pub const COMPACT_WIDTH: f32 = 40.0;
-pub const COMPACT_HEIGHT: f32 = 34.0;
+pub const COMPACT_HEIGHT: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -339,19 +338,10 @@ impl HoverSubclassState {
         }
     }
 
-    fn cancel_leave_tracking(&mut self, hwnd: *mut c_void) {
-        if !self.tracking_leave {
-            return;
-        }
-        let mut event = TrackMouseEventRaw {
-            cb_size: std::mem::size_of::<TrackMouseEventRaw>() as u32,
-            flags: TME_CANCEL | TME_LEAVE,
-            hwnd_track: hwnd,
-            hover_time: 0,
-        };
-        unsafe {
-            let _ = TrackMouseEvent(&mut event);
-        }
+    fn forget_leave_tracking(&mut self) {
+        // Tracking is associated with the HWND, not with this subclass. Cancelling it here
+        // would also cancel GPUI's leave request. A late WM_MOUSELEAVE is harmless because
+        // reset() has already returned the disclosure machine to Collapsed.
         self.tracking_leave = false;
     }
 
@@ -391,7 +381,7 @@ impl HoverSubclassState {
     }
 
     fn reset(&mut self, hwnd: *mut c_void) {
-        self.cancel_leave_tracking(hwnd);
+        self.forget_leave_tracking();
         let effects = self.machine.reset();
         self.apply_effects(hwnd, effects);
     }
@@ -600,6 +590,16 @@ struct WindowMetrics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowRegion {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    corner_width: i32,
+    corner_height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CaptionGeometry {
     band: RectI,
     buttons_left: i32,
@@ -691,10 +691,14 @@ impl TeamsWindowFollower {
                         thread_expanded.load(Ordering::Acquire),
                         compact_now,
                     );
-                    let region_state = (client_size(overlay_hwnd), mode);
-                    if previous_region_state != Some(region_state) {
-                        apply_window_region(overlay_hwnd, mode);
-                        previous_region_state = Some(region_state);
+                    match desired_window_region(overlay_hwnd, mode) {
+                        Some(region) if previous_region_state != Some(region) => {
+                            if apply_window_region(overlay_hwnd, region) {
+                                previous_region_state = Some(region);
+                            }
+                        }
+                        Some(_) => {}
+                        None => previous_region_state = None,
                     }
 
                     if previous_placement != Some(placement) {
@@ -847,11 +851,6 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     })
 }
 
-fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
-    let metrics = window_metrics(hwnd)?;
-    Some((metrics.client_width, metrics.client_height))
-}
-
 fn scale_logical(value: f32, actual: i32, logical: f32) -> i32 {
     ((value * actual as f32) / logical).round() as i32
 }
@@ -871,27 +870,54 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
     }
 }
 
-fn apply_window_region(hwnd: HWND, mode: OverlayMode) {
-    let Some(metrics) = window_metrics(hwnd) else {
-        return;
-    };
+fn hover_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
+    let surface = surface_rect(width, height, mode);
+    let hover_height = scale_logical(EXPANDED_HEIGHT, height, WINDOW_HEIGHT).clamp(1, height);
+    let hover_top = (height - hover_height) / 2;
+    RectI {
+        left: surface.left,
+        top: hover_top,
+        right: surface.right,
+        bottom: hover_top + hover_height,
+    }
+}
 
-    let client_left = metrics.client_screen_left - metrics.window_rect.left;
-    let client_top = metrics.client_screen_top - metrics.window_rect.top;
-    let surface = surface_rect(metrics.client_width, metrics.client_height, mode);
-    let height = surface.height().max(1);
+fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
+    let client_left = metrics
+        .client_screen_left
+        .saturating_sub(metrics.window_rect.left);
+    let client_top = metrics
+        .client_screen_top
+        .saturating_sub(metrics.window_rect.top);
+    let hover = hover_rect(metrics.client_width, metrics.client_height, mode);
+    let height = hover.height().max(1);
+    WindowRegion {
+        left: client_left.saturating_add(hover.left),
+        top: client_top.saturating_add(hover.top),
+        right: client_left.saturating_add(hover.right),
+        bottom: client_top.saturating_add(hover.bottom),
+        corner_width: height,
+        corner_height: height,
+    }
+}
+
+fn desired_window_region(hwnd: HWND, mode: OverlayMode) -> Option<WindowRegion> {
+    Some(window_region(window_metrics(hwnd)?, mode))
+}
+
+fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
     let region = unsafe {
         CreateRoundRectRgn(
-            client_left + surface.left,
-            client_top + surface.top,
-            client_left + surface.right,
-            client_top + surface.bottom,
-            height,
-            height,
+            desired.left,
+            desired.top,
+            desired.right,
+            desired.bottom,
+            desired.corner_width,
+            desired.corner_height,
         )
     };
     if region.is_null() {
-        return;
+        return false;
     }
 
     let applied = unsafe { SetWindowRgn(hwnd.0, region, 1) };
@@ -899,7 +925,9 @@ fn apply_window_region(hwnd: HWND, mode: OverlayMode) {
         unsafe {
             let _ = DeleteObject(region);
         }
+        return false;
     }
+    true
 }
 
 fn caption_geometry(
@@ -982,16 +1010,15 @@ fn calculate_placement(
         expanded_surface
     };
     let preferred_center = target_frame.center_x();
-    let surface_center = if compact {
-        preferred_center
-    } else {
-        let minimum_center = safe_left + active_surface.width() / 2;
-        let maximum_center = safe_right - active_surface.width() / 2;
-        if maximum_center < minimum_center {
-            return OverlayPlacement::Hidden;
-        }
-        preferred_center.clamp(minimum_center, maximum_center)
-    };
+    let active_width = active_surface.width();
+    let left_extent = active_width / 2;
+    let right_extent = active_width - left_extent;
+    let minimum_center = safe_left.saturating_add(left_extent);
+    let maximum_center = safe_right.saturating_sub(right_extent);
+    if maximum_center < minimum_center {
+        return OverlayPlacement::Hidden;
+    }
+    let surface_center = preferred_center.clamp(minimum_center, maximum_center);
 
     let client_offset_x = overlay.client_screen_left - overlay.window_rect.left;
     let client_offset_y = overlay.client_screen_top - overlay.window_rect.top;
@@ -1152,6 +1179,19 @@ mod tests {
     }
 
     #[test]
+    fn late_mouse_leave_after_reset_is_harmless() {
+        let mut machine = DisclosureMachine {
+            phase: DisclosurePhase::Expanded,
+        };
+        assert_eq!(machine.reset().expanded_changed, Some(false));
+        let late_leave = machine.pointer_leave();
+        assert!(late_leave.cancel_expand);
+        assert!(!late_leave.start_collapse);
+        assert_eq!(late_leave.expanded_changed, None);
+        assert_eq!(machine.phase, DisclosurePhase::Collapsed);
+    }
+
+    #[test]
     fn regions_match_visible_surfaces() {
         assert_eq!(
             surface_rect(280, 40, OverlayMode::Collapsed),
@@ -1166,19 +1206,106 @@ mod tests {
             surface_rect(280, 40, OverlayMode::Expanded),
             RectI {
                 left: 4,
-                top: 3,
+                top: 5,
                 right: 276,
-                bottom: 37,
+                bottom: 35,
             }
         );
         assert_eq!(
             surface_rect(280, 40, OverlayMode::Compact),
             RectI {
                 left: 120,
-                top: 3,
+                top: 5,
                 right: 160,
-                bottom: 37,
+                bottom: 35,
             }
+        );
+    }
+
+    #[test]
+    fn hover_regions_fill_the_titlebar_height_without_changing_width() {
+        assert_eq!(
+            hover_rect(280, 40, OverlayMode::Collapsed),
+            RectI {
+                left: 94,
+                top: 5,
+                right: 186,
+                bottom: 35,
+            }
+        );
+        assert_eq!(
+            hover_rect(280, 40, OverlayMode::Expanded),
+            surface_rect(280, 40, OverlayMode::Expanded)
+        );
+        assert_eq!(
+            hover_rect(280, 40, OverlayMode::Compact),
+            surface_rect(280, 40, OverlayMode::Compact)
+        );
+    }
+
+    #[test]
+    fn hover_region_scales_with_dpi() {
+        assert_eq!(
+            hover_rect(420, 60, OverlayMode::Collapsed),
+            RectI {
+                left: 141,
+                top: 7,
+                right: 279,
+                bottom: 52,
+            }
+        );
+    }
+
+    #[test]
+    fn native_region_includes_the_client_origin_offset() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: -7,
+                top: -7,
+                right: 287,
+                bottom: 47,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 40,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Collapsed),
+            WindowRegion {
+                left: 101,
+                top: 12,
+                right: 193,
+                bottom: 42,
+                corner_width: 30,
+                corner_height: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn native_region_retry_key_changes_with_the_client_origin() {
+        let first = WindowMetrics {
+            window_rect: RectI {
+                left: -7,
+                top: -7,
+                right: 287,
+                bottom: 47,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 40,
+        };
+        let shifted = WindowMetrics {
+            client_screen_left: 1,
+            ..first
+        };
+
+        assert_ne!(
+            window_region(first, OverlayMode::Collapsed),
+            window_region(shifted, OverlayMode::Collapsed)
         );
     }
 
@@ -1250,6 +1377,137 @@ mod tests {
         let expanded = surface_rect(350, 50, OverlayMode::Expanded);
         assert!(y + expanded.top >= 0);
         assert!(y + expanded.bottom <= 46);
+    }
+
+    #[test]
+    fn thirty_pixel_caption_accepts_expanded_surface() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 564,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 40,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            Some(RectI {
+                left: 1167,
+                top: 0,
+                right: 1313,
+                bottom: 30,
+            }),
+            overlay,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 811,
+                y: 15,
+                compact: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_surface_is_clamped_inside_caption_safe_span() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 40,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 40,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 0,
+                top: 0,
+                right: 500,
+                bottom: 100,
+            },
+            RectI {
+                left: 0,
+                top: 0,
+                right: 500,
+                bottom: 100,
+            },
+            Some(RectI {
+                left: 260,
+                top: 0,
+                right: 400,
+                bottom: 46,
+            }),
+            overlay,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 92,
+                y: 3,
+                compact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_surface_hides_when_caption_safe_span_is_too_narrow() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 40,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 40,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            RectI {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            Some(RectI {
+                left: 51,
+                top: 0,
+                right: 100,
+                bottom: 46,
+            }),
+            overlay,
+        );
+
+        assert_eq!(placement, OverlayPlacement::Hidden);
     }
 
     #[test]

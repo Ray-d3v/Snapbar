@@ -33,8 +33,9 @@ Windows向けのインストーラーとポータブル版は、[GitHub Releases
    - `TeamsWebView`子ウィンドウ
    - `TeamsVideo`子ウィンドウ
    - Windows UI Automation上の`退出`、`通話を終了`、`Leave call`などの操作
+   - UI Automation上の通話時間／退出コントロールを示す安定した`AutomationId`
    - UI Automation上の共有コンテンツ要素
-4. 単一の信号だけでは会議参加と判定しません。複数信号が同じウィンドウで2回以上、概ね0.6〜1.1秒安定した場合に参加確定とします。
+4. 単発の検出だけでは会議参加と判定しません。退出／通話時間などの会議固有信号が同じウィンドウで2回以上、概ね0.6〜1.1秒安定した場合に参加確定とします。
 5. 退出は、会議信号の消失を2回以上かつ約1.4秒継続して確認してから確定します。
 6. 最小化中は会議状態を維持します。
 
@@ -64,12 +65,12 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 
 - 約`92 × 28px`の小さな黒いピルだけを表示します。
 - 状態ドット、カメラアイコン、`Snapbar`ラベルだけの構成です。
-- 透明なウィンドウ全体ではなく、実際に見えているピル部分だけがマウス入力を受け取ります。
-- そのほかのタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
+- ホバー入力範囲は、横方向をピル幅のままに保ち、縦方向だけTeamsタイトルバーの高さいっぱいへ広げます。
+- ピルの左右にあるタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
 
 ### ホバー時
 
-約180msホバーすると、中央を基準に**横方向だけ**へ約`272 × 34px`まで展開します。下方向へメニューを出さないため、直下のTeams会議操作UIへ被りません。
+約50msホバーすると、中央を基準に**横方向だけ**へ約`272 × 30px`まで展開します。下方向へメニューを出さないため、直下のTeams会議操作UIへ被りません。
 
 左から次の操作を配置しています。
 
@@ -79,7 +80,7 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 - 会議・共有の再検出
 - Snapbarを終了
 
-カーソルが操作列から外れて約400ms経過すると自動で縮みます。ホバー判定はGPUI要素ではなく、オーバーレイHWNDへ`SetWindowSubclass`で追加した単一のWin32状態機械が`TrackMouseEvent`／`WM_MOUSELEAVE`とウィンドウタイマーを処理します。タイマー発火時には`WindowFromPoint`でも実際のポインター位置を再確認し、展開中だけ低頻度の安全確認を行います。クリック固定と常時カーソルポーリングはありません。
+カーソルが操作列から外れて約50ms経過すると自動で縮みます。ホバー判定はGPUI要素ではなく、オーバーレイHWNDへ`SetWindowSubclass`で追加した単一のWin32状態機械が`TrackMouseEvent`／`WM_MOUSELEAVE`とウィンドウタイマーを処理します。タイマー発火時には`WindowFromPoint`でも実際のポインター位置を再確認し、展開中だけ低頻度の安全確認を行います。クリック固定と常時カーソルポーリングはありません。
 
 ### 配置と狭いウィンドウ
 
@@ -88,6 +89,7 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 - 左側の会議名と右側のキャプションボタンを避けた中央領域へ配置します。
 - Teamsの移動、最大化、スナップ、別モニターへの移動、DPI変更へ追従します。
 - 横幅が足りない場合は、中央のカメラボタン1個だけへ縮退します。
+- カメラボタンも安全なタイトルバー領域へ収まらない場合は、Teamsの操作を妨げないようSnapbarを非表示にします。
 - タスクバーとAlt+Tabには表示せず、Teamsからフォーカスを奪いません。
 - Snapbar自身はキャプチャ画像から除外します。
 
@@ -123,7 +125,8 @@ GPUIとWindows Graphics Capture自体の基礎メモリは必要ですが、旧�
 1. `Snapbar.exe`を起動します。タイトルバーUIは表示されず、通知領域で待機します。
 2. Teams会議へ参加します。
 3. 会議参加が確定すると、Teamsタイトルバー中央へ小さなSnapbarピルが表示されます。
-4. ピルへ約180msホバーし、横に展開した操作列を表示します。
+   - 参加者が自分だけで、まだ共有画面がない状態でも表示されます。撮影機能だけが共有開始まで待機します。
+4. ピルへ約50msホバーし、横に展開した操作列を表示します。
 5. 他の参加者が画面共有を開始し、カメラボタンが赤くなったらクリックします。
 6. PowerPoint、OneNote、Teamsチャットなどへ`Ctrl + V`で貼り付けます。
 7. 会議退出後はタイトルバーUIが自動で消え、Snapbarは通知領域で次の会議を待ちます。
@@ -177,7 +180,7 @@ Resident Snapbar process
 │  └─ debounced join / leave state
 └─ hidden GPUI title-bar control
    └─ active meeting detected → follow Teams title bar and show 92 × 30 trigger
-      ├─ 180 ms hover → horizontal 272 × 36 control strip
+      ├─ 50 ms hover → horizontal 272 × 30 control strip
       ├─ narrow title bar → camera-only compact mode
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle

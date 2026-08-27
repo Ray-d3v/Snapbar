@@ -15,8 +15,7 @@ use crate::{
 };
 use gpui::{
     App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
-    transparent_black,
+    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
 };
 use gpui_platform::application;
 
@@ -487,7 +486,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(32.0))
+            .size(px(30.0))
             .rounded_full()
             .bg(capture_background)
             .shadow_sm()
@@ -610,7 +609,9 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size_full()
-            .bg(transparent_black())
+            // Layered-window pixels with alpha 0 are mouse-transparent. Alpha 1 keeps the
+            // titlebar-height native hover band hit-testable without becoming perceptible.
+            .bg(rgba(0x00000001))
             .child(surface)
     }
 }

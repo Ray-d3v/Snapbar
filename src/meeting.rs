@@ -169,19 +169,26 @@ struct MeetingEvidence {
     has_webview: bool,
     has_video: bool,
     has_leave_control: bool,
+    has_call_control: bool,
     has_shared_content: bool,
     score: i32,
 }
 
 impl MeetingEvidence {
     fn has_maintenance_signal(&self) -> bool {
-        self.has_leave_control || self.has_video || self.has_shared_content
+        self.has_leave_control || self.has_call_control || self.has_video || self.has_shared_content
     }
 
     fn entry_delay(&self) -> Option<Duration> {
-        if self.has_leave_control && (self.has_video || self.has_shared_content) {
+        if (self.has_leave_control
+            && (self.has_call_control || self.has_video || self.has_shared_content))
+            || (self.has_call_control && (self.has_video || self.has_shared_content))
+        {
             Some(ENTRY_STABLE_FOR)
-        } else if self.has_leave_control || (self.has_video && self.has_shared_content) {
+        } else if self.has_leave_control
+            || self.has_call_control
+            || (self.has_video && self.has_shared_content)
+        {
             Some(ENTRY_FALLBACK_STABLE_FOR)
         } else {
             None
@@ -335,7 +342,7 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
         let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
         let focused = window.is_focused().unwrap_or(false);
         let classes = inspect_child_classes(hwnd);
-        let (has_leave_control, has_shared_content) = automation
+        let uia = automation
             .as_ref()
             .map(|automation| inspect_meeting_uia(automation, id, &window))
             .transpose()
@@ -343,13 +350,16 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
             .unwrap_or_default();
 
         let mut score = 0;
-        if has_leave_control {
+        if uia.has_leave_control {
             score += 130;
+        }
+        if uia.has_call_control {
+            score += 110;
         }
         if classes.has_video {
             score += 85;
         }
-        if has_shared_content {
+        if uia.has_shared_content {
             score += 55;
         }
         if classes.has_webview {
@@ -377,8 +387,9 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
             focused,
             has_webview: classes.has_webview,
             has_video: classes.has_video,
-            has_leave_control,
-            has_shared_content,
+            has_leave_control: uia.has_leave_control,
+            has_call_control: uia.has_call_control,
+            has_shared_content: uia.has_shared_content,
             score,
         });
     }
@@ -410,9 +421,9 @@ fn inspect_meeting_uia(
     automation: &UIAutomation,
     target_id: u32,
     window: &Window,
-) -> Result<(bool, bool)> {
+) -> Result<MeetingUiaEvidence> {
     let first = scan_meeting_uia(automation, target_id)?;
-    if first.0 || first.1 {
+    if first.has_signal() {
         return Ok(first);
     }
 
@@ -430,7 +441,20 @@ fn inspect_meeting_uia(
     scan_meeting_uia(automation, target_id)
 }
 
-fn scan_meeting_uia(automation: &UIAutomation, target_id: u32) -> Result<(bool, bool)> {
+#[derive(Clone, Copy, Debug, Default)]
+struct MeetingUiaEvidence {
+    has_leave_control: bool,
+    has_call_control: bool,
+    has_shared_content: bool,
+}
+
+impl MeetingUiaEvidence {
+    fn has_signal(self) -> bool {
+        self.has_leave_control || self.has_call_control || self.has_shared_content
+    }
+}
+
+fn scan_meeting_uia(automation: &UIAutomation, target_id: u32) -> Result<MeetingUiaEvidence> {
     let root = automation
         .element_from_handle(Handle::from(target_id as isize))
         .context("Teams会議UIのルートを取得できませんでした")?;
@@ -441,25 +465,28 @@ fn scan_meeting_uia(automation: &UIAutomation, target_id: u32) -> Result<(bool, 
         .find_all(TreeScope::Subtree, &condition)
         .context("Teams会議UIを走査できませんでした")?;
 
-    let mut has_leave = false;
-    let mut has_shared_content = false;
+    let mut evidence = MeetingUiaEvidence::default();
     for element in elements {
         if element.is_offscreen().unwrap_or(true) {
             continue;
         }
         let name = normalize_name(&element.get_name().unwrap_or_default());
+        let automation_id = element.get_automation_id().unwrap_or_default();
         let control_type = element.get_control_type().ok();
         if is_leave_control(&name, control_type) {
-            has_leave = true;
+            evidence.has_leave_control = true;
+        }
+        if is_call_control(&automation_id, control_type) {
+            evidence.has_call_control = true;
         }
         if is_shared_content_name(&name) {
-            has_shared_content = true;
+            evidence.has_shared_content = true;
         }
-        if has_leave && has_shared_content {
+        if evidence.has_leave_control && evidence.has_call_control && evidence.has_shared_content {
             break;
         }
     }
-    Ok((has_leave, has_shared_content))
+    Ok(evidence)
 }
 
 fn is_leave_control(name: &str, control_type: Option<ControlType>) -> bool {
@@ -483,6 +510,17 @@ fn is_leave_control(name: &str, control_type: Option<ControlType>) -> bool {
     ]
     .iter()
     .any(|hint| name.contains(hint))
+}
+
+fn is_call_control(automation_id: &str, control_type: Option<ControlType>) -> bool {
+    let automation_id = automation_id.trim();
+    (automation_id.eq_ignore_ascii_case("hangup-button")
+        && matches!(
+            control_type,
+            Some(ControlType::Button | ControlType::SplitButton | ControlType::MenuItem)
+        ))
+        || (automation_id.eq_ignore_ascii_case("call-duration-custom")
+            && matches!(control_type, Some(ControlType::Text)))
 }
 
 fn is_shared_content_name(name: &str) -> bool {
@@ -619,14 +657,20 @@ unsafe extern "system" fn win_event_callback(
 #[cfg(test)]
 mod tests {
     use super::{
-        DebouncedMeetingState, MeetingEvidence, REQUIRED_ENTRY_SCANS, is_leave_control,
-        is_shared_content_name, normalize_name,
+        DebouncedMeetingState, MeetingEvidence, REQUIRED_ENTRY_SCANS, is_call_control,
+        is_leave_control, is_shared_content_name, normalize_name,
     };
     use crate::capture::CaptureTarget;
     use std::time::{Duration, Instant};
     use uiautomation::types::ControlType;
 
-    fn evidence(id: u32, leave: bool, video: bool, shared: bool) -> MeetingEvidence {
+    fn evidence(
+        id: u32,
+        leave: bool,
+        call_control: bool,
+        video: bool,
+        shared: bool,
+    ) -> MeetingEvidence {
         MeetingEvidence {
             target: CaptureTarget {
                 id,
@@ -639,6 +683,7 @@ mod tests {
             has_webview: true,
             has_video: video,
             has_leave_control: leave,
+            has_call_control: call_control,
             has_shared_content: shared,
             score: 300,
         }
@@ -668,30 +713,75 @@ mod tests {
     }
 
     #[test]
+    fn stable_call_control_ids_are_detected() {
+        assert!(is_call_control("hangup-button", Some(ControlType::Button)));
+        assert!(is_call_control(
+            "call-duration-custom",
+            Some(ControlType::Text)
+        ));
+        assert!(!is_call_control("share-button", Some(ControlType::Button)));
+    }
+
+    #[test]
     fn meeting_entry_is_debounced() {
         let started = Instant::now();
         let mut state = DebouncedMeetingState::default();
         assert!(
             state
-                .update(started, vec![evidence(42, true, true, false)])
+                .update(started, vec![evidence(42, true, true, true, false)])
                 .is_none()
         );
         let active = state.update(
             started + Duration::from_millis(700),
-            vec![evidence(42, true, true, false)],
+            vec![evidence(42, true, true, true, false)],
         );
         assert_eq!(REQUIRED_ENTRY_SCANS, 2);
         assert_eq!(active.map(|meeting| meeting.target.id), Some(42));
     }
 
     #[test]
+    fn single_participant_meeting_enters_without_shared_content() {
+        let started = Instant::now();
+        let mut state = DebouncedMeetingState::default();
+        assert!(
+            state
+                .update(started, vec![evidence(42, false, true, false, false)])
+                .is_none()
+        );
+        let active = state.update(
+            started + Duration::from_millis(1_200),
+            vec![evidence(42, false, true, false, false)],
+        );
+        assert_eq!(active.map(|meeting| meeting.target.id), Some(42));
+    }
+
+    #[test]
+    fn shared_content_alone_does_not_enter_a_meeting() {
+        let started = Instant::now();
+        let mut state = DebouncedMeetingState::default();
+        assert!(
+            state
+                .update(started, vec![evidence(42, false, false, false, true)])
+                .is_none()
+        );
+        assert!(
+            state
+                .update(
+                    started + Duration::from_millis(2_000),
+                    vec![evidence(42, false, false, false, true)],
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn transient_missing_signal_does_not_exit() {
         let started = Instant::now();
         let mut state = DebouncedMeetingState::default();
-        let _ = state.update(started, vec![evidence(42, true, true, false)]);
+        let _ = state.update(started, vec![evidence(42, true, true, true, false)]);
         let _ = state.update(
             started + Duration::from_millis(700),
-            vec![evidence(42, true, true, false)],
+            vec![evidence(42, true, true, true, false)],
         );
         assert_eq!(
             state
