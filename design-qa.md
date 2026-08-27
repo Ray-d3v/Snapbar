@@ -1,46 +1,48 @@
-# Native title-bar idle state — Product Design QA
+# Dynamic Island disclosure — Product Design QA
 
 ## Evidence
 
-- Design reference: the user-provided Dynamic Island sketch at `C:\Users\arare\.codex\codex-remote-attachments\01a0417a-1d1b-7c10-a5e1-ab0cec13a9a5\316DDA94-0204-472A-BDDF-F313571AB8C4\1-写真1.jpg`.
-- Before, unhovered: `target/product-design-audit/native-idle/02-current-titlebar-full.png`.
-- Final, unhovered: `target/product-design-audit/native-idle/07-final-unhovered-full.png` and `08-final-unhovered-center.png`.
-- Final, hovered: `target/product-design-audit/native-idle/09-final-hovered.png`.
-- Required combined comparison input: `target/product-design-audit/native-idle/10-before-after-comparison.png`.
-- Runtime context: active one-person Teams meeting, dark title bar, no shared content, 1920-pixel-wide window, Windows DPI 96 (100%). Full title-bar captures are 1920 × 120 native pixels; centered state captures are 720 × 120 native pixels.
+- Design reference: the user-annotated root-curve sketch at `C:\Users\arare\.codex\codex-remote-attachments\01a0417a-1d1b-7c10-a5e1-ab0cec13a9a5\5636C9E4-3757-4774-A08F-BCA346C83689\1-写真1.jpg`.
+- Initial motion: `target/product-design-audit/island-motion/pass1/expand-contact-sheet.png`.
+- Final expansion and collapse: `target/product-design-audit/island-motion/pass5/expand-contact-sheet.png` and `collapse-contact-sheet.png`.
+- Final settled state: `target/product-design-audit/island-motion/pass5/expand-07-300ms.png`.
+- Required combined reference/implementation input: `target/product-design-audit/island-motion/pass5/reference-implementation-comparison.png`.
+- Runtime context: active one-person Teams meeting with no shared content, dark title bar, 1920-pixel-wide window, Windows DPI 96 (100%). The audit build temporarily allowed local screen capture; release capture exclusion is restored after QA.
 
 ## Audit and iterations
 
-### Pass 1 — current implementation
+### Pass 1 — shallow attached strip
 
-- P1, shape and surface: the 92 × 38 opaque-black container, shadow, rounded drop, and `Snapbar` label read as an attached third-party badge rather than part of the title bar.
-- P2, spacing and layout: the idle surface extended 8 pixels below the 30-pixel caption band and was denser than the native caption controls shown in the same screenshot.
-- P2, state contrast: idle and expanded modes used the same opaque-island material, so hover disclosure did not create a meaningful native-to-island transition.
+- P1, shape and surface: the 8-pixel drop placed most of the shoulder inside the black caption band, so the root read as a short diagonal edge instead of the annotated concave join.
+- P2, motion: the surface widened from the center, but clamping the spring at its target removed the requested Dynamic Island-like peak bulge.
 
-### Pass 2 — first native-cell build
+### Passes 2–4 — visible root and spring tuning
 
-- Converted idle mode to two 46 × 30 title-bar cells and reserved the 272 × 38 black surface for expansion.
-- P2, state rendering: `04-final-unhovered-full.png` still showed a stale camera-cell hover backplate while the pointer was outside the overlay. Removed the GPUI idle hover backplate instead of accepting an incorrect rest state.
+- Increased the fixed envelope to 280 × 48, the expanded surface to 272 × 46, and the caption drop to 16 pixels so the join is visible below Teams' title bar.
+- Made one progress value drive both GPUI painting and the Win32 input region, eliminating geometry/input drift during disclosure.
+- Added a bounded spring overshoot. P2 remained when the first spring peaked too late; stiffness and damping were retuned so useful controls appear around 150–200 ms and the island settles by about 300 ms.
+- P2, shape tangent: the first smoothstep shoulder still left the caption edge at a slightly diagonal-looking tangent.
 
-### Pass 3 — final build
+### Pass 5 — final build
 
-- `07-final-unhovered-full.png` shows no idle fill, shadow, brand label, rounded container, or caption-bottom drop. Only the centered status dot and 16-pixel camera glyph remain.
-- The two cells occupy the title-bar band from its top to bottom and align to the same visual axis as the Windows caption glyphs at the right edge.
-- `09-final-hovered.png` confirms that the black square-top, rounded-bottom island appears only after disclosure and that its existing controls remain intact.
-- No actionable P0, P1, or P2 visual mismatch remains in the compared states.
+- The shoulder now follows a quarter-circle ease-out: it leaves the title-bar baseline horizontally, turns inward across 10 pixels, and reaches the body with a vertical tangent.
+- The settled island uses a 16-pixel shoulder inset, 6-pixel bottom radius, and 16-pixel caption drop. The black surface remains one centered horizontal control row.
+- Expansion starts after the existing 50 ms pointer verification, grows symmetrically, shows a restrained peak bulge near 200 ms, and returns to the 272-pixel target by 300 ms. Collapse preserves the same silhouette while fading back to the transparent 92 × 30 idle cells.
+- A final geometry clamp keeps that peak bulge horizontal; it cannot exceed the audited 16-pixel vertical drop. The settled comparison state is unchanged.
+- The combined comparison confirms the two annotated root curves, centered growth, title-bar attachment, and the absence of an unrelated downward menu. No actionable P0, P1, or P2 visual mismatch remains.
 
 ## Mandatory fidelity surfaces
 
-- Fonts and typography: idle mode contains no text, eliminating the previous competing micro-label. Expanded Japanese status text remains centered, legible, and untruncated.
-- Spacing and layout: idle is exactly 92 × 30 logical pixels, split into two 46-pixel cells. Expanded remains 272 × 38 with its existing 6-pixel control rhythm and 8-pixel drop. Unit coverage verifies 100% and 150% geometry plus narrow-window compact placement.
-- Viewport resilience: normal width uses the centered two-cell idle affordance; constrained title bars reduce to one 46 × 30 camera cell; insufficient safe spans still hide the overlay rather than overlapping caption controls.
-- Colors and tokens: idle material is transparent with a one-alpha hit surface; green/amber/red status and white/gray camera glyphs remain the only visible tokens. Opaque `#050506` is reserved for expanded mode.
-- Image and asset fidelity: the existing repository camera, folder, refresh, and power SVG assets are retained. No substitute illustration, CSS art, or generated asset was introduced.
-- Copy and content: `Snapbar` is removed from idle mode. Expanded mode preserves the useful localized status label and current actions.
-- Icons: the idle camera is 16 pixels and optically centered in a 46 × 30 cell; status dot is centered in the adjacent cell. Expanded icons remain aligned and visually unchanged.
-- States and interactions: pointer enter and leave retain the native 50 ms disclosure controller. Live captures verify both final states; region tests verify that idle/compact regions are rectangular while expanded keeps the rounded-bottom silhouette.
-- Accessibility: the 46 × 30 targets match the practical size of Windows caption cells and expanded mode supplies text in addition to status color. The deliberate `WS_EX_NOACTIVATE` contract means this overlay remains pointer-operated and does not take keyboard focus from Teams; UI Automation naming and high-contrast appearance remain separate product follow-ups rather than visual-fidelity claims.
+- Fonts and typography: the expanded Japanese status remains legible and untruncated throughout the crossfade; idle contains no competing label.
+- Spacing and layout: idle remains 92 × 30; expanded settles at 272 × 46 inside a fixed 280 × 48 envelope. Controls remain centered on one row and clear of Teams caption buttons.
+- Viewport resilience: normal width uses the full island, constrained title bars retain the existing 46 × 30 camera-only mode, and insufficient safe spans still hide the overlay.
+- Colors and tokens: transparent native-style idle cells and existing status/icon colors are unchanged. Opaque `#050506` remains expanded-only.
+- Image and asset fidelity: existing camera, folder, refresh, and power SVG assets are retained; no replacement or generated artwork was introduced.
+- Copy and content: status and action semantics are unchanged.
+- Icons: all five expanded items remain optically aligned and were checked at settled, expanding, and collapsing frames without clipping.
+- States and interactions: enter, peak, settled, leave, and idle frames were captured. Unit coverage checks 100% and 150% geometry, root scanlines, fixed-envelope overshoot, native-region/client-origin alignment, compact placement, and the existing 50 ms disclosure state machine.
+- Accessibility: GPUI's reduced-motion setting snaps the spring to its target. The overlay deliberately remains non-activating and pointer-operated so Teams retains focus; keyboard operation and UI Automation naming remain separate product follow-ups rather than claims of this visual change.
 
 ## Result
 
-Final result: passed. The unhovered affordance now reads as title-bar glyphs; the Dynamic Island material is reserved for hover disclosure.
+Final result: passed. The surface now grows from the centered title-bar affordance with a visible concave root, a restrained spring bulge, and a matched native input silhouette.

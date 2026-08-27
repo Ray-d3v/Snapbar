@@ -23,7 +23,7 @@
 - Do not copy the full Teams frame to CPU memory merely to compute UIA geometry. Read only the authoritative cropped region.
 - Reuse the cropped CPU buffer and avoid per-frame heap allocation. Keep only one latest cropped frame and a low-frequency backup refresh.
 - Place the visible Snapbar affordance in the center-safe area of the Teams title bar, not over the meeting content or meeting control row.
-- The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand controls horizontally only; never open a menu below the title bar.
+- The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand into the bounded 272 × 46 px island with a visible concave shoulder/root at the caption bottom; the 16 px drop is part of that island, not a separate menu. Keep all controls on one horizontal row.
 - Use DWM frame and caption-button bounds to avoid the Windows caption controls. `DWMWA_CAPTION_BUTTON_BOUNDS` is window-relative and must be converted using `GetWindowRect` before combining it with screen-space `DWMWA_EXTENDED_FRAME_BOUNDS`. When the available title-bar span is too narrow, reduce to a single camera control.
 - Hover expansion and collapse must be debounced. The non-pinned control strip must always collapse after the pointer leaves the actual visible surface.
 - Keep hover disclosure at the native overlay-window level: one `SetWindowSubclass` controller, one explicit state machine, `TrackMouseEvent` / `WM_MOUSELEAVE`, and pointer verification at timer boundaries. GPUI must only render the published mode. Do not use element-level hover as the source of truth, detached timer generations, or permanent cursor polling.
@@ -35,8 +35,9 @@
 - Keep Windows capture, shared-content detection, clipboard, and optional file-save logic isolated from GPUI under `src/capture.rs` and `src/capture/`.
 - Keep local meeting detection isolated in `src/meeting.rs` and notification-area lifetime control in `src/resident.rs`.
 - Prefer `SetWinEventHook` for prompt local change notification, but retain a low-frequency watchdog scan for missed events.
-- Keep idle and compact title-bar affordances visually transparent like native caption cells. Use the opaque-black square-top/rounded-bottom material only for the expanded island.
+- Keep idle and compact title-bar affordances visually transparent like native caption cells. Use the opaque-black square-top, concave-shoulder, rounded-bottom material only for the expanded island.
 - Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette. Use one shared geometry source and one native-region writer.
+- During disclosure, animate one shared progress value for both painting and the native region. The expanded region must retain a square top, concave shoulders at the caption boundary, and rounded bottom corners while it grows from the centered idle surface.
 - Keep the control out of Alt+Tab and the taskbar, do not activate it when shown or clicked, and exclude it from screen capture.
 - Prefer small, direct changes. Do not introduce Electron, Tauri, another webview, a background service, or cloud authentication.
 

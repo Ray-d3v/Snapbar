@@ -50,38 +50,47 @@ const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
 const TME_LEAVE: u32 = 0x0000_0002;
 const MA_NOACTIVATE: isize = 3;
 const RGN_OR: i32 = 2;
+const DISCLOSURE_PROGRESS_MAX: u32 = 1_000;
+const DISCLOSURE_PROGRESS_LIMIT: u32 = 1_044;
 
 pub const WINDOW_WIDTH: f32 = 280.0;
-pub const WINDOW_HEIGHT: f32 = 40.0;
+pub const WINDOW_HEIGHT: f32 = 48.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
 pub const COLLAPSED_HEIGHT: f32 = 30.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
-pub const EXPANDED_HEIGHT: f32 = 38.0;
+pub const EXPANDED_HEIGHT: f32 = 46.0;
 pub const COMPACT_WIDTH: f32 = 46.0;
 pub const COMPACT_HEIGHT: f32 = 30.0;
-pub const ISLAND_BOTTOM_RADIUS: f32 = 16.0;
-pub const ISLAND_DROP: f32 = 8.0;
+pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
+pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
+pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
+pub const ISLAND_DROP: f32 = 16.0;
+
+pub fn disclosure_width(progress: f32) -> f32 {
+    COLLAPSED_WIDTH
+        + (EXPANDED_WIDTH - COLLAPSED_WIDTH)
+            * progress.clamp(
+                0.0,
+                DISCLOSURE_PROGRESS_LIMIT as f32 / DISCLOSURE_PROGRESS_MAX as f32,
+            )
+}
+
+pub fn disclosure_height(progress: f32) -> f32 {
+    COLLAPSED_HEIGHT + (EXPANDED_HEIGHT - COLLAPSED_HEIGHT) * progress.clamp(0.0, 1.0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverlayMode {
+enum OverlayMode {
+    #[cfg(test)]
     Collapsed,
     Expanded,
     Compact,
 }
 
 impl OverlayMode {
-    pub const fn from_state(expanded: bool, compact: bool) -> Self {
-        if compact {
-            Self::Compact
-        } else if expanded {
-            Self::Expanded
-        } else {
-            Self::Collapsed
-        }
-    }
-
     pub const fn logical_width(self) -> f32 {
         match self {
+            #[cfg(test)]
             Self::Collapsed => COLLAPSED_WIDTH,
             Self::Expanded => EXPANDED_WIDTH,
             Self::Compact => COMPACT_WIDTH,
@@ -90,6 +99,7 @@ impl OverlayMode {
 
     pub const fn logical_height(self) -> f32 {
         match self {
+            #[cfg(test)]
             Self::Collapsed => COLLAPSED_HEIGHT,
             Self::Expanded => EXPANDED_HEIGHT,
             Self::Compact => COMPACT_HEIGHT,
@@ -123,14 +133,6 @@ unsafe extern "system" {
         combine_mode: i32,
     ) -> i32;
     fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
-    fn CreateRoundRectRgn(
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-        width: i32,
-        height: i32,
-    ) -> *mut c_void;
     fn DeleteObject(object: *mut c_void) -> i32;
 }
 
@@ -605,9 +607,18 @@ struct WindowRegion {
     top: i32,
     right: i32,
     bottom: i32,
-    corner_width: i32,
-    corner_height: i32,
-    square_top_height: i32,
+    shape: WindowRegionShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowRegionShape {
+    Rectangle,
+    Island {
+        shoulder_start: i32,
+        shoulder_depth: i32,
+        shoulder_inset: i32,
+        bottom_radius: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -616,9 +627,27 @@ struct CaptionGeometry {
     buttons_left: i32,
 }
 
+#[derive(Clone)]
+pub struct DisclosureProgressPublisher {
+    progress: Arc<AtomicU32>,
+    wake_tx: SyncSender<()>,
+}
+
+impl DisclosureProgressPublisher {
+    pub fn publish(&self, progress: f32) {
+        let next = (progress.max(0.0) * DISCLOSURE_PROGRESS_MAX as f32)
+            .round()
+            .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32;
+        if self.progress.swap(next, Ordering::AcqRel) != next {
+            let _ = self.wake_tx.try_send(());
+        }
+    }
+}
+
 pub struct TeamsWindowFollower {
     target_id: Arc<AtomicU32>,
     expanded: Arc<AtomicBool>,
+    disclosure_progress: Arc<AtomicU32>,
     compact: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     event_rx: Receiver<()>,
@@ -638,6 +667,7 @@ impl TeamsWindowFollower {
 
         let target_id = Arc::new(AtomicU32::new(0));
         let expanded = Arc::new(AtomicBool::new(false));
+        let disclosure_progress = Arc::new(AtomicU32::new(0));
         let compact = Arc::new(AtomicBool::new(false));
         let visible = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
@@ -654,6 +684,7 @@ impl TeamsWindowFollower {
 
         let thread_target_id = Arc::clone(&target_id);
         let thread_expanded = Arc::clone(&expanded);
+        let thread_disclosure_progress = Arc::clone(&disclosure_progress);
         let thread_compact = Arc::clone(&compact);
         let thread_visible = Arc::clone(&visible);
         let thread_stop = Arc::clone(&stop);
@@ -691,6 +722,7 @@ impl TeamsWindowFollower {
                     if visibility_changed || compact_changed {
                         if !visible_now || compact_now {
                             thread_expanded.store(false, Ordering::Release);
+                            thread_disclosure_progress.store(0, Ordering::Release);
                             post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
                         }
                         let _ = thread_event_tx.try_send(());
@@ -698,11 +730,13 @@ impl TeamsWindowFollower {
                         previous_compact = compact_now;
                     }
 
-                    let mode = OverlayMode::from_state(
-                        thread_expanded.load(Ordering::Acquire),
-                        compact_now,
-                    );
-                    match desired_window_region(overlay_hwnd, mode) {
+                    let disclosure_progress = if visible_now && !compact_now {
+                        thread_disclosure_progress.load(Ordering::Acquire)
+                    } else {
+                        thread_disclosure_progress.store(0, Ordering::Release);
+                        0
+                    };
+                    match desired_window_region(overlay_hwnd, compact_now, disclosure_progress) {
                         Some(region) if previous_region_state != Some(region) => {
                             if apply_window_region(overlay_hwnd, region) {
                                 previous_region_state = Some(region);
@@ -740,6 +774,7 @@ impl TeamsWindowFollower {
         Some(Self {
             target_id,
             expanded,
+            disclosure_progress,
             compact,
             visible,
             event_rx,
@@ -765,12 +800,20 @@ impl TeamsWindowFollower {
                 native_hover.reset();
             }
             self.expanded.store(false, Ordering::Release);
+            self.disclosure_progress.store(0, Ordering::Release);
             self.wake();
         }
     }
 
     pub fn is_expanded(&self) -> bool {
         self.expanded.load(Ordering::Acquire)
+    }
+
+    pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
+        DisclosureProgressPublisher {
+            progress: Arc::clone(&self.disclosure_progress),
+            wake_tx: self.wake_tx.clone(),
+        }
     }
 
     pub fn is_compact(&self) -> bool {
@@ -866,12 +909,16 @@ fn scale_logical(value: f32, actual: i32, logical: f32) -> i32 {
     ((value * actual as f32) / logical).round() as i32
 }
 
-fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
-    let surface_width = scale_logical(mode.logical_width(), width, WINDOW_WIDTH).clamp(1, width);
-    let surface_height =
-        scale_logical(mode.logical_height(), height, WINDOW_HEIGHT).clamp(1, height);
+fn surface_rect_for_size(
+    width: i32,
+    height: i32,
+    logical_width: f32,
+    logical_height: f32,
+) -> RectI {
+    let surface_width = scale_logical(logical_width, width, WINDOW_WIDTH).clamp(1, width);
+    let surface_height = scale_logical(logical_height, height, WINDOW_HEIGHT).clamp(1, height);
     let expanded_height = scale_logical(EXPANDED_HEIGHT, height, WINDOW_HEIGHT).clamp(1, height);
-    let surface_left = (width - surface_width) / 2;
+    let surface_left = width / 2 - surface_width / 2;
     // Every mode starts at the title-bar top edge. The idle caption cells end at the
     // caption bottom, while only the expanded island uses the reserved drop below it.
     let surface_top = (height - expanded_height) / 2;
@@ -884,83 +931,241 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
     }
 }
 
+fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
+    surface_rect_for_size(width, height, mode.logical_width(), mode.logical_height())
+}
+
+fn disclosure_surface_rect(width: i32, height: i32, progress: u32) -> RectI {
+    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT) as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+    surface_rect_for_size(
+        width,
+        height,
+        disclosure_width(progress),
+        disclosure_height(progress),
+    )
+}
+
+#[cfg(test)]
 fn hover_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
     surface_rect(width, height, mode)
 }
 
+#[cfg(test)]
 fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
+    match mode {
+        OverlayMode::Collapsed => window_region_for_progress(metrics, false, 0),
+        OverlayMode::Expanded => {
+            window_region_for_progress(metrics, false, DISCLOSURE_PROGRESS_MAX)
+        }
+        OverlayMode::Compact => window_region_for_progress(metrics, true, 0),
+    }
+}
+
+fn window_region_for_progress(
+    metrics: WindowMetrics,
+    compact: bool,
+    progress: u32,
+) -> WindowRegion {
     let client_left = metrics
         .client_screen_left
         .saturating_sub(metrics.window_rect.left);
     let client_top = metrics
         .client_screen_top
         .saturating_sub(metrics.window_rect.top);
-    let hover = hover_rect(metrics.client_width, metrics.client_height, mode);
-    let corner_diameter = scale_logical(
-        ISLAND_BOTTOM_RADIUS * 2.0,
-        metrics.client_height,
-        WINDOW_HEIGHT,
-    )
-    .clamp(1, hover.height().max(1));
+    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT);
+    let hover = if compact {
+        surface_rect(
+            metrics.client_width,
+            metrics.client_height,
+            OverlayMode::Compact,
+        )
+    } else {
+        disclosure_surface_rect(metrics.client_width, metrics.client_height, progress)
+    };
+    let normalized = progress as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+    let shape = if compact || progress == 0 {
+        WindowRegionShape::Rectangle
+    } else {
+        let caption_height = scale_logical(COLLAPSED_HEIGHT, metrics.client_height, WINDOW_HEIGHT)
+            .clamp(1, hover.height());
+        let animated_drop = hover.height().saturating_sub(caption_height);
+        let bottom_radius = scale_logical(
+            ISLAND_BOTTOM_RADIUS * normalized,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, animated_drop);
+        let shoulder_depth = scale_logical(
+            ISLAND_SHOULDER_DEPTH * normalized,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, animated_drop.saturating_sub(bottom_radius));
+        let shoulder_inset = scale_logical(
+            ISLAND_SHOULDER_INSET * normalized,
+            metrics.client_width,
+            WINDOW_WIDTH,
+        )
+        .clamp(0, hover.width().saturating_sub(1) / 2);
+        WindowRegionShape::Island {
+            shoulder_start: caption_height,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        }
+    };
     WindowRegion {
         left: client_left.saturating_add(hover.left),
         top: client_top.saturating_add(hover.top),
         right: client_left.saturating_add(hover.right),
         bottom: client_top.saturating_add(hover.bottom),
-        corner_width: corner_diameter,
-        corner_height: corner_diameter,
-        square_top_height: if matches!(mode, OverlayMode::Collapsed | OverlayMode::Compact) {
-            hover.height()
-        } else {
-            (corner_diameter / 2).max(1)
-        },
+        shape,
     }
 }
 
-fn desired_window_region(hwnd: HWND, mode: OverlayMode) -> Option<WindowRegion> {
-    Some(window_region(window_metrics(hwnd)?, mode))
+fn desired_window_region(
+    hwnd: HWND,
+    compact: bool,
+    disclosure_progress: u32,
+) -> Option<WindowRegion> {
+    Some(window_region_for_progress(
+        window_metrics(hwnd)?,
+        compact,
+        disclosure_progress,
+    ))
+}
+
+fn island_row_inset(
+    row: i32,
+    width: i32,
+    height: i32,
+    shoulder_start: i32,
+    shoulder_depth: i32,
+    shoulder_inset: i32,
+    bottom_radius: i32,
+) -> i32 {
+    let shoulder_row = row.saturating_sub(shoulder_start);
+    let mut inset = if row < shoulder_start {
+        0
+    } else if shoulder_depth <= 1 || shoulder_row >= shoulder_depth {
+        shoulder_inset
+    } else {
+        let phase = shoulder_row as f32 / (shoulder_depth - 1) as f32;
+        // A quarter-circle ease-out gives the join a horizontal tangent against
+        // the caption edge and a vertical tangent as it reaches the island body.
+        let eased = (1.0 - (1.0 - phase) * (1.0 - phase)).sqrt();
+        (shoulder_inset as f32 * eased).round() as i32
+    };
+
+    if bottom_radius > 0 {
+        let corner_start = height.saturating_sub(bottom_radius);
+        if row >= corner_start {
+            let phase = if bottom_radius <= 1 {
+                1.0
+            } else {
+                (row - corner_start) as f32 / (bottom_radius - 1) as f32
+            };
+            let circle = (1.0 - phase * phase).max(0.0).sqrt();
+            let corner_inset = (bottom_radius as f32 * (1.0 - circle)).round() as i32;
+            inset = shoulder_inset.saturating_add(corner_inset);
+        }
+    }
+
+    inset.clamp(0, width.saturating_sub(1) / 2)
+}
+
+fn create_island_region(
+    desired: WindowRegion,
+    shoulder_start: i32,
+    shoulder_depth: i32,
+    shoulder_inset: i32,
+    bottom_radius: i32,
+) -> *mut c_void {
+    let width = desired.right.saturating_sub(desired.left);
+    let height = desired.bottom.saturating_sub(desired.top);
+    if width <= 0 || height <= 0 {
+        return null_mut();
+    }
+
+    let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+    if region.is_null() {
+        return null_mut();
+    }
+
+    let mut has_rows = false;
+    for row in 0..height {
+        let inset = island_row_inset(
+            row,
+            width,
+            height,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        );
+        let strip_left = desired.left.saturating_add(inset);
+        let strip_right = desired.right.saturating_sub(inset);
+        if strip_right <= strip_left {
+            continue;
+        }
+
+        let strip = unsafe {
+            CreateRectRgn(
+                strip_left,
+                desired.top.saturating_add(row),
+                strip_right,
+                desired.top.saturating_add(row).saturating_add(1),
+            )
+        };
+        if strip.is_null() {
+            unsafe {
+                let _ = DeleteObject(region);
+            }
+            return null_mut();
+        }
+        let combined = unsafe { CombineRgn(region, region, strip, RGN_OR) };
+        unsafe {
+            let _ = DeleteObject(strip);
+        }
+        if combined == 0 {
+            unsafe {
+                let _ = DeleteObject(region);
+            }
+            return null_mut();
+        }
+        has_rows = true;
+    }
+
+    if !has_rows {
+        unsafe {
+            let _ = DeleteObject(region);
+        }
+        return null_mut();
+    }
+    region
 }
 
 fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
-    let region = unsafe {
-        CreateRoundRectRgn(
-            desired.left,
-            desired.top,
-            desired.right,
-            desired.bottom,
-            desired.corner_width,
-            desired.corner_height,
-        )
+    let region = match desired.shape {
+        WindowRegionShape::Rectangle => unsafe {
+            CreateRectRgn(desired.left, desired.top, desired.right, desired.bottom)
+        },
+        WindowRegionShape::Island {
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        } => create_island_region(
+            desired,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        ),
     };
     if region.is_null() {
         return false;
     }
-
-    let square_top = unsafe {
-        CreateRectRgn(
-            desired.left,
-            desired.top,
-            desired.right,
-            desired.top.saturating_add(desired.square_top_height),
-        )
-    };
-    if square_top.is_null() {
-        unsafe {
-            let _ = DeleteObject(region);
-        }
-        return false;
-    }
-    let combined = unsafe { CombineRgn(region, region, square_top, RGN_OR) };
-    unsafe {
-        let _ = DeleteObject(square_top);
-    }
-    if combined == 0 {
-        unsafe {
-            let _ = DeleteObject(region);
-        }
-        return false;
-    }
-
     let applied = unsafe { SetWindowRgn(hwnd.0, region, 1) };
     if applied == 0 {
         unsafe {
@@ -1238,7 +1443,7 @@ mod tests {
     #[test]
     fn regions_match_visible_surfaces() {
         assert_eq!(
-            surface_rect(280, 40, OverlayMode::Collapsed),
+            surface_rect(280, 48, OverlayMode::Collapsed),
             RectI {
                 left: 94,
                 top: 1,
@@ -1247,16 +1452,16 @@ mod tests {
             }
         );
         assert_eq!(
-            surface_rect(280, 40, OverlayMode::Expanded),
+            surface_rect(280, 48, OverlayMode::Expanded),
             RectI {
                 left: 4,
                 top: 1,
                 right: 276,
-                bottom: 39,
+                bottom: 47,
             }
         );
         assert_eq!(
-            surface_rect(280, 40, OverlayMode::Compact),
+            surface_rect(280, 48, OverlayMode::Compact),
             RectI {
                 left: 117,
                 top: 1,
@@ -1269,23 +1474,23 @@ mod tests {
     #[test]
     fn hover_regions_follow_the_full_island_silhouette() {
         assert_eq!(
-            hover_rect(280, 40, OverlayMode::Collapsed),
-            surface_rect(280, 40, OverlayMode::Collapsed)
+            hover_rect(280, 48, OverlayMode::Collapsed),
+            surface_rect(280, 48, OverlayMode::Collapsed)
         );
         assert_eq!(
-            hover_rect(280, 40, OverlayMode::Expanded),
-            surface_rect(280, 40, OverlayMode::Expanded)
+            hover_rect(280, 48, OverlayMode::Expanded),
+            surface_rect(280, 48, OverlayMode::Expanded)
         );
         assert_eq!(
-            hover_rect(280, 40, OverlayMode::Compact),
-            surface_rect(280, 40, OverlayMode::Compact)
+            hover_rect(280, 48, OverlayMode::Compact),
+            surface_rect(280, 48, OverlayMode::Compact)
         );
     }
 
     #[test]
     fn hover_region_scales_with_dpi() {
         assert_eq!(
-            hover_rect(420, 60, OverlayMode::Collapsed),
+            hover_rect(420, 72, OverlayMode::Collapsed),
             RectI {
                 left: 141,
                 top: 1,
@@ -1302,12 +1507,12 @@ mod tests {
                 left: -7,
                 top: -7,
                 right: 287,
-                bottom: 47,
+                bottom: 55,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
 
         assert_eq!(
@@ -1317,34 +1522,121 @@ mod tests {
                 top: 8,
                 right: 193,
                 bottom: 38,
-                corner_width: 30,
-                corner_height: 30,
-                square_top_height: 30,
+                shape: WindowRegionShape::Rectangle,
             }
         );
     }
 
     #[test]
-    fn idle_regions_are_rectangular_but_expanded_region_keeps_rounded_bottom() {
+    fn idle_regions_are_rectangular_but_expanded_region_has_curved_shoulders() {
         let metrics = WindowMetrics {
             window_rect: RectI {
                 left: 0,
                 top: 0,
                 right: 280,
-                bottom: 40,
+                bottom: 48,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
 
         for mode in [OverlayMode::Collapsed, OverlayMode::Compact] {
             let region = window_region(metrics, mode);
-            assert_eq!(region.square_top_height, region.bottom - region.top);
+            assert_eq!(region.shape, WindowRegionShape::Rectangle);
         }
         let expanded = window_region(metrics, OverlayMode::Expanded);
-        assert!(expanded.square_top_height < expanded.bottom - expanded.top);
+        assert_eq!(
+            expanded.shape,
+            WindowRegionShape::Island {
+                shoulder_start: 30,
+                shoulder_depth: 10,
+                shoulder_inset: 16,
+                bottom_radius: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn disclosure_geometry_grows_from_the_center_without_moving_the_top_anchor() {
+        assert_eq!(disclosure_width(0.0), COLLAPSED_WIDTH);
+        assert_eq!(disclosure_height(0.0), COLLAPSED_HEIGHT);
+        assert_eq!(disclosure_width(1.0), EXPANDED_WIDTH);
+        assert_eq!(disclosure_height(1.0), EXPANDED_HEIGHT);
+
+        let halfway = disclosure_surface_rect(280, 48, 500);
+        assert_eq!(
+            halfway,
+            RectI {
+                left: 49,
+                top: 1,
+                right: 231,
+                bottom: 39,
+            }
+        );
+        assert_eq!(halfway.center_x(), 140);
+        for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
+            assert_eq!(disclosure_surface_rect(280, 48, progress).top, 1);
+            assert_eq!(disclosure_surface_rect(280, 48, progress).center_x(), 140);
+        }
+    }
+
+    #[test]
+    fn spring_overshoot_bulges_inside_the_fixed_overlay_envelope() {
+        assert_eq!(
+            disclosure_surface_rect(280, 48, DISCLOSURE_PROGRESS_LIMIT),
+            RectI {
+                left: 0,
+                top: 1,
+                right: 280,
+                bottom: 47,
+            }
+        );
+    }
+
+    #[test]
+    fn disclosure_region_scales_shoulders_with_dpi() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 420,
+                bottom: 72,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 420,
+            client_height: 72,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Expanded),
+            WindowRegion {
+                left: 6,
+                top: 1,
+                right: 414,
+                bottom: 70,
+                shape: WindowRegionShape::Island {
+                    shoulder_start: 45,
+                    shoulder_depth: 15,
+                    shoulder_inset: 24,
+                    bottom_radius: 9,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn island_rows_curve_in_at_the_root_and_round_out_at_the_bottom() {
+        assert_eq!(island_row_inset(0, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(29, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(30, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(31, 272, 46, 30, 10, 16, 6), 7);
+        assert_eq!(island_row_inset(35, 272, 46, 30, 10, 16, 6), 14);
+        assert_eq!(island_row_inset(39, 272, 46, 30, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(40, 272, 46, 30, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(45, 272, 46, 30, 10, 16, 6), 22);
     }
 
     #[test]
@@ -1354,12 +1646,12 @@ mod tests {
                 left: -7,
                 top: -7,
                 right: 287,
-                bottom: 47,
+                bottom: 55,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
         let shifted = WindowMetrics {
             client_screen_left: 1,
@@ -1439,7 +1731,8 @@ mod tests {
         assert!(!compact);
         let expanded = surface_rect(350, 50, OverlayMode::Expanded);
         assert!(y + expanded.top >= 0);
-        assert_eq!(y + expanded.bottom, 56);
+        // Caption bottom (46) plus the scaled 16px island drop (17px here).
+        assert_eq!(y + expanded.bottom, 63);
     }
 
     #[test]
@@ -1449,12 +1742,12 @@ mod tests {
                 left: 812,
                 top: 516,
                 right: 1108,
-                bottom: 564,
+                bottom: 572,
             },
             client_screen_left: 820,
             client_screen_top: 516,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
         let placement = calculate_placement(
             RectI {
@@ -1495,12 +1788,12 @@ mod tests {
                 left: 0,
                 top: 0,
                 right: 280,
-                bottom: 40,
+                bottom: 48,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
         let placement = calculate_placement(
             RectI {
@@ -1541,12 +1834,12 @@ mod tests {
                 left: 0,
                 top: 0,
                 right: 280,
-                bottom: 40,
+                bottom: 48,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
         let placement = calculate_placement(
             RectI {
@@ -1580,12 +1873,12 @@ mod tests {
                 left: 0,
                 top: 0,
                 right: 280,
-                bottom: 40,
+                bottom: 48,
             },
             client_screen_left: 0,
             client_screen_top: 0,
             client_width: 280,
-            client_height: 40,
+            client_height: 48,
         };
         let placement = calculate_placement(
             RectI {

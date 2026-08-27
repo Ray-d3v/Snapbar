@@ -8,19 +8,29 @@ use crate::{
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
         COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, EXPANDED_HEIGHT,
-        EXPANDED_WIDTH, ISLAND_BOTTOM_RADIUS, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+        EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH, disclosure_height,
+        disclosure_width,
     },
     resident::ResidentController,
     settings::AppSettings,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
-    transparent_black,
+    AnimationExt as _, App, Bounds, ClickEvent, Context, SpringAnimation, SpringConfig, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions, div,
+    prelude::*, px, relative, rgb, rgba, size, svg, transparent_black,
 };
 use gpui_platform::application;
 
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const DISCLOSURE_SPRING_STIFFNESS: f32 = 900.0;
+const DISCLOSURE_SPRING_DAMPING: f32 = 46.0;
+const DISCLOSURE_OVERSHOOT_GAIN: f32 = 2.0;
+const DISCLOSURE_MAX_PRESENTATION: f32 = 1.044;
+
+fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
+    let phase = ((value - start) / (end - start)).clamp(0.0, 1.0);
+    phase * phase * (3.0 - 2.0 * phase)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
@@ -438,46 +448,40 @@ impl Render for Snapbar {
                     )),
             );
 
-        let collapsed = div()
-            .id("titlebar-surface")
+        let idle_content = div()
+            .absolute()
+            .top(px(0.0))
+            .left(relative(0.5))
+            .ml(px(-COLLAPSED_WIDTH / 2.0))
             .flex()
-            .items_start()
-            .justify_center()
+            .items_center()
             .w(px(COLLAPSED_WIDTH))
-            .h(px(EXPANDED_HEIGHT))
-            .bg(transparent_black())
+            .h(px(COLLAPSED_HEIGHT))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .w(px(COLLAPSED_WIDTH))
-                    .h(px(COLLAPSED_HEIGHT))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(COMPACT_WIDTH))
-                            .h_full()
-                            .bg(idle_hit_surface)
-                            .child(div().size(px(6.0)).rounded_full().bg(status_color)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(COMPACT_WIDTH))
-                            .h_full()
-                            .bg(idle_hit_surface)
-                            .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
-                                if can_capture {
-                                    primary_text
-                                } else {
-                                    secondary_text
-                                },
-                            )),
-                    ),
+                    .justify_center()
+                    .w(px(COMPACT_WIDTH))
+                    .h_full()
+                    .bg(idle_hit_surface)
+                    .child(div().size(px(6.0)).rounded_full().bg(status_color)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(COMPACT_WIDTH))
+                    .h_full()
+                    .bg(idle_hit_surface)
+                    .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
+                        if can_capture {
+                            primary_text
+                        } else {
+                            secondary_text
+                        },
+                    )),
             );
 
         let status = div()
@@ -594,8 +598,11 @@ impl Render for Snapbar {
                     .text_color(rgb(0xf07178)),
             );
 
-        let expanded = div()
-            .id("titlebar-surface")
+        let expanded_content = div()
+            .absolute()
+            .top(px(0.0))
+            .left(relative(0.5))
+            .ml(px(-EXPANDED_WIDTH / 2.0))
             .flex()
             .items_center()
             .justify_center()
@@ -603,22 +610,80 @@ impl Render for Snapbar {
             .w(px(EXPANDED_WIDTH))
             .h(px(EXPANDED_HEIGHT))
             .px(px(7.0))
-            .rounded_t(px(0.0))
-            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
-            .bg(island_background)
-            .shadow_lg()
             .child(status)
             .child(capture)
             .child(save)
             .child(refresh)
             .child(quit);
 
+        let disclosure_target = self.expanded;
+        let progress_publisher = self
+            .follower
+            .as_ref()
+            .map(TeamsWindowFollower::disclosure_progress_publisher);
+        let animated_surface = div()
+            .id("titlebar-surface")
+            .relative()
+            .w(px(EXPANDED_WIDTH))
+            .h(px(EXPANDED_HEIGHT))
+            .bg(transparent_black())
+            .with_spring(
+                "titlebar-disclosure-spring",
+                SpringAnimation::new(SpringConfig::new(
+                    DISCLOSURE_SPRING_STIFFNESS,
+                    DISCLOSURE_SPRING_DAMPING,
+                    1.0,
+                ))
+                .to(disclosure_target)
+                .from(false)
+                .with_epsilon(0.001),
+                move |surface, phase| {
+                    let spring_position = phase.0.max(0.0);
+                    let progress = if spring_position > 1.0 {
+                        1.0 + (spring_position - 1.0) * DISCLOSURE_OVERSHOOT_GAIN
+                    } else {
+                        spring_position
+                    }
+                    .clamp(0.0, DISCLOSURE_MAX_PRESENTATION);
+                    let content_progress = spring_position.clamp(0.0, 1.0);
+                    if let Some(publisher) = &progress_publisher {
+                        publisher.publish(progress);
+                    }
+
+                    let surface_width = disclosure_width(progress);
+                    let surface_height = disclosure_height(progress);
+                    let black_alpha = (1.0 / 255.0
+                        + (254.0 / 255.0) * smoothstep_between(0.0, 0.22, content_progress))
+                    .clamp(1.0 / 255.0, 1.0);
+                    let idle_alpha = 1.0 - smoothstep_between(0.12, 0.62, content_progress);
+                    let expanded_alpha = smoothstep_between(0.58, 0.92, content_progress);
+
+                    surface
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .left(relative(0.5))
+                                .ml(px(-surface_width / 2.0))
+                                .w(px(surface_width))
+                                .h(px(surface_height))
+                                // SetWindowRgn supplies the animated concave shoulders and
+                                // rounded bottom; this fill is clipped to that exact shape.
+                                .bg(island_background.opacity(black_alpha)),
+                        )
+                        .when(content_progress < 0.72, |surface| {
+                            surface.child(idle_content.opacity(idle_alpha))
+                        })
+                        .when(content_progress > 0.58, |surface| {
+                            surface.child(expanded_content.opacity(expanded_alpha))
+                        })
+                },
+            );
+
         let surface = if self.compact_layout {
-            compact_camera
-        } else if self.expanded {
-            expanded
+            compact_camera.into_any_element()
         } else {
-            collapsed
+            animated_surface.into_any_element()
         };
 
         div()
