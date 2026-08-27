@@ -63,14 +63,13 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 
 ### 通常時
 
-- 約`92 × 38px`の小さな黒いアイランドを表示します。タイトルバー下端へ接続し、丸い底面だけが約`8px`下へせり出します。
-- 状態ドット、カメラアイコン、`Snapbar`ラベルだけの構成です。
-- ホバー入力範囲は、黒いアイランドの輪郭と一致し、Teamsタイトルバーの縦幅全体と下端のせり出し部分を覆います。
-- アイランドの左右にあるタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
+- 約`92 × 30px`の領域を、最小化・最大化ボタンと同じ考え方の`46px`幅セル2個としてタイトルバー内へ収めます。
+- 背景、影、ラベル、下方向のせり出しは表示せず、状態ドットと`16px`のカメラアイコンだけをタイトルバー上へ置きます。
+- ホバー入力範囲はこの`92 × 30px`の矩形と一致し、Teamsタイトルバーの縦幅を上端から下端まで覆います。左右の領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
 
 ### ホバー時
 
-約50msホバーすると、タイトルバーへ接続したまま中央を基準に**横方向だけ**へ約`272 × 38px`まで展開します。下へ別メニューは開かず、中央の安全領域からも動きません。
+約50msホバーすると、タイトルバーへ接続したまま中央を基準に、黒いDynamic Island風の操作列へ約`272 × 38px`まで展開します。黒い面と約`8px`の下方向のせり出しはこの展開時だけ表示します。下へ別メニューは開かず、中央の安全領域からも動きません。
 
 左から次の操作を配置しています。
 
@@ -88,7 +87,7 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 - `DWMWA_CAPTION_BUTTON_BOUNDS`で右側の最小化・最大化・閉じるボタン領域を避けます。
 - 左側の会議名と右側のキャプションボタンを避けた中央領域へ配置します。
 - Teamsの移動、最大化、スナップ、別モニターへの移動、DPI変更へ追従します。
-- 横幅が足りない場合は、中央のカメラボタン1個だけへ縮退します。
+- 横幅が足りない場合は、`46 × 30px`の透明なキャプションセル内にあるカメラアイコン1個だけへ縮退します。
 - カメラボタンも安全なタイトルバー領域へ収まらない場合は、Teamsの操作を妨げないようSnapbarを非表示にします。
 - タスクバーとAlt+Tabには表示せず、Teamsからフォーカスを奪いません。
 - Snapbar自身はキャプチャ画像から除外します。
@@ -179,9 +178,9 @@ Resident Snapbar process
 │  ├─ UIA leave-call evidence
 │  └─ debounced join / leave state
 └─ hidden GPUI title-bar control
-   └─ active meeting detected → follow Teams title bar and show 92 × 38 island
-      ├─ 50 ms hover → horizontal 272 × 38 island
-      ├─ narrow title bar → camera-only compact mode
+   └─ active meeting detected → follow Teams title bar and show 92 × 30 caption cells
+      ├─ 50 ms hover → horizontal 272 × 38 black island
+      ├─ narrow title bar → 46 × 30 camera-only caption cell
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle
          ├─ cropped-only reusable CPU buffer

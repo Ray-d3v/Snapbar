@@ -35,7 +35,7 @@
 - Keep Windows capture, shared-content detection, clipboard, and optional file-save logic isolated from GPUI under `src/capture.rs` and `src/capture/`.
 - Keep local meeting detection isolated in `src/meeting.rs` and notification-area lifetime control in `src/resident.rs`.
 - Prefer `SetWinEventHook` for prompt local change notification, but retain a low-frequency watchdog scan for missed events.
-- Keep the visible title-bar controls opaque black. Transparency is permitted only outside their rounded silhouette.
+- Keep idle and compact title-bar affordances visually transparent like native caption cells. Use the opaque-black square-top/rounded-bottom material only for the expanded island.
 - Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette. Use one shared geometry source and one native-region writer.
 - Keep the control out of Alt+Tab and the taskbar, do not activate it when shown or clicked, and exclude it from screen capture.
 - Prefer small, direct changes. Do not introduce Electron, Tauri, another webview, a background service, or cloud authentication.

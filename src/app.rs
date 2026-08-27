@@ -15,7 +15,7 @@ use crate::{
 };
 use gpui::{
     App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
+    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
     transparent_black,
 };
 use gpui_platform::application;
@@ -397,6 +397,10 @@ impl Render for Snapbar {
         let primary_text = rgb(0xf5f5f6);
         let secondary_text = rgb(0x9b9ba2);
         let island_background = rgb(0x050506);
+        // A non-zero alpha keeps the layered HWND interactive while remaining visually
+        // indistinguishable from the Teams title bar at rest.
+        let idle_hit_surface = rgba(0x00000001);
+        let idle_active_backplate = rgba(0xffffff24);
         let capture_background = match self.capture_state {
             CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0x35353a),
             CaptureState::Capturing => rgb(0xc83f47),
@@ -407,34 +411,27 @@ impl Render for Snapbar {
         let compact_camera = div()
             .id("titlebar-surface")
             .flex()
-            .items_center()
+            .items_start()
             .justify_center()
             .w(px(COMPACT_WIDTH))
-            .h(px(COMPACT_HEIGHT))
-            .rounded_t(px(0.0))
-            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
-            .bg(island_background)
-            .shadow_sm()
+            .h(px(EXPANDED_HEIGHT))
+            .bg(transparent_black())
             .child(
                 div()
                     .id("compact-capture-button")
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
-                    .rounded_full()
-                    .bg(capture_background)
+                    .w(px(COMPACT_WIDTH))
+                    .h(px(COMPACT_HEIGHT))
+                    .bg(idle_hit_surface)
+                    .active(move |button| button.bg(idle_active_backplate))
                     .when(can_capture, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(|button| button.opacity(0.91))
-                            .active(|button| button.opacity(0.68))
-                            .on_click(cx.listener(Self::on_capture_clicked))
+                        button.on_click(cx.listener(Self::on_capture_clicked))
                     })
-                    .when(!can_capture, |button| button.opacity(0.66))
                     .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
                         if can_capture {
-                            rgb(0xffffff)
+                            rgb(0xe5484d)
                         } else {
                             rgb(0xa7a7ac)
                         },
@@ -444,28 +441,44 @@ impl Render for Snapbar {
         let collapsed = div()
             .id("titlebar-surface")
             .flex()
-            .items_center()
+            .items_start()
             .justify_center()
-            .gap(px(7.0))
             .w(px(COLLAPSED_WIDTH))
-            .h(px(COLLAPSED_HEIGHT))
-            .rounded_t(px(0.0))
-            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
-            .bg(island_background)
-            .shadow_sm()
-            .cursor_pointer()
-            .child(div().size(px(7.0)).rounded_full().bg(status_color))
+            .h(px(EXPANDED_HEIGHT))
+            .bg(transparent_black())
             .child(
-                svg()
-                    .path("icons/camera.svg")
-                    .size(px(15.0))
-                    .text_color(if can_capture {
-                        primary_text
-                    } else {
-                        secondary_text
-                    }),
-            )
-            .child(div().text_xs().text_color(primary_text).child("Snapbar"));
+                div()
+                    .flex()
+                    .items_center()
+                    .w(px(COLLAPSED_WIDTH))
+                    .h(px(COLLAPSED_HEIGHT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(COMPACT_WIDTH))
+                            .h_full()
+                            .bg(idle_hit_surface)
+                            .child(div().size(px(6.0)).rounded_full().bg(status_color)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(COMPACT_WIDTH))
+                            .h_full()
+                            .bg(idle_hit_surface)
+                            .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
+                                if can_capture {
+                                    primary_text
+                                } else {
+                                    secondary_text
+                                },
+                            )),
+                    ),
+            );
 
         let status = div()
             .id("status-button")

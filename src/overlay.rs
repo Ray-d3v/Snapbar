@@ -54,11 +54,11 @@ const RGN_OR: i32 = 2;
 pub const WINDOW_WIDTH: f32 = 280.0;
 pub const WINDOW_HEIGHT: f32 = 40.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
-pub const COLLAPSED_HEIGHT: f32 = 38.0;
+pub const COLLAPSED_HEIGHT: f32 = 30.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
 pub const EXPANDED_HEIGHT: f32 = 38.0;
-pub const COMPACT_WIDTH: f32 = 40.0;
-pub const COMPACT_HEIGHT: f32 = 38.0;
+pub const COMPACT_WIDTH: f32 = 46.0;
+pub const COMPACT_HEIGHT: f32 = 30.0;
 pub const ISLAND_BOTTOM_RADIUS: f32 = 16.0;
 pub const ISLAND_DROP: f32 = 8.0;
 
@@ -870,8 +870,11 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
     let surface_width = scale_logical(mode.logical_width(), width, WINDOW_WIDTH).clamp(1, width);
     let surface_height =
         scale_logical(mode.logical_height(), height, WINDOW_HEIGHT).clamp(1, height);
+    let expanded_height = scale_logical(EXPANDED_HEIGHT, height, WINDOW_HEIGHT).clamp(1, height);
     let surface_left = (width - surface_width) / 2;
-    let surface_top = (height - surface_height) / 2;
+    // Every mode starts at the title-bar top edge. The idle caption cells end at the
+    // caption bottom, while only the expanded island uses the reserved drop below it.
+    let surface_top = (height - expanded_height) / 2;
 
     RectI {
         left: surface_left,
@@ -906,7 +909,11 @@ fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
         bottom: client_top.saturating_add(hover.bottom),
         corner_width: corner_diameter,
         corner_height: corner_diameter,
-        square_top_height: (corner_diameter / 2).max(1),
+        square_top_height: if matches!(mode, OverlayMode::Collapsed | OverlayMode::Compact) {
+            hover.height()
+        } else {
+            (corner_diameter / 2).max(1)
+        },
     }
 }
 
@@ -1236,7 +1243,7 @@ mod tests {
                 left: 94,
                 top: 1,
                 right: 186,
-                bottom: 39,
+                bottom: 31,
             }
         );
         assert_eq!(
@@ -1251,10 +1258,10 @@ mod tests {
         assert_eq!(
             surface_rect(280, 40, OverlayMode::Compact),
             RectI {
-                left: 120,
+                left: 117,
                 top: 1,
-                right: 160,
-                bottom: 39,
+                right: 163,
+                bottom: 31,
             }
         );
     }
@@ -1283,7 +1290,7 @@ mod tests {
                 left: 141,
                 top: 1,
                 right: 279,
-                bottom: 58,
+                bottom: 46,
             }
         );
     }
@@ -1309,12 +1316,35 @@ mod tests {
                 left: 101,
                 top: 8,
                 right: 193,
-                bottom: 46,
-                corner_width: 32,
-                corner_height: 32,
-                square_top_height: 16,
+                bottom: 38,
+                corner_width: 30,
+                corner_height: 30,
+                square_top_height: 30,
             }
         );
+    }
+
+    #[test]
+    fn idle_regions_are_rectangular_but_expanded_region_keeps_rounded_bottom() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 40,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 40,
+        };
+
+        for mode in [OverlayMode::Collapsed, OverlayMode::Compact] {
+            let region = window_region(metrics, mode);
+            assert_eq!(region.square_top_height, region.bottom - region.top);
+        }
+        let expanded = window_region(metrics, OverlayMode::Expanded);
+        assert!(expanded.square_top_height < expanded.bottom - expanded.top);
     }
 
     #[test]
@@ -1497,7 +1527,7 @@ mod tests {
         assert_eq!(
             placement,
             OverlayPlacement::Visible {
-                x: 92,
+                x: 89,
                 y: 15,
                 compact: true,
             }
