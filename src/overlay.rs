@@ -49,15 +49,18 @@ const WM_APP_RESET_DISCLOSURE: u32 = 0x8000 + 0x351;
 const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
 const TME_LEAVE: u32 = 0x0000_0002;
 const MA_NOACTIVATE: isize = 3;
+const RGN_OR: i32 = 2;
 
 pub const WINDOW_WIDTH: f32 = 280.0;
 pub const WINDOW_HEIGHT: f32 = 40.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
-pub const COLLAPSED_HEIGHT: f32 = 28.0;
+pub const COLLAPSED_HEIGHT: f32 = 38.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
-pub const EXPANDED_HEIGHT: f32 = 30.0;
+pub const EXPANDED_HEIGHT: f32 = 38.0;
 pub const COMPACT_WIDTH: f32 = 40.0;
-pub const COMPACT_HEIGHT: f32 = 30.0;
+pub const COMPACT_HEIGHT: f32 = 38.0;
+pub const ISLAND_BOTTOM_RADIUS: f32 = 16.0;
+pub const ISLAND_DROP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -113,6 +116,13 @@ type SubclassProc = unsafe extern "system" fn(
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
+    fn CombineRgn(
+        destination: *mut c_void,
+        source_one: *mut c_void,
+        source_two: *mut c_void,
+        combine_mode: i32,
+    ) -> i32;
+    fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
     fn CreateRoundRectRgn(
         left: i32,
         top: i32,
@@ -597,6 +607,7 @@ struct WindowRegion {
     bottom: i32,
     corner_width: i32,
     corner_height: i32,
+    square_top_height: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -871,15 +882,7 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
 }
 
 fn hover_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
-    let surface = surface_rect(width, height, mode);
-    let hover_height = scale_logical(EXPANDED_HEIGHT, height, WINDOW_HEIGHT).clamp(1, height);
-    let hover_top = (height - hover_height) / 2;
-    RectI {
-        left: surface.left,
-        top: hover_top,
-        right: surface.right,
-        bottom: hover_top + hover_height,
-    }
+    surface_rect(width, height, mode)
 }
 
 fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
@@ -890,14 +893,20 @@ fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
         .client_screen_top
         .saturating_sub(metrics.window_rect.top);
     let hover = hover_rect(metrics.client_width, metrics.client_height, mode);
-    let height = hover.height().max(1);
+    let corner_diameter = scale_logical(
+        ISLAND_BOTTOM_RADIUS * 2.0,
+        metrics.client_height,
+        WINDOW_HEIGHT,
+    )
+    .clamp(1, hover.height().max(1));
     WindowRegion {
         left: client_left.saturating_add(hover.left),
         top: client_top.saturating_add(hover.top),
         right: client_left.saturating_add(hover.right),
         bottom: client_top.saturating_add(hover.bottom),
-        corner_width: height,
-        corner_height: height,
+        corner_width: corner_diameter,
+        corner_height: corner_diameter,
+        square_top_height: (corner_diameter / 2).max(1),
     }
 }
 
@@ -917,6 +926,31 @@ fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
         )
     };
     if region.is_null() {
+        return false;
+    }
+
+    let square_top = unsafe {
+        CreateRectRgn(
+            desired.left,
+            desired.top,
+            desired.right,
+            desired.top.saturating_add(desired.square_top_height),
+        )
+    };
+    if square_top.is_null() {
+        unsafe {
+            let _ = DeleteObject(region);
+        }
+        return false;
+    }
+    let combined = unsafe { CombineRgn(region, region, square_top, RGN_OR) };
+    unsafe {
+        let _ = DeleteObject(square_top);
+    }
+    if combined == 0 {
+        unsafe {
+            let _ = DeleteObject(region);
+        }
         return false;
     }
 
@@ -988,15 +1022,18 @@ fn calculate_placement(
         return OverlayPlacement::Hidden;
     }
 
+    let island_drop =
+        scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, expanded_height);
+    let caption_fallback_height = expanded_height.saturating_sub(island_drop).max(24);
     let Some(caption) = caption_geometry(
         target_window,
         target_frame,
         caption_relative,
-        expanded_height + 8,
+        caption_fallback_height,
     ) else {
         return OverlayPlacement::Hidden;
     };
-    if expanded_height > caption.band.height() {
+    if expanded_height > caption.band.height().saturating_add(island_drop) {
         return OverlayPlacement::Hidden;
     }
 
@@ -1025,12 +1062,12 @@ fn calculate_placement(
     let desired_surface_left = surface_center - active_surface.width() / 2;
     let x = desired_surface_left - client_offset_x - active_surface.left;
 
-    let desired_surface_top =
-        caption.band.top + (caption.band.height() - expanded_surface.height()) / 2;
+    let desired_surface_bottom = caption.band.bottom.saturating_add(island_drop);
+    let desired_surface_top = desired_surface_bottom.saturating_sub(expanded_surface.height());
     let y = desired_surface_top - client_offset_y - expanded_surface.top;
     let placed_top = y + client_offset_y + expanded_surface.top;
     let placed_bottom = y + client_offset_y + expanded_surface.bottom;
-    if placed_top < caption.band.top || placed_bottom > caption.band.bottom {
+    if placed_top < caption.band.top || placed_bottom > desired_surface_bottom {
         return OverlayPlacement::Hidden;
     }
 
@@ -1197,41 +1234,36 @@ mod tests {
             surface_rect(280, 40, OverlayMode::Collapsed),
             RectI {
                 left: 94,
-                top: 6,
+                top: 1,
                 right: 186,
-                bottom: 34,
+                bottom: 39,
             }
         );
         assert_eq!(
             surface_rect(280, 40, OverlayMode::Expanded),
             RectI {
                 left: 4,
-                top: 5,
+                top: 1,
                 right: 276,
-                bottom: 35,
+                bottom: 39,
             }
         );
         assert_eq!(
             surface_rect(280, 40, OverlayMode::Compact),
             RectI {
                 left: 120,
-                top: 5,
+                top: 1,
                 right: 160,
-                bottom: 35,
+                bottom: 39,
             }
         );
     }
 
     #[test]
-    fn hover_regions_fill_the_titlebar_height_without_changing_width() {
+    fn hover_regions_follow_the_full_island_silhouette() {
         assert_eq!(
             hover_rect(280, 40, OverlayMode::Collapsed),
-            RectI {
-                left: 94,
-                top: 5,
-                right: 186,
-                bottom: 35,
-            }
+            surface_rect(280, 40, OverlayMode::Collapsed)
         );
         assert_eq!(
             hover_rect(280, 40, OverlayMode::Expanded),
@@ -1249,9 +1281,9 @@ mod tests {
             hover_rect(420, 60, OverlayMode::Collapsed),
             RectI {
                 left: 141,
-                top: 7,
+                top: 1,
                 right: 279,
-                bottom: 52,
+                bottom: 58,
             }
         );
     }
@@ -1275,11 +1307,12 @@ mod tests {
             window_region(metrics, OverlayMode::Collapsed),
             WindowRegion {
                 left: 101,
-                top: 12,
+                top: 8,
                 right: 193,
-                bottom: 42,
-                corner_width: 30,
-                corner_height: 30,
+                bottom: 46,
+                corner_width: 32,
+                corner_height: 32,
+                square_top_height: 16,
             }
         );
     }
@@ -1336,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_surface_is_fully_inside_caption_band() {
+    fn expanded_surface_is_anchored_to_the_caption_bottom_edge() {
         let overlay = WindowMetrics {
             window_rect: RectI {
                 left: 0,
@@ -1376,7 +1409,7 @@ mod tests {
         assert!(!compact);
         let expanded = surface_rect(350, 50, OverlayMode::Expanded);
         assert!(y + expanded.top >= 0);
-        assert!(y + expanded.bottom <= 46);
+        assert_eq!(y + expanded.bottom, 56);
     }
 
     #[test]
@@ -1419,7 +1452,7 @@ mod tests {
             placement,
             OverlayPlacement::Visible {
                 x: 811,
-                y: 15,
+                y: 19,
                 compact: false,
             }
         );
@@ -1465,7 +1498,7 @@ mod tests {
             placement,
             OverlayPlacement::Visible {
                 x: 92,
-                y: 3,
+                y: 15,
                 compact: true,
             }
         );

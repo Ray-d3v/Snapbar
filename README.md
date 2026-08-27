@@ -63,14 +63,14 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 
 ### 通常時
 
-- 約`92 × 28px`の小さな黒いピルだけを表示します。
+- 約`92 × 38px`の小さな黒いアイランドを表示します。タイトルバー下端へ接続し、丸い底面だけが約`8px`下へせり出します。
 - 状態ドット、カメラアイコン、`Snapbar`ラベルだけの構成です。
-- ホバー入力範囲は、横方向をピル幅のままに保ち、縦方向だけTeamsタイトルバーの高さいっぱいへ広げます。
-- ピルの左右にあるタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
+- ホバー入力範囲は、黒いアイランドの輪郭と一致し、Teamsタイトルバーの縦幅全体と下端のせり出し部分を覆います。
+- アイランドの左右にあるタイトルバー領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
 
 ### ホバー時
 
-約50msホバーすると、中央を基準に**横方向だけ**へ約`272 × 30px`まで展開します。下方向へメニューを出さないため、直下のTeams会議操作UIへ被りません。
+約50msホバーすると、タイトルバーへ接続したまま中央を基準に**横方向だけ**へ約`272 × 38px`まで展開します。下へ別メニューは開かず、中央の安全領域からも動きません。
 
 左から次の操作を配置しています。
 
@@ -124,9 +124,9 @@ GPUIとWindows Graphics Capture自体の基礎メモリは必要ですが、旧�
 
 1. `Snapbar.exe`を起動します。タイトルバーUIは表示されず、通知領域で待機します。
 2. Teams会議へ参加します。
-3. 会議参加が確定すると、Teamsタイトルバー中央へ小さなSnapbarピルが表示されます。
+3. 会議参加が確定すると、Teamsタイトルバー中央へ小さなSnapbarアイランドが表示されます。
    - 参加者が自分だけで、まだ共有画面がない状態でも表示されます。撮影機能だけが共有開始まで待機します。
-4. ピルへ約50msホバーし、横に展開した操作列を表示します。
+4. アイランドへ約50msホバーし、横に展開した操作列を表示します。
 5. 他の参加者が画面共有を開始し、カメラボタンが赤くなったらクリックします。
 6. PowerPoint、OneNote、Teamsチャットなどへ`Ctrl + V`で貼り付けます。
 7. 会議退出後はタイトルバーUIが自動で消え、Snapbarは通知領域で次の会議を待ちます。
@@ -179,8 +179,8 @@ Resident Snapbar process
 │  ├─ UIA leave-call evidence
 │  └─ debounced join / leave state
 └─ hidden GPUI title-bar control
-   └─ active meeting detected → follow Teams title bar and show 92 × 30 trigger
-      ├─ 50 ms hover → horizontal 272 × 30 control strip
+   └─ active meeting detected → follow Teams title bar and show 92 × 38 island
+      ├─ 50 ms hover → horizontal 272 × 38 island
       ├─ narrow title bar → camera-only compact mode
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle

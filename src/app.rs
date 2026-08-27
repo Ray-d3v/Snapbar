@@ -8,14 +8,15 @@ use crate::{
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
         COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, EXPANDED_HEIGHT,
-        EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+        EXPANDED_WIDTH, ISLAND_BOTTOM_RADIUS, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
     },
     resident::ResidentController,
     settings::AppSettings,
 };
 use gpui::{
     App, Bounds, ClickEvent, Context, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
+    WindowDecorations, WindowKind, WindowOptions, div, prelude::*, px, rgb, size, svg,
+    transparent_black,
 };
 use gpui_platform::application;
 
@@ -395,6 +396,7 @@ impl Render for Snapbar {
         let status_color = self.status_color();
         let primary_text = rgb(0xf5f5f6);
         let secondary_text = rgb(0x9b9ba2);
+        let island_background = rgb(0x050506);
         let capture_background = match self.capture_state {
             CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0x35353a),
             CaptureState::Capturing => rgb(0xc83f47),
@@ -409,8 +411,9 @@ impl Render for Snapbar {
             .justify_center()
             .w(px(COMPACT_WIDTH))
             .h(px(COMPACT_HEIGHT))
-            .rounded_full()
-            .bg(rgb(0x0b0b0d))
+            .rounded_t(px(0.0))
+            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
+            .bg(island_background)
             .shadow_sm()
             .child(
                 div()
@@ -446,8 +449,9 @@ impl Render for Snapbar {
             .gap(px(7.0))
             .w(px(COLLAPSED_WIDTH))
             .h(px(COLLAPSED_HEIGHT))
-            .rounded_full()
-            .bg(rgb(0x0b0b0d))
+            .rounded_t(px(0.0))
+            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
+            .bg(island_background)
             .shadow_sm()
             .cursor_pointer()
             .child(div().size(px(7.0)).rounded_full().bg(status_color))
@@ -586,8 +590,9 @@ impl Render for Snapbar {
             .w(px(EXPANDED_WIDTH))
             .h(px(EXPANDED_HEIGHT))
             .px(px(7.0))
-            .rounded_full()
-            .bg(rgb(0x0b0b0d))
+            .rounded_t(px(0.0))
+            .rounded_b(px(ISLAND_BOTTOM_RADIUS))
+            .bg(island_background)
             .shadow_lg()
             .child(status)
             .child(capture)
@@ -609,9 +614,9 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size_full()
-            // Layered-window pixels with alpha 0 are mouse-transparent. Alpha 1 keeps the
-            // titlebar-height native hover band hit-testable without becoming perceptible.
-            .bg(rgba(0x00000001))
+            // SetWindowRgn clips both painting and input to the island silhouette. Everything
+            // outside it remains fully transparent so Teams keeps its title-bar drag surface.
+            .bg(transparent_black())
             .child(surface)
     }
 }
