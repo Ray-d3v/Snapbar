@@ -26,6 +26,7 @@
 - The idle affordance must remain approximately 80–96 px wide and 28–30 px high. Expand into the bounded 272 × 46 px island with a visible concave shoulder/root at the caption bottom; the 16 px drop is part of that island, not a separate menu. Keep all controls on one horizontal row.
 - Use DWM frame and caption-button bounds to avoid the Windows caption controls. `DWMWA_CAPTION_BUTTON_BOUNDS` is window-relative and must be converted using `GetWindowRect` before combining it with screen-space `DWMWA_EXTENDED_FRAME_BOUNDS`. When the available title-bar span is too narrow, reduce to a single camera control.
 - Hover expansion and collapse must be debounced. The non-pinned control strip must always collapse after the pointer leaves the actual visible surface.
+- Keep the idle camera glyph and expanded capture button on the exact same logical X coordinate. Arrange secondary controls around this primary-action anchor so disclosure never forces the pointer to chase the capture target.
 - Keep hover disclosure at the native overlay-window level: one `SetWindowSubclass` controller, one explicit state machine, `TrackMouseEvent` / `WM_MOUSELEAVE`, and pointer verification at timer boundaries. GPUI must only render the published mode. Do not use element-level hover as the source of truth, detached timer generations, or permanent cursor polling.
 - Invisible transparent window areas must not intercept clicks or title-bar dragging intended for Teams.
 

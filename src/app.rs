@@ -26,6 +26,19 @@ const DISCLOSURE_SPRING_STIFFNESS: f32 = 900.0;
 const DISCLOSURE_SPRING_DAMPING: f32 = 46.0;
 const DISCLOSURE_OVERSHOOT_GAIN: f32 = 2.0;
 const DISCLOSURE_MAX_PRESENTATION: f32 = 1.044;
+const EXPANDED_CONTROL_GAP: f32 = 6.0;
+const STATUS_CONTROL_WIDTH: f32 = 82.0;
+const ACTION_CONTROL_SIZE: f32 = 30.0;
+const EXPANDED_CONTROLS_WIDTH: f32 =
+    STATUS_CONTROL_WIDTH + ACTION_CONTROL_SIZE * 4.0 + EXPANDED_CONTROL_GAP * 4.0;
+const IDLE_CAPTURE_CENTER_X: f32 = -COLLAPSED_WIDTH / 2.0 + COMPACT_WIDTH + COMPACT_WIDTH / 2.0;
+const EXPANDED_CAPTURE_CENTER_X_UNSHIFTED: f32 = -EXPANDED_CONTROLS_WIDTH / 2.0
+    + STATUS_CONTROL_WIDTH
+    + EXPANDED_CONTROL_GAP
+    + ACTION_CONTROL_SIZE
+    + EXPANDED_CONTROL_GAP
+    + ACTION_CONTROL_SIZE / 2.0;
+const EXPANDED_CONTENT_SHIFT_X: f32 = IDLE_CAPTURE_CENTER_X - EXPANDED_CAPTURE_CENTER_X_UNSHIFTED;
 
 fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
     let phase = ((value - start) / (end - start)).clamp(0.0, 1.0);
@@ -489,7 +502,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .gap(px(7.0))
-            .w(px(82.0))
+            .w(px(STATUS_CONTROL_WIDTH))
             .h(px(28.0))
             .px(px(8.0))
             .rounded(px(11.0))
@@ -507,7 +520,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(30.0))
+            .size(px(ACTION_CONTROL_SIZE))
             .rounded_full()
             .bg(capture_background)
             .shadow_sm()
@@ -535,7 +548,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(30.0))
+            .size(px(ACTION_CONTROL_SIZE))
             .rounded(px(10.0))
             .cursor_pointer()
             .bg(if save_to_screenshots {
@@ -565,7 +578,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(30.0))
+            .size(px(ACTION_CONTROL_SIZE))
             .rounded(px(10.0))
             .cursor_pointer()
             .bg(rgb(0x18181b))
@@ -584,7 +597,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(30.0))
+            .size(px(ACTION_CONTROL_SIZE))
             .rounded(px(10.0))
             .cursor_pointer()
             .bg(rgb(0x18181b))
@@ -602,17 +615,17 @@ impl Render for Snapbar {
             .absolute()
             .top(px(0.0))
             .left(relative(0.5))
-            .ml(px(-EXPANDED_WIDTH / 2.0))
+            .ml(px(-EXPANDED_WIDTH / 2.0 + EXPANDED_CONTENT_SHIFT_X))
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(6.0))
+            .gap(px(EXPANDED_CONTROL_GAP))
             .w(px(EXPANDED_WIDTH))
             .h(px(EXPANDED_HEIGHT))
             .px(px(7.0))
             .child(status)
-            .child(capture)
             .child(save)
+            .child(capture)
             .child(refresh)
             .child(quit);
 
@@ -721,4 +734,24 @@ pub fn run() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_control_keeps_the_idle_x_coordinate_when_expanded() {
+        let expanded_capture_center =
+            EXPANDED_CAPTURE_CENTER_X_UNSHIFTED + EXPANDED_CONTENT_SHIFT_X;
+        assert_eq!(expanded_capture_center, IDLE_CAPTURE_CENTER_X);
+    }
+
+    #[test]
+    fn reordered_expanded_controls_stay_inside_the_island() {
+        let controls_left = -EXPANDED_CONTROLS_WIDTH / 2.0 + EXPANDED_CONTENT_SHIFT_X;
+        let controls_right = controls_left + EXPANDED_CONTROLS_WIDTH;
+        assert!(controls_left >= -EXPANDED_WIDTH / 2.0);
+        assert!(controls_right <= EXPANDED_WIDTH / 2.0);
+    }
 }

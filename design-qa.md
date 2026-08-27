@@ -7,6 +7,7 @@
 - Final expansion and collapse: `target/product-design-audit/island-motion/pass5/expand-contact-sheet.png` and `collapse-contact-sheet.png`.
 - Final settled state: `target/product-design-audit/island-motion/pass5/expand-07-300ms.png`.
 - Required combined reference/implementation input: `target/product-design-audit/island-motion/pass5/reference-implementation-comparison.png`.
+- Final primary-action anchor: `target/product-design-audit/camera-anchor/pass1/expand-00-000ms.png` and `expand-07-300ms.png`.
 - Runtime context: active one-person Teams meeting with no shared content, dark title bar, 1920-pixel-wide window, Windows DPI 96 (100%). The audit build temporarily allowed local screen capture; release capture exclusion is restored after QA.
 
 ## Audit and iterations
@@ -31,10 +32,17 @@
 - A final geometry clamp keeps that peak bulge horizontal; it cannot exceed the audited 16-pixel vertical drop. The settled comparison state is unchanged.
 - The combined comparison confirms the two annotated root curves, centered growth, title-bar attachment, and the absence of an unrelated downward menu. No actionable P0, P1, or P2 visual mismatch remains.
 
+### Pass 6 — stable primary-action anchor
+
+- P1, interaction stability: pixel measurement of the previous build placed the idle camera at X 382.5 and the expanded capture button at X 349.5, forcing a 33-pixel pointer correction as disclosure completed.
+- Reordered the context row to status, save destination, capture, rescan, and quit, then applied a shared logical anchor to the idle glyph and red capture button. Secondary controls now disclose around the primary action.
+- Live Teams captures measure both the idle camera glyph and expanded red capture button at X 382.5, for a 0-pixel horizontal delta. The capture button also stays on that anchor through the content crossfade.
+- Unit coverage locks the two logical centers together and verifies that the reordered row remains within the island bounds. No actionable P0, P1, or P2 mismatch remains.
+
 ## Mandatory fidelity surfaces
 
 - Fonts and typography: the expanded Japanese status remains legible and untruncated throughout the crossfade; idle contains no competing label.
-- Spacing and layout: idle remains 92 × 30; expanded settles at 272 × 46 inside a fixed 280 × 48 envelope. Controls remain centered on one row and clear of Teams caption buttons.
+- Spacing and layout: idle remains 92 × 30; expanded settles at 272 × 46 inside a fixed 280 × 48 envelope. The capture target keeps one X anchor while secondary controls balance around it on one row, clear of Teams caption buttons.
 - Viewport resilience: normal width uses the full island, constrained title bars retain the existing 46 × 30 camera-only mode, and insufficient safe spans still hide the overlay.
 - Colors and tokens: transparent native-style idle cells and existing status/icon colors are unchanged. Opaque `#050506` remains expanded-only.
 - Image and asset fidelity: existing camera, folder, refresh, and power SVG assets are retained; no replacement or generated artwork was introduced.
@@ -45,4 +53,4 @@
 
 ## Result
 
-Final result: passed. The surface now grows from the centered title-bar affordance with a visible concave root, a restrained spring bulge, and a matched native input silhouette.
+Final result: passed. The surface grows with a visible concave root and restrained spring bulge while the primary capture target remains horizontally stationary from idle through expansion.
