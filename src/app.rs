@@ -7,9 +7,9 @@ use crate::{
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
-        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, EXPANDED_HEIGHT,
-        EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH, disclosure_height,
-        disclosure_width,
+        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR,
+        EXPANDED_HEIGHT, EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+        disclosure_height, disclosure_width,
     },
     resident::ResidentController,
     settings::AppSettings,
@@ -45,6 +45,95 @@ fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
     phase * phase * (3.0 - 2.0 * phase)
 }
 
+fn mix_rgb(base: u32, target: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0.0, 1.0);
+    [16, 8, 0]
+        .into_iter()
+        .map(|shift| {
+            let base_channel = ((base >> shift) & 0xff) as f32;
+            let target_channel = ((target >> shift) & 0xff) as f32;
+            ((base_channel + (target_channel - base_channel) * amount).round() as u32) << shift
+        })
+        .fold(0, |color, channel| color | channel)
+}
+
+fn relative_luminance(color: u32) -> f32 {
+    let linear_channel = |shift: u32| {
+        let value = ((color >> shift) & 0xff_u32) as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear_channel(16) + 0.7152 * linear_channel(8) + 0.0722 * linear_channel(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TitlebarPalette {
+    surface: u32,
+    primary_text: u32,
+    secondary_text: u32,
+    idle_active_backplate: u32,
+    control_background: u32,
+    control_hover: u32,
+    status_hover: u32,
+    quit_hover: u32,
+    control_icon: u32,
+    disabled_control: u32,
+    disabled_icon: u32,
+    save_background: u32,
+    save_hover: u32,
+    save_icon: u32,
+    danger_icon: u32,
+    is_light: bool,
+}
+
+impl TitlebarPalette {
+    fn for_surface(surface: u32) -> Self {
+        let is_light = relative_luminance(surface) >= 0.5;
+        if is_light {
+            Self {
+                surface,
+                primary_text: 0x202124,
+                secondary_text: 0x5f6368,
+                idle_active_backplate: 0x0000001f,
+                control_background: mix_rgb(surface, 0x000000, 0.08),
+                control_hover: mix_rgb(surface, 0x000000, 0.16),
+                status_hover: mix_rgb(surface, 0x000000, 0.06),
+                quit_hover: mix_rgb(surface, 0xc42b1c, 0.14),
+                control_icon: 0x4f5058,
+                disabled_control: mix_rgb(surface, 0x000000, 0.12),
+                disabled_icon: 0x66666f,
+                save_background: mix_rgb(surface, 0x2e7d4a, 0.22),
+                save_hover: mix_rgb(surface, 0x2e7d4a, 0.32),
+                save_icon: 0x225c37,
+                danger_icon: 0xb4232c,
+                is_light,
+            }
+        } else {
+            Self {
+                surface,
+                primary_text: 0xf5f5f6,
+                secondary_text: 0x9b9ba2,
+                idle_active_backplate: 0xffffff24,
+                control_background: mix_rgb(surface, 0xffffff, 0.08),
+                control_hover: mix_rgb(surface, 0xffffff, 0.16),
+                status_hover: mix_rgb(surface, 0xffffff, 0.06),
+                quit_hover: mix_rgb(surface, 0xd1444c, 0.22),
+                control_icon: 0xc8c8cd,
+                disabled_control: mix_rgb(surface, 0xffffff, 0.14),
+                disabled_icon: 0xa7a7ac,
+                save_background: mix_rgb(surface, 0x3a9b60, 0.42),
+                save_hover: mix_rgb(surface, 0x3a9b60, 0.55),
+                save_icon: 0xe8fff0,
+                danger_icon: 0xf07178,
+                is_light,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureState {
     Idle,
@@ -65,6 +154,7 @@ struct Snapbar {
     last_monitor_generation: u64,
     shared_content_hint: bool,
     compact_layout: bool,
+    titlebar_color: u32,
     settings: AppSettings,
     expanded: bool,
     capture_state: CaptureState,
@@ -76,6 +166,10 @@ impl Snapbar {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let follower = TeamsWindowFollower::start(window);
         let overlay_events = follower.as_ref().map(TeamsWindowFollower::subscribe);
+        let titlebar_color = follower
+            .as_ref()
+            .map(TeamsWindowFollower::titlebar_color)
+            .unwrap_or(DEFAULT_TITLEBAR_COLOR);
         let mut snapbar = Self {
             targets: Vec::new(),
             selected_target: 0,
@@ -86,6 +180,7 @@ impl Snapbar {
             last_monitor_generation: u64::MAX,
             shared_content_hint: false,
             compact_layout: false,
+            titlebar_color,
             settings: AppSettings::load(),
             expanded: false,
             capture_state: CaptureState::NoTarget,
@@ -290,9 +385,13 @@ impl Snapbar {
 
         let compact = follower.is_compact();
         let expanded = follower.is_visible() && follower.is_expanded() && !compact;
-        let changed = self.compact_layout != compact || self.expanded != expanded;
+        let titlebar_color = follower.titlebar_color();
+        let changed = self.compact_layout != compact
+            || self.expanded != expanded
+            || self.titlebar_color != titlebar_color;
         self.compact_layout = compact;
         self.expanded = expanded;
+        self.titlebar_color = titlebar_color;
         changed
     }
 
@@ -398,12 +497,16 @@ impl Snapbar {
         }
     }
 
-    fn status_color(&self) -> gpui::Rgba {
-        match self.capture_state {
-            CaptureState::Idle | CaptureState::Copied => rgb(0x55c27c),
-            CaptureState::Capturing => rgb(0xe5484d),
-            CaptureState::WaitingForShare | CaptureState::NoTarget => rgb(0xe0a24a),
-            CaptureState::Error => rgb(0xf07178),
+    fn status_color(&self, light_surface: bool) -> gpui::Rgba {
+        match (light_surface, self.capture_state) {
+            (true, CaptureState::Idle | CaptureState::Copied) => rgb(0x277a46),
+            (true, CaptureState::Capturing) => rgb(0xc7363f),
+            (true, CaptureState::WaitingForShare | CaptureState::NoTarget) => rgb(0x986500),
+            (true, CaptureState::Error) => rgb(0xb4232c),
+            (false, CaptureState::Idle | CaptureState::Copied) => rgb(0x55c27c),
+            (false, CaptureState::Capturing) => rgb(0xe5484d),
+            (false, CaptureState::WaitingForShare | CaptureState::NoTarget) => rgb(0xe0a24a),
+            (false, CaptureState::Error) => rgb(0xf07178),
         }
     }
 }
@@ -416,16 +519,17 @@ impl Render for Snapbar {
             .is_some_and(CaptureEngine::is_ready)
             && self.capture_state != CaptureState::Capturing;
         let save_to_screenshots = self.settings.save_to_screenshots;
-        let status_color = self.status_color();
-        let primary_text = rgb(0xf5f5f6);
-        let secondary_text = rgb(0x9b9ba2);
-        let island_background = rgb(0x050506);
+        let palette = TitlebarPalette::for_surface(self.titlebar_color);
+        let status_color = self.status_color(palette.is_light);
+        let primary_text = rgb(palette.primary_text);
+        let secondary_text = rgb(palette.secondary_text);
+        let island_background = rgb(palette.surface);
         // A non-zero alpha keeps the layered HWND interactive while remaining visually
         // indistinguishable from the Teams title bar at rest.
         let idle_hit_surface = rgba(0x00000001);
-        let idle_active_backplate = rgba(0xffffff24);
+        let idle_active_backplate = rgba(palette.idle_active_backplate);
         let capture_background = match self.capture_state {
-            CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(0x35353a),
+            CaptureState::NoTarget | CaptureState::WaitingForShare => rgb(palette.disabled_control),
             CaptureState::Capturing => rgb(0xc83f47),
             CaptureState::Error => rgb(0xd1444c),
             CaptureState::Idle | CaptureState::Copied => rgb(0xe5484d),
@@ -456,7 +560,7 @@ impl Render for Snapbar {
                         if can_capture {
                             rgb(0xe5484d)
                         } else {
-                            rgb(0xa7a7ac)
+                            rgb(palette.disabled_icon)
                         },
                     )),
             );
@@ -509,7 +613,7 @@ impl Render for Snapbar {
             .cursor_pointer()
             .text_xs()
             .text_color(primary_text)
-            .hover(|button| button.bg(rgb(0x1a1a1e)))
+            .hover(move |button| button.bg(rgb(palette.status_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_refresh_clicked))
             .child(div().size(px(7.0)).rounded_full().bg(status_color))
@@ -539,7 +643,7 @@ impl Render for Snapbar {
                     .text_color(if can_capture {
                         rgb(0xffffff)
                     } else {
-                        rgb(0xa7a7ac)
+                        rgb(palette.disabled_icon)
                     }),
             );
 
@@ -552,24 +656,24 @@ impl Render for Snapbar {
             .rounded(px(10.0))
             .cursor_pointer()
             .bg(if save_to_screenshots {
-                rgb(0x285d40)
+                rgb(palette.save_background)
             } else {
-                rgb(0x18181b)
+                rgb(palette.control_background)
             })
-            .hover(|button| {
+            .hover(move |button| {
                 button.bg(if save_to_screenshots {
-                    rgb(0x347451)
+                    rgb(palette.save_hover)
                 } else {
-                    rgb(0x28282d)
+                    rgb(palette.control_hover)
                 })
             })
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_save_toggle_clicked))
             .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
                 if save_to_screenshots {
-                    rgb(0xe8fff0)
+                    rgb(palette.save_icon)
                 } else {
-                    rgb(0xc8c8cd)
+                    rgb(palette.control_icon)
                 },
             ));
 
@@ -581,15 +685,15 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .rounded(px(10.0))
             .cursor_pointer()
-            .bg(rgb(0x18181b))
-            .hover(|button| button.bg(rgb(0x28282d)))
+            .bg(rgb(palette.control_background))
+            .hover(move |button| button.bg(rgb(palette.control_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_refresh_clicked))
             .child(
                 svg()
                     .path("icons/refresh.svg")
                     .size(px(16.0))
-                    .text_color(rgb(0xc8c8cd)),
+                    .text_color(rgb(palette.control_icon)),
             );
 
         let quit = div()
@@ -600,15 +704,15 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .rounded(px(10.0))
             .cursor_pointer()
-            .bg(rgb(0x18181b))
-            .hover(|button| button.bg(rgb(0x3a2025)))
+            .bg(rgb(palette.control_background))
+            .hover(move |button| button.bg(rgb(palette.quit_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(|_, _, cx| cx.quit())
             .child(
                 svg()
                     .path("icons/power.svg")
                     .size(px(16.0))
-                    .text_color(rgb(0xf07178)),
+                    .text_color(rgb(palette.danger_icon)),
             );
 
         let expanded_content = div()
@@ -665,7 +769,7 @@ impl Render for Snapbar {
 
                     let surface_width = disclosure_width(progress);
                     let surface_height = disclosure_height(progress);
-                    let black_alpha = (1.0 / 255.0
+                    let surface_alpha = (1.0 / 255.0
                         + (254.0 / 255.0) * smoothstep_between(0.0, 0.22, content_progress))
                     .clamp(1.0 / 255.0, 1.0);
                     let idle_alpha = 1.0 - smoothstep_between(0.12, 0.62, content_progress);
@@ -682,7 +786,7 @@ impl Render for Snapbar {
                                 .h(px(surface_height))
                                 // SetWindowRgn supplies the animated concave shoulders and
                                 // rounded bottom; this fill is clipped to that exact shape.
-                                .bg(island_background.opacity(black_alpha)),
+                                .bg(island_background.opacity(surface_alpha)),
                         )
                         .when(content_progress < 0.72, |surface| {
                             surface.child(idle_content.opacity(idle_alpha))
@@ -739,6 +843,44 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contrast_ratio(left: u32, right: u32) -> f32 {
+        let lighter = relative_luminance(left).max(relative_luminance(right));
+        let darker = relative_luminance(left).min(relative_luminance(right));
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn titlebar_palette_preserves_the_sampled_surface() {
+        for surface in [0x111111, 0xf3f3f3] {
+            assert_eq!(TitlebarPalette::for_surface(surface).surface, surface);
+        }
+    }
+
+    #[test]
+    fn titlebar_palette_inverts_text_and_controls_for_light_and_dark() {
+        let dark = TitlebarPalette::for_surface(0x111111);
+        let light = TitlebarPalette::for_surface(0xf3f3f3);
+        assert!(!dark.is_light);
+        assert!(light.is_light);
+        assert!(relative_luminance(dark.primary_text) > relative_luminance(dark.surface));
+        assert!(relative_luminance(light.primary_text) < relative_luminance(light.surface));
+        assert!(
+            relative_luminance(dark.control_hover) > relative_luminance(dark.control_background)
+        );
+        assert!(
+            relative_luminance(light.control_hover) < relative_luminance(light.control_background)
+        );
+    }
+
+    #[test]
+    fn titlebar_text_contrast_remains_accessible_in_both_themes() {
+        for surface in [0x111111, 0x242424, 0xeeeeee, 0xf5f5f5] {
+            let palette = TitlebarPalette::for_surface(surface);
+            assert!(contrast_ratio(palette.primary_text, palette.surface) >= 4.5);
+            assert!(contrast_ratio(palette.secondary_text, palette.surface) >= 4.5);
+        }
+    }
 
     #[test]
     fn capture_control_keeps_the_idle_x_coordinate_when_expanded() {

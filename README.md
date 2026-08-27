@@ -69,7 +69,7 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 
 ### ホバー時
 
-約50msホバーすると、タイトルバーへ接続したまま中央を基準に、黒いDynamic Island風の操作列へ約`272 × 46px`まで展開します。タイトルバー下端から根本が四分円状に内側へカーブし、黒い面は約`16px`下へ膨らみます。形状と内容は約150〜200msで展開し、ピークでわずかに膨らんでから約300msまでに収束します。下へ別メニューは開かず、中央の安全領域からも動きません。
+約50msホバーすると、タイトルバーへ接続したまま中央を基準に、Dynamic Island風の操作列へ約`272 × 46px`まで展開します。展開面はTeamsタイトルバーの実表示色へ追従し、ライトテーマでは暗い文字と操作面、ダークテーマでは明るい文字と操作面へ自動反転します。タイトルバー下端から根本が四分円状に内側へカーブし、同色の面が約`16px`下へ膨らみます。形状と内容は約150〜200msで展開し、ピークでわずかに膨らんでから約300msまでに収束します。下へ別メニューは開かず、中央の安全領域からも動きません。
 
 未ホバー時のカメラアイコンと展開後の赤い撮影ボタンは、同じX座標へ固定しています。ホバー後もカーソルを横へ追い直す必要はありません。
 
@@ -181,7 +181,7 @@ Resident Snapbar process
 │  └─ debounced join / leave state
 └─ hidden GPUI title-bar control
    └─ active meeting detected → follow Teams title bar and show 92 × 30 caption cells
-      ├─ 50 ms hover → spring to 272 × 46 curved-root black island
+      ├─ 50 ms hover → spring to 272 × 46 curved-root, title-bar-colored island
       ├─ narrow title bar → 46 × 30 camera-only caption cell
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle

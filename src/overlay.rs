@@ -7,17 +7,20 @@ use std::{
         mpsc::{RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_channel::{Receiver, Sender};
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{HWND, POINT, RECT},
-    Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_EXTENDED_FRAME_BOUNDS,
-        DwmGetWindowAttribute, DwmSetWindowAttribute,
+    Foundation::{COLORREF, HWND, POINT, RECT},
+    Graphics::{
+        Dwm::{
+            DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_CAPTION_COLOR,
+            DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
+        },
+        Gdi::{GetDC, GetPixel, ReleaseDC},
     },
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic,
@@ -30,10 +33,13 @@ use windows::Win32::{
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
+const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
 const EXPAND_DELAY_MS: u32 = 50;
 const COLLAPSE_DELAY_MS: u32 = 50;
 const SAFETY_INTERVAL_MS: u32 = 250;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
+const DWMWA_COLOR_DEFAULT: u32 = 0xffff_ffff;
+const CLR_INVALID: u32 = 0xffff_ffff;
 const SUBCLASS_ID: usize = 0x534e_4150;
 const TIMER_EXPAND: usize = 0x0053_4e01;
 const TIMER_COLLAPSE: usize = 0x0053_4e02;
@@ -65,6 +71,7 @@ pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
 pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
 pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
 pub const ISLAND_DROP: f32 = 16.0;
+pub const DEFAULT_TITLEBAR_COLOR: u32 = 0x111111;
 
 pub fn disclosure_width(progress: f32) -> f32 {
     COLLAPSED_WIDTH
@@ -627,6 +634,132 @@ struct CaptionGeometry {
     buttons_left: i32,
 }
 
+fn colorref_to_rgb(color: COLORREF) -> u32 {
+    let color = color.0;
+    let red = color & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = (color >> 16) & 0xff;
+    (red << 16) | (green << 8) | blue
+}
+
+fn color_distance(left: u32, right: u32) -> u32 {
+    let channel_distance =
+        |shift: u32| ((left >> shift) & 0xff_u32).abs_diff((right >> shift) & 0xff_u32);
+    channel_distance(16) + channel_distance(8) + channel_distance(0)
+}
+
+fn representative_color(samples: &[u32]) -> Option<u32> {
+    samples.iter().copied().min_by_key(|candidate| {
+        samples
+            .iter()
+            .map(|sample| color_distance(*candidate, *sample) as u64)
+            .sum::<u64>()
+    })
+}
+
+fn colors_materially_differ(left: u32, right: u32) -> bool {
+    [16_u32, 8, 0]
+        .into_iter()
+        .any(|shift| ((left >> shift) & 0xff_u32).abs_diff((right >> shift) & 0xff_u32) >= 3)
+}
+
+fn push_segment_samples(points: &mut Vec<i32>, left: i32, right: i32) {
+    if right < left {
+        return;
+    }
+    let span = right.saturating_sub(left);
+    for numerator in [0, 1, 2, 3] {
+        points.push(left.saturating_add(span.saturating_mul(numerator) / 3));
+    }
+}
+
+fn titlebar_sample_points(caption: CaptionGeometry) -> Vec<(i32, i32)> {
+    let band = caption.band;
+    let center = band.center_x();
+    let scale = (band.height() as f32 / COLLAPSED_HEIGHT).clamp(0.75, 4.0);
+    let island_exclusion = (WINDOW_WIDTH * scale / 2.0).ceil() as i32 + 18;
+    let outer_inset = (12.0 * scale).round() as i32;
+    let mut x_positions = Vec::with_capacity(8);
+    push_segment_samples(
+        &mut x_positions,
+        band.left.saturating_add(outer_inset),
+        center.saturating_sub(island_exclusion),
+    );
+    push_segment_samples(
+        &mut x_positions,
+        center.saturating_add(island_exclusion),
+        caption
+            .buttons_left
+            .min(band.right)
+            .saturating_sub(outer_inset),
+    );
+
+    if x_positions.is_empty() {
+        push_segment_samples(
+            &mut x_positions,
+            band.left.saturating_add(outer_inset),
+            caption
+                .buttons_left
+                .min(band.right)
+                .saturating_sub(outer_inset),
+        );
+    }
+
+    let inner_top = band.top.saturating_add(1);
+    let inner_bottom = band.bottom.saturating_sub(2).max(inner_top);
+    let first_y = (band.top + band.height() / 3).clamp(inner_top, inner_bottom);
+    let second_y = (band.top + band.height() * 2 / 3).clamp(inner_top, inner_bottom);
+    let mut points = Vec::with_capacity(x_positions.len() * 2);
+    for x in x_positions {
+        points.push((x, first_y));
+        if second_y != first_y {
+            points.push((x, second_y));
+        }
+    }
+    points
+}
+
+fn sample_screen_colors(points: &[(i32, i32)]) -> Vec<u32> {
+    let screen_dc = unsafe { GetDC(None) };
+    if screen_dc.0.is_null() {
+        return Vec::new();
+    }
+
+    let samples = points
+        .iter()
+        .filter_map(|(x, y)| {
+            let color = unsafe { GetPixel(screen_dc, *x, *y) };
+            (color.0 != CLR_INVALID).then(|| colorref_to_rgb(color))
+        })
+        .collect();
+    unsafe {
+        let _ = ReleaseDC(None, screen_dc);
+    }
+    samples
+}
+
+fn dwm_caption_color(hwnd: HWND) -> Option<u32> {
+    let mut color = COLORREF::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &mut color as *mut COLORREF as *mut c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        )
+        .ok()?;
+    }
+    (!matches!(color.0, DWMWA_COLOR_DEFAULT | DWMWA_COLOR_NONE)).then(|| colorref_to_rgb(color))
+}
+
+fn sample_titlebar_color(hwnd: HWND) -> Option<u32> {
+    let window = get_window_rect(hwnd)?;
+    let frame = extended_frame_bounds(hwnd).unwrap_or(window);
+    let caption = caption_geometry(window, frame, caption_button_bounds(hwnd), 32)?;
+    representative_color(&sample_screen_colors(&titlebar_sample_points(caption)))
+        .or_else(|| dwm_caption_color(hwnd))
+}
+
 #[derive(Clone)]
 pub struct DisclosureProgressPublisher {
     progress: Arc<AtomicU32>,
@@ -646,6 +779,7 @@ impl DisclosureProgressPublisher {
 
 pub struct TeamsWindowFollower {
     target_id: Arc<AtomicU32>,
+    titlebar_color: Arc<AtomicU32>,
     expanded: Arc<AtomicBool>,
     disclosure_progress: Arc<AtomicU32>,
     compact: Arc<AtomicBool>,
@@ -666,6 +800,7 @@ impl TeamsWindowFollower {
         }
 
         let target_id = Arc::new(AtomicU32::new(0));
+        let titlebar_color = Arc::new(AtomicU32::new(DEFAULT_TITLEBAR_COLOR));
         let expanded = Arc::new(AtomicBool::new(false));
         let disclosure_progress = Arc::new(AtomicU32::new(0));
         let compact = Arc::new(AtomicBool::new(false));
@@ -683,6 +818,7 @@ impl TeamsWindowFollower {
         )?;
 
         let thread_target_id = Arc::clone(&target_id);
+        let thread_titlebar_color = Arc::clone(&titlebar_color);
         let thread_expanded = Arc::clone(&expanded);
         let thread_disclosure_progress = Arc::clone(&disclosure_progress);
         let thread_compact = Arc::clone(&compact);
@@ -702,6 +838,8 @@ impl TeamsWindowFollower {
                 let mut previous_region_state = None;
                 let mut previous_visible = false;
                 let mut previous_compact = false;
+                let mut previous_target_id = 0;
+                let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
                 while !thread_stop.load(Ordering::Acquire) {
                     let target_id = thread_target_id.load(Ordering::Acquire);
                     let placement = if target_id == 0 {
@@ -716,6 +854,23 @@ impl TeamsWindowFollower {
                         matches!(placement, OverlayPlacement::Visible { compact: true, .. });
                     thread_visible.store(visible_now, Ordering::Release);
                     thread_compact.store(compact_now, Ordering::Release);
+
+                    let target_changed = target_id != previous_target_id;
+                    if visible_now
+                        && (target_changed
+                            || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
+                    {
+                        let target_hwnd = HWND(target_id as usize as *mut c_void);
+                        if let Some(sampled_color) = sample_titlebar_color(target_hwnd) {
+                            let current_color = thread_titlebar_color.load(Ordering::Acquire);
+                            if colors_materially_differ(current_color, sampled_color) {
+                                thread_titlebar_color.store(sampled_color, Ordering::Release);
+                                let _ = thread_event_tx.try_send(());
+                            }
+                        }
+                        last_titlebar_sample = Instant::now();
+                    }
+                    previous_target_id = target_id;
 
                     let visibility_changed = visible_now != previous_visible;
                     let compact_changed = compact_now != previous_compact;
@@ -773,6 +928,7 @@ impl TeamsWindowFollower {
 
         Some(Self {
             target_id,
+            titlebar_color,
             expanded,
             disclosure_progress,
             compact,
@@ -807,6 +963,10 @@ impl TeamsWindowFollower {
 
     pub fn is_expanded(&self) -> bool {
         self.expanded.load(Ordering::Acquire)
+    }
+
+    pub fn titlebar_color(&self) -> u32 {
+        self.titlebar_color.load(Ordering::Acquire)
     }
 
     pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
@@ -1374,6 +1534,41 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colorref_is_converted_from_bgr_to_rgb() {
+        assert_eq!(colorref_to_rgb(COLORREF(0x0033_2211)), 0x112233);
+    }
+
+    #[test]
+    fn representative_color_rejects_isolated_foreground_pixels() {
+        let samples = [0xf3f3f3, 0xf3f3f3, 0xf4f4f4, 0xf3f3f3, 0x202020];
+        assert_eq!(representative_color(&samples), Some(0xf3f3f3));
+    }
+
+    #[test]
+    fn tiny_sampling_noise_does_not_trigger_a_palette_update() {
+        assert!(!colors_materially_differ(0xf3f3f3, 0xf5f4f3));
+        assert!(colors_materially_differ(0xf3f3f3, 0x202020));
+    }
+
+    #[test]
+    fn titlebar_samples_avoid_the_island_and_caption_buttons() {
+        let caption = CaptionGeometry {
+            band: RectI {
+                left: 0,
+                top: 10,
+                right: 1_200,
+                bottom: 40,
+            },
+            buttons_left: 1_050,
+        };
+        let points = titlebar_sample_points(caption);
+        assert!(!points.is_empty());
+        assert!(points.iter().all(|(x, y)| {
+            (*x <= 442 || *x >= 758) && *x < caption.buttons_left && (10..40).contains(y)
+        }));
+    }
 
     #[test]
     fn disclosure_requires_pointer_at_timer_boundaries() {
