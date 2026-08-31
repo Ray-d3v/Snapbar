@@ -4,6 +4,7 @@
 #endif
 #define MyAppPublisher "Ray-d3v"
 #define MyAppExeName "snapbar.exe"
+#define MyAppLaunchParameters "--inline-titlebar"
 
 [Setup]
 AppId={{3FB7C0BC-32B5-49B2-90E7-83BE73AF4D1E}
@@ -38,8 +39,8 @@ Name: "desktopicon"; Description: "デスクトップにショートカットを
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#MyAppLaunchParameters}"; WorkingDir: "{app}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#MyAppLaunchParameters}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{#MyAppName}を起動"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "{#MyAppLaunchParameters}"; Description: "{#MyAppName}を起動（タイトルバー内表示）"; Flags: nowait postinstall skipifsilent
