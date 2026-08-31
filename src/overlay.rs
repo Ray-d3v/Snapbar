@@ -1,89 +1,224 @@
 use std::{
     ffi::c_void,
+    ptr::null_mut,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use async_channel::{Receiver, Sender};
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{HWND, POINT, RECT},
-    Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_EXTENDED_FRAME_BOUNDS,
-        DwmGetWindowAttribute, DwmSetWindowAttribute,
+    Foundation::{COLORREF, HWND, POINT, RECT},
+    Graphics::{
+        Dwm::{
+            DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_CAPTION_COLOR,
+            DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
+        },
+        Gdi::{GetDC, GetPixel, ReleaseDC},
     },
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic,
         IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
         SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
+const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
+const EXPAND_DELAY_MS: u32 = 16;
+const COLLAPSE_DELAY_MS: u32 = 50;
+const SAFETY_INTERVAL_MS: u32 = 250;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
+const DWMWA_COLOR_DEFAULT: u32 = 0xffff_ffff;
+const CLR_INVALID: u32 = 0xffff_ffff;
+const SUBCLASS_ID: usize = 0x534e_4150;
+const TIMER_EXPAND: usize = 0x0053_4e01;
+const TIMER_COLLAPSE: usize = 0x0053_4e02;
+const TIMER_SAFETY: usize = 0x0053_4e03;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_MOUSELEAVE: u32 = 0x02a3;
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+const WM_TIMER: u32 = 0x0113;
+const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_CANCELMODE: u32 = 0x001f;
+const WM_NCDESTROY: u32 = 0x0082;
+const WM_APP_RESET_DISCLOSURE: u32 = 0x8000 + 0x351;
+const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
+const TME_LEAVE: u32 = 0x0000_0002;
+const MA_NOACTIVATE: isize = 3;
+const RGN_OR: i32 = 2;
+const DISCLOSURE_PROGRESS_MAX: u32 = 1_000;
+const DISCLOSURE_PROGRESS_LIMIT: u32 = 1_044;
 
 pub const WINDOW_WIDTH: f32 = 280.0;
-pub const WINDOW_HEIGHT: f32 = 40.0;
+pub const WINDOW_HEIGHT: f32 = 48.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
 pub const COLLAPSED_HEIGHT: f32 = 30.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
-pub const EXPANDED_HEIGHT: f32 = 36.0;
-pub const COMPACT_WIDTH: f32 = 40.0;
-pub const COMPACT_HEIGHT: f32 = 36.0;
+pub const EXPANDED_HEIGHT: f32 = 46.0;
+pub const INLINE_WIDTH: f32 = EXPANDED_WIDTH;
+pub const INLINE_FRAME_INSET: f32 = 1.0;
+pub const INLINE_HEIGHT: f32 = COLLAPSED_HEIGHT - INLINE_FRAME_INSET;
+pub const COMPACT_WIDTH: f32 = 46.0;
+pub const COMPACT_HEIGHT: f32 = 30.0;
+pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
+pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
+pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
+pub const ISLAND_DROP: f32 = 16.0;
+pub const DEFAULT_TITLEBAR_COLOR: u32 = 0x111111;
+
+pub fn disclosure_width(progress: f32) -> f32 {
+    COLLAPSED_WIDTH
+        + (EXPANDED_WIDTH - COLLAPSED_WIDTH)
+            * progress.clamp(
+                0.0,
+                DISCLOSURE_PROGRESS_LIMIT as f32 / DISCLOSURE_PROGRESS_MAX as f32,
+            )
+}
+
+pub fn disclosure_height(progress: f32) -> f32 {
+    COLLAPSED_HEIGHT + (EXPANDED_HEIGHT - COLLAPSED_HEIGHT) * progress.clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayPresentation {
+    #[default]
+    HoverIsland,
+    InlineTitlebar,
+}
+
+impl OverlayPresentation {
+    pub const fn is_inline(self) -> bool {
+        matches!(self, Self::InlineTitlebar)
+    }
+
+    pub fn from_command_line() -> Self {
+        Self::from_arguments(std::env::args())
+    }
+
+    fn from_arguments<I, S>(arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if arguments.into_iter().any(|argument| {
+            matches!(
+                argument.as_ref().to_str(),
+                Some("--inline") | Some("--inline-titlebar")
+            )
+        }) {
+            Self::InlineTitlebar
+        } else {
+            Self::HoverIsland
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayCaptureMode {
+    #[default]
+    Excluded,
+    Recordable,
+}
+
+impl OverlayCaptureMode {
+    pub fn from_command_line() -> Self {
+        Self::from_arguments(std::env::args_os(), cfg!(debug_assertions))
+    }
+
+    fn from_arguments<I, S>(arguments: I, debug_build: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if debug_build
+            || arguments
+                .into_iter()
+                .any(|argument| matches!(argument.as_ref().to_str(), Some("--recordable-overlay")))
+        {
+            Self::Recordable
+        } else {
+            Self::Excluded
+        }
+    }
+
+    pub(crate) const fn display_affinity(self) -> WINDOW_DISPLAY_AFFINITY {
+        match self {
+            Self::Excluded => WDA_EXCLUDEFROMCAPTURE,
+            Self::Recordable => WDA_NONE,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverlayMode {
+    #[cfg(test)]
     Collapsed,
     Expanded,
+    Inline,
+    #[cfg(test)]
     Compact,
 }
 
 impl OverlayMode {
-    const fn from_state(expanded: bool, compact: bool) -> Self {
-        if compact {
-            Self::Compact
-        } else if expanded {
-            Self::Expanded
-        } else {
-            Self::Collapsed
-        }
-    }
-
-    const fn logical_width(self) -> f32 {
+    pub const fn logical_width(self) -> f32 {
         match self {
+            #[cfg(test)]
             Self::Collapsed => COLLAPSED_WIDTH,
             Self::Expanded => EXPANDED_WIDTH,
+            Self::Inline => INLINE_WIDTH,
+            #[cfg(test)]
             Self::Compact => COMPACT_WIDTH,
         }
     }
 
-    const fn logical_height(self) -> f32 {
+    pub const fn logical_height(self) -> f32 {
         match self {
+            #[cfg(test)]
             Self::Collapsed => COLLAPSED_HEIGHT,
             Self::Expanded => EXPANDED_HEIGHT,
+            Self::Inline => INLINE_HEIGHT,
+            #[cfg(test)]
             Self::Compact => COMPACT_HEIGHT,
         }
     }
 }
 
+#[repr(C)]
+struct TrackMouseEventRaw {
+    cb_size: u32,
+    flags: u32,
+    hwnd_track: *mut c_void,
+    hover_time: u32,
+}
+
+type SubclassProc = unsafe extern "system" fn(
+    hwnd: *mut c_void,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    subclass_id: usize,
+    reference_data: usize,
+) -> isize;
+
 #[link(name = "gdi32")]
 unsafe extern "system" {
-    fn CreateRoundRectRgn(
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-        width: i32,
-        height: i32,
-    ) -> *mut c_void;
+    fn CombineRgn(
+        destination: *mut c_void,
+        source_one: *mut c_void,
+        source_two: *mut c_void,
+        combine_mode: i32,
+    ) -> i32;
+    fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
     fn DeleteObject(object: *mut c_void) -> i32;
 }
 
@@ -91,6 +226,450 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn ClientToScreen(hwnd: *mut c_void, point: *mut POINT) -> i32;
     fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
+    fn TrackMouseEvent(event: *mut TrackMouseEventRaw) -> i32;
+    fn SetTimer(
+        hwnd: *mut c_void,
+        timer_id: usize,
+        elapsed_ms: u32,
+        timer_proc: *mut c_void,
+    ) -> usize;
+    fn KillTimer(hwnd: *mut c_void, timer_id: usize) -> i32;
+    fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+    fn GetCursorPos(point: *mut POINT) -> i32;
+    fn WindowFromPoint(point: POINT) -> *mut c_void;
+}
+
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: *mut c_void,
+        subclass_proc: Option<SubclassProc>,
+        subclass_id: usize,
+        reference_data: usize,
+    ) -> i32;
+    fn RemoveWindowSubclass(
+        hwnd: *mut c_void,
+        subclass_proc: Option<SubclassProc>,
+        subclass_id: usize,
+    ) -> i32;
+    fn DefSubclassProc(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisclosurePhase {
+    Collapsed,
+    ExpandPending,
+    Expanded,
+    CollapsePending,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DisclosureEffects {
+    cancel_expand: bool,
+    cancel_collapse: bool,
+    start_expand: bool,
+    start_collapse: bool,
+    expanded_changed: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisclosureMachine {
+    phase: DisclosurePhase,
+}
+
+impl Default for DisclosureMachine {
+    fn default() -> Self {
+        Self {
+            phase: DisclosurePhase::Collapsed,
+        }
+    }
+}
+
+impl DisclosureMachine {
+    fn is_expanded(self) -> bool {
+        matches!(
+            self.phase,
+            DisclosurePhase::Expanded | DisclosurePhase::CollapsePending
+        )
+    }
+
+    fn pointer_enter(&mut self) -> DisclosureEffects {
+        let mut effects = DisclosureEffects {
+            cancel_collapse: true,
+            ..Default::default()
+        };
+        match self.phase {
+            DisclosurePhase::Collapsed => {
+                self.phase = DisclosurePhase::ExpandPending;
+                effects.start_expand = true;
+            }
+            DisclosurePhase::CollapsePending => {
+                self.phase = DisclosurePhase::Expanded;
+            }
+            DisclosurePhase::ExpandPending | DisclosurePhase::Expanded => {}
+        }
+        effects
+    }
+
+    fn pointer_leave(&mut self) -> DisclosureEffects {
+        let mut effects = DisclosureEffects {
+            cancel_expand: true,
+            ..Default::default()
+        };
+        match self.phase {
+            DisclosurePhase::ExpandPending => {
+                self.phase = DisclosurePhase::Collapsed;
+            }
+            DisclosurePhase::Expanded => {
+                self.phase = DisclosurePhase::CollapsePending;
+                effects.start_collapse = true;
+            }
+            DisclosurePhase::Collapsed | DisclosurePhase::CollapsePending => {}
+        }
+        effects
+    }
+
+    fn expand_elapsed(&mut self, pointer_over: bool) -> DisclosureEffects {
+        let mut effects = DisclosureEffects {
+            cancel_expand: true,
+            ..Default::default()
+        };
+        if self.phase == DisclosurePhase::ExpandPending {
+            if pointer_over {
+                self.phase = DisclosurePhase::Expanded;
+                effects.expanded_changed = Some(true);
+            } else {
+                self.phase = DisclosurePhase::Collapsed;
+            }
+        }
+        effects
+    }
+
+    fn collapse_elapsed(&mut self, pointer_over: bool) -> DisclosureEffects {
+        let mut effects = DisclosureEffects {
+            cancel_collapse: true,
+            ..Default::default()
+        };
+        if self.phase == DisclosurePhase::CollapsePending {
+            if pointer_over {
+                self.phase = DisclosurePhase::Expanded;
+            } else {
+                self.phase = DisclosurePhase::Collapsed;
+                effects.expanded_changed = Some(false);
+            }
+        }
+        effects
+    }
+
+    fn safety_check(&mut self, pointer_over: bool) -> DisclosureEffects {
+        match (self.phase, pointer_over) {
+            (DisclosurePhase::Expanded, false) => {
+                self.phase = DisclosurePhase::CollapsePending;
+                DisclosureEffects {
+                    start_collapse: true,
+                    ..Default::default()
+                }
+            }
+            (DisclosurePhase::CollapsePending, true) => {
+                self.phase = DisclosurePhase::Expanded;
+                DisclosureEffects {
+                    cancel_collapse: true,
+                    ..Default::default()
+                }
+            }
+            (DisclosurePhase::ExpandPending, false) => {
+                self.phase = DisclosurePhase::Collapsed;
+                DisclosureEffects {
+                    cancel_expand: true,
+                    ..Default::default()
+                }
+            }
+            _ => DisclosureEffects::default(),
+        }
+    }
+
+    fn reset(&mut self) -> DisclosureEffects {
+        let was_expanded = self.is_expanded();
+        self.phase = DisclosurePhase::Collapsed;
+        DisclosureEffects {
+            cancel_expand: true,
+            cancel_collapse: true,
+            expanded_changed: was_expanded.then_some(false),
+            ..Default::default()
+        }
+    }
+}
+
+struct HoverSubclassState {
+    machine: DisclosureMachine,
+    tracking_leave: bool,
+    safety_timer_active: bool,
+    expanded: Arc<AtomicBool>,
+    compact: Arc<AtomicBool>,
+    visible: Arc<AtomicBool>,
+    wake_tx: SyncSender<()>,
+    event_tx: Sender<()>,
+}
+
+impl HoverSubclassState {
+    fn interactive(&self) -> bool {
+        self.visible.load(Ordering::Acquire) && !self.compact.load(Ordering::Acquire)
+    }
+
+    fn publish(&self) {
+        let _ = self.wake_tx.try_send(());
+        let _ = self.event_tx.try_send(());
+    }
+
+    fn start_leave_tracking(&mut self, hwnd: *mut c_void) {
+        if self.tracking_leave {
+            return;
+        }
+        let mut event = TrackMouseEventRaw {
+            cb_size: std::mem::size_of::<TrackMouseEventRaw>() as u32,
+            flags: TME_LEAVE,
+            hwnd_track: hwnd,
+            hover_time: 0,
+        };
+        if unsafe { TrackMouseEvent(&mut event) } != 0 {
+            self.tracking_leave = true;
+        }
+    }
+
+    fn forget_leave_tracking(&mut self) {
+        // Tracking is associated with the HWND, not with this subclass. Cancelling it here
+        // would also cancel GPUI's leave request. A late WM_MOUSELEAVE is harmless because
+        // reset() has already returned the disclosure machine to Collapsed.
+        self.tracking_leave = false;
+    }
+
+    fn apply_effects(&mut self, hwnd: *mut c_void, effects: DisclosureEffects) {
+        unsafe {
+            if effects.cancel_expand {
+                let _ = KillTimer(hwnd, TIMER_EXPAND);
+            }
+            if effects.cancel_collapse {
+                let _ = KillTimer(hwnd, TIMER_COLLAPSE);
+            }
+            if effects.start_expand {
+                let _ = SetTimer(hwnd, TIMER_EXPAND, EXPAND_DELAY_MS, null_mut());
+            }
+            if effects.start_collapse {
+                let _ = SetTimer(hwnd, TIMER_COLLAPSE, COLLAPSE_DELAY_MS, null_mut());
+            }
+        }
+
+        if let Some(expanded) = effects.expanded_changed {
+            if self.expanded.swap(expanded, Ordering::AcqRel) != expanded {
+                self.publish();
+            }
+        }
+
+        let should_run_safety = self.machine.is_expanded();
+        if should_run_safety != self.safety_timer_active {
+            unsafe {
+                if should_run_safety {
+                    let _ = SetTimer(hwnd, TIMER_SAFETY, SAFETY_INTERVAL_MS, null_mut());
+                } else {
+                    let _ = KillTimer(hwnd, TIMER_SAFETY);
+                }
+            }
+            self.safety_timer_active = should_run_safety;
+        }
+    }
+
+    fn reset(&mut self, hwnd: *mut c_void) {
+        self.forget_leave_tracking();
+        let effects = self.machine.reset();
+        self.apply_effects(hwnd, effects);
+    }
+}
+
+struct NativeHoverSubclass {
+    hwnd: isize,
+    state_ptr: usize,
+}
+
+impl NativeHoverSubclass {
+    fn install(
+        hwnd: HWND,
+        expanded: Arc<AtomicBool>,
+        compact: Arc<AtomicBool>,
+        visible: Arc<AtomicBool>,
+        wake_tx: SyncSender<()>,
+        event_tx: Sender<()>,
+    ) -> Option<Self> {
+        let state = Box::new(HoverSubclassState {
+            machine: DisclosureMachine::default(),
+            tracking_leave: false,
+            safety_timer_active: false,
+            expanded,
+            compact,
+            visible,
+            wake_tx,
+            event_tx,
+        });
+        let state_ptr = Box::into_raw(state) as usize;
+        let installed = unsafe {
+            SetWindowSubclass(hwnd.0, Some(overlay_subclass_proc), SUBCLASS_ID, state_ptr)
+        };
+        if installed == 0 {
+            unsafe {
+                drop(Box::from_raw(state_ptr as *mut HoverSubclassState));
+            }
+            return None;
+        }
+        Some(Self {
+            hwnd: hwnd.0 as isize,
+            state_ptr,
+        })
+    }
+
+    fn reset(&self) {
+        post_overlay_message(HWND(self.hwnd as *mut c_void), WM_APP_RESET_DISCLOSURE);
+    }
+}
+
+impl Drop for NativeHoverSubclass {
+    fn drop(&mut self) {
+        let hwnd = self.hwnd as *mut c_void;
+        unsafe {
+            let state = &mut *(self.state_ptr as *mut HoverSubclassState);
+            state.reset(hwnd);
+            let _ = RemoveWindowSubclass(hwnd, Some(overlay_subclass_proc), SUBCLASS_ID);
+            drop(Box::from_raw(self.state_ptr as *mut HoverSubclassState));
+        }
+    }
+}
+
+unsafe extern "system" fn overlay_subclass_proc(
+    hwnd: *mut c_void,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> isize {
+    let state = unsafe { &mut *(reference_data as *mut HoverSubclassState) };
+    match message {
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE,
+        WM_MOUSEMOVE => {
+            if state.interactive() {
+                state.start_leave_tracking(hwnd);
+                let effects = state.machine.pointer_enter();
+                state.apply_effects(hwnd, effects);
+            } else {
+                state.reset(hwnd);
+            }
+        }
+        WM_MOUSELEAVE => {
+            state.tracking_leave = false;
+            let effects = state.machine.pointer_leave();
+            state.apply_effects(hwnd, effects);
+        }
+        WM_TIMER => match wparam {
+            TIMER_EXPAND => {
+                let pointer_over = pointer_is_over(HWND(hwnd));
+                if pointer_over {
+                    state.start_leave_tracking(hwnd);
+                }
+                let effects = state
+                    .machine
+                    .expand_elapsed(pointer_over && state.interactive());
+                state.apply_effects(hwnd, effects);
+            }
+            TIMER_COLLAPSE => {
+                let pointer_over = pointer_is_over(HWND(hwnd)) && state.interactive();
+                if pointer_over {
+                    state.start_leave_tracking(hwnd);
+                }
+                let effects = state.machine.collapse_elapsed(pointer_over);
+                state.apply_effects(hwnd, effects);
+            }
+            TIMER_SAFETY => {
+                let pointer_over = pointer_is_over(HWND(hwnd)) && state.interactive();
+                if pointer_over {
+                    state.start_leave_tracking(hwnd);
+                }
+                let effects = state.machine.safety_check(pointer_over);
+                state.apply_effects(hwnd, effects);
+            }
+            _ => {}
+        },
+        WM_APP_RESET_DISCLOSURE | WM_CANCELMODE => state.reset(hwnd),
+        WM_APP_REEVALUATE_POINTER => {
+            if !state.interactive() {
+                state.reset(hwnd);
+            } else if pointer_is_over(HWND(hwnd)) {
+                state.start_leave_tracking(hwnd);
+                let effects = state.machine.pointer_enter();
+                state.apply_effects(hwnd, effects);
+            } else {
+                let effects = state.machine.pointer_leave();
+                state.apply_effects(hwnd, effects);
+            }
+        }
+        WM_SHOWWINDOW if wparam == 0 => state.reset(hwnd),
+        WM_NCDESTROY => state.reset(hwnd),
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+fn pointer_is_over(hwnd: HWND) -> bool {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return false;
+    }
+    unsafe { WindowFromPoint(point) == hwnd.0 }
+}
+
+fn post_overlay_message(hwnd: HWND, message: u32) {
+    unsafe {
+        let _ = PostMessageW(hwnd.0, message, 0, 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RectI {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl RectI {
+    fn width(self) -> i32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    fn height(self) -> i32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    fn center_x(self) -> i32 {
+        self.left + self.width() / 2
+    }
+
+    fn offset(self, x: i32, y: i32) -> Self {
+        Self {
+            left: self.left.saturating_add(x),
+            top: self.top.saturating_add(y),
+            right: self.right.saturating_add(x),
+            bottom: self.bottom.saturating_add(y),
+        }
+    }
+}
+
+impl From<RECT> for RectI {
+    fn from(value: RECT) -> Self {
+        Self {
+            left: value.left,
+            top: value.top,
+            right: value.right,
+            bottom: value.bottom,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,18 +678,204 @@ enum OverlayPlacement {
     Visible { x: i32, y: i32, compact: bool },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WindowMetrics {
+    window_rect: RectI,
+    client_screen_left: i32,
+    client_screen_top: i32,
+    client_width: i32,
+    client_height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowRegion {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    shape: WindowRegionShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowRegionShape {
+    Rectangle,
+    Island {
+        shoulder_start: i32,
+        shoulder_depth: i32,
+        shoulder_inset: i32,
+        bottom_radius: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptionGeometry {
+    band: RectI,
+    buttons_left: i32,
+}
+
+fn colorref_to_rgb(color: COLORREF) -> u32 {
+    let color = color.0;
+    let red = color & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = (color >> 16) & 0xff;
+    (red << 16) | (green << 8) | blue
+}
+
+fn color_distance(left: u32, right: u32) -> u32 {
+    let channel_distance =
+        |shift: u32| ((left >> shift) & 0xff_u32).abs_diff((right >> shift) & 0xff_u32);
+    channel_distance(16) + channel_distance(8) + channel_distance(0)
+}
+
+fn representative_color(samples: &[u32]) -> Option<u32> {
+    samples.iter().copied().min_by_key(|candidate| {
+        samples
+            .iter()
+            .map(|sample| color_distance(*candidate, *sample) as u64)
+            .sum::<u64>()
+    })
+}
+
+fn colors_materially_differ(left: u32, right: u32) -> bool {
+    [16_u32, 8, 0]
+        .into_iter()
+        .any(|shift| ((left >> shift) & 0xff_u32).abs_diff((right >> shift) & 0xff_u32) >= 3)
+}
+
+fn push_segment_samples(points: &mut Vec<i32>, left: i32, right: i32) {
+    if right < left {
+        return;
+    }
+    let span = right.saturating_sub(left);
+    for numerator in [0, 1, 2, 3] {
+        points.push(left.saturating_add(span.saturating_mul(numerator) / 3));
+    }
+}
+
+fn titlebar_sample_points(caption: CaptionGeometry) -> Vec<(i32, i32)> {
+    let band = caption.band;
+    let center = band.center_x();
+    let scale = (band.height() as f32 / COLLAPSED_HEIGHT).clamp(0.75, 4.0);
+    let island_exclusion = (WINDOW_WIDTH * scale / 2.0).ceil() as i32 + 18;
+    let outer_inset = (12.0 * scale).round() as i32;
+    let mut x_positions = Vec::with_capacity(8);
+    push_segment_samples(
+        &mut x_positions,
+        band.left.saturating_add(outer_inset),
+        center.saturating_sub(island_exclusion),
+    );
+    push_segment_samples(
+        &mut x_positions,
+        center.saturating_add(island_exclusion),
+        caption
+            .buttons_left
+            .min(band.right)
+            .saturating_sub(outer_inset),
+    );
+
+    if x_positions.is_empty() {
+        push_segment_samples(
+            &mut x_positions,
+            band.left.saturating_add(outer_inset),
+            caption
+                .buttons_left
+                .min(band.right)
+                .saturating_sub(outer_inset),
+        );
+    }
+
+    let inner_top = band.top.saturating_add(1);
+    let inner_bottom = band.bottom.saturating_sub(2).max(inner_top);
+    let first_y = (band.top + band.height() / 3).clamp(inner_top, inner_bottom);
+    let second_y = (band.top + band.height() * 2 / 3).clamp(inner_top, inner_bottom);
+    let mut points = Vec::with_capacity(x_positions.len() * 2);
+    for x in x_positions {
+        points.push((x, first_y));
+        if second_y != first_y {
+            points.push((x, second_y));
+        }
+    }
+    points
+}
+
+fn sample_screen_colors(points: &[(i32, i32)]) -> Vec<u32> {
+    let screen_dc = unsafe { GetDC(None) };
+    if screen_dc.0.is_null() {
+        return Vec::new();
+    }
+
+    let samples = points
+        .iter()
+        .filter_map(|(x, y)| {
+            let color = unsafe { GetPixel(screen_dc, *x, *y) };
+            (color.0 != CLR_INVALID).then(|| colorref_to_rgb(color))
+        })
+        .collect();
+    unsafe {
+        let _ = ReleaseDC(None, screen_dc);
+    }
+    samples
+}
+
+fn dwm_caption_color(hwnd: HWND) -> Option<u32> {
+    let mut color = COLORREF::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &mut color as *mut COLORREF as *mut c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        )
+        .ok()?;
+    }
+    (!matches!(color.0, DWMWA_COLOR_DEFAULT | DWMWA_COLOR_NONE)).then(|| colorref_to_rgb(color))
+}
+
+fn sample_titlebar_color(hwnd: HWND) -> Option<u32> {
+    let window = get_window_rect(hwnd)?;
+    let frame = extended_frame_bounds(hwnd).unwrap_or(window);
+    let caption = caption_geometry(window, frame, caption_button_bounds(hwnd), 32)?;
+    representative_color(&sample_screen_colors(&titlebar_sample_points(caption)))
+        .or_else(|| dwm_caption_color(hwnd))
+}
+
+#[derive(Clone)]
+pub struct DisclosureProgressPublisher {
+    progress: Arc<AtomicU32>,
+    wake_tx: SyncSender<()>,
+}
+
+impl DisclosureProgressPublisher {
+    pub fn publish(&self, progress: f32) {
+        let next = (progress.max(0.0) * DISCLOSURE_PROGRESS_MAX as f32)
+            .round()
+            .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32;
+        if self.progress.swap(next, Ordering::AcqRel) != next {
+            let _ = self.wake_tx.try_send(());
+        }
+    }
+}
+
 pub struct TeamsWindowFollower {
     target_id: Arc<AtomicU32>,
+    titlebar_color: Arc<AtomicU32>,
     expanded: Arc<AtomicBool>,
+    disclosure_progress: Arc<AtomicU32>,
     compact: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
+    event_rx: Receiver<()>,
     wake_tx: SyncSender<()>,
+    native_hover: Option<NativeHoverSubclass>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl TeamsWindowFollower {
-    pub fn start(window: &Window) -> Option<Self> {
+    pub fn start(
+        window: &Window,
+        presentation: OverlayPresentation,
+        capture_mode: OverlayCaptureMode,
+    ) -> Option<Self> {
         let overlay_hwnd = window_hwnd(window)?;
         configure_overlay_window(overlay_hwnd);
         unsafe {
@@ -118,53 +883,119 @@ impl TeamsWindowFollower {
         }
 
         let target_id = Arc::new(AtomicU32::new(0));
+        let titlebar_color = Arc::new(AtomicU32::new(DEFAULT_TITLEBAR_COLOR));
         let expanded = Arc::new(AtomicBool::new(false));
+        let disclosure_progress = Arc::new(AtomicU32::new(0));
         let compact = Arc::new(AtomicBool::new(false));
         let visible = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (wake_tx, wake_rx) = sync_channel(1);
+        let (event_tx, event_rx) = async_channel::bounded(1);
+        let native_hover = Some(NativeHoverSubclass::install(
+            overlay_hwnd,
+            Arc::clone(&expanded),
+            Arc::clone(&compact),
+            Arc::clone(&visible),
+            wake_tx.clone(),
+            event_tx.clone(),
+        )?);
+
         let thread_target_id = Arc::clone(&target_id);
+        let thread_titlebar_color = Arc::clone(&titlebar_color);
         let thread_expanded = Arc::clone(&expanded);
+        let thread_disclosure_progress = Arc::clone(&disclosure_progress);
         let thread_compact = Arc::clone(&compact);
         let thread_visible = Arc::clone(&visible);
         let thread_stop = Arc::clone(&stop);
+        let thread_event_tx = event_tx.clone();
+        let thread_presentation = presentation;
+        let display_affinity = capture_mode.display_affinity();
         let overlay_value = overlay_hwnd.0 as isize;
         let worker = thread::Builder::new()
             .name("snapbar-window-follow".to_string())
             .spawn(move || {
                 let overlay_hwnd = HWND(overlay_value as *mut c_void);
                 unsafe {
-                    let _ = SetWindowDisplayAffinity(overlay_hwnd, WDA_EXCLUDEFROMCAPTURE);
+                    let _ = SetWindowDisplayAffinity(overlay_hwnd, display_affinity);
                 }
 
                 let mut previous_placement = None;
                 let mut previous_region_state = None;
+                let mut previous_visible = false;
+                let mut previous_compact = false;
+                let mut previous_target_id = 0;
+                let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
                 while !thread_stop.load(Ordering::Acquire) {
                     let target_id = thread_target_id.load(Ordering::Acquire);
                     let placement = if target_id == 0 {
                         OverlayPlacement::Hidden
                     } else {
                         let target_hwnd = HWND(target_id as usize as *mut c_void);
-                        desired_placement(overlay_hwnd, target_hwnd)
+                        desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
                     };
 
                     let visible_now = matches!(placement, OverlayPlacement::Visible { .. });
-                    thread_visible.store(visible_now, Ordering::Release);
-                    let compact_layout =
+                    let compact_now =
                         matches!(placement, OverlayPlacement::Visible { compact: true, .. });
-                    thread_compact.store(compact_layout, Ordering::Release);
-                    let mode = OverlayMode::from_state(
-                        thread_expanded.load(Ordering::Acquire),
-                        compact_layout,
-                    );
-                    let region_state = (client_size(overlay_hwnd), mode);
-                    if previous_region_state != Some(region_state) {
-                        apply_window_region(overlay_hwnd, mode);
-                        previous_region_state = Some(region_state);
+                    thread_visible.store(visible_now, Ordering::Release);
+                    thread_compact.store(compact_now, Ordering::Release);
+
+                    let target_changed = target_id != previous_target_id;
+                    if visible_now
+                        && (target_changed
+                            || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
+                    {
+                        let target_hwnd = HWND(target_id as usize as *mut c_void);
+                        if let Some(sampled_color) = sample_titlebar_color(target_hwnd) {
+                            let current_color = thread_titlebar_color.load(Ordering::Acquire);
+                            if colors_materially_differ(current_color, sampled_color) {
+                                thread_titlebar_color.store(sampled_color, Ordering::Release);
+                                let _ = thread_event_tx.try_send(());
+                            }
+                        }
+                        last_titlebar_sample = Instant::now();
+                    }
+                    previous_target_id = target_id;
+
+                    let visibility_changed = visible_now != previous_visible;
+                    let compact_changed = compact_now != previous_compact;
+                    if visibility_changed || compact_changed || target_changed {
+                        if !visible_now || compact_now {
+                            thread_expanded.store(false, Ordering::Release);
+                            thread_disclosure_progress.store(0, Ordering::Release);
+                            post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
+                        }
+                        let _ = thread_event_tx.try_send(());
+                        previous_visible = visible_now;
+                        previous_compact = compact_now;
+                    }
+
+                    let disclosure_progress = if visible_now && !compact_now {
+                        thread_disclosure_progress.load(Ordering::Acquire)
+                    } else {
+                        thread_disclosure_progress.store(0, Ordering::Release);
+                        0
+                    };
+                    match desired_window_region(
+                        overlay_hwnd,
+                        thread_presentation,
+                        compact_now,
+                        disclosure_progress,
+                    ) {
+                        Some(region) if previous_region_state != Some(region) => {
+                            if apply_window_region(overlay_hwnd, region) {
+                                previous_region_state = Some(region);
+                            }
+                        }
+                        Some(_) => {}
+                        None => previous_region_state = None,
                     }
 
                     if previous_placement != Some(placement) {
                         apply_placement(overlay_hwnd, placement);
+                        if visible_now {
+                            post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
+                        }
                         previous_placement = Some(placement);
                     }
 
@@ -179,16 +1010,22 @@ impl TeamsWindowFollower {
                     }
                 }
                 thread_visible.store(false, Ordering::Release);
+                thread_expanded.store(false, Ordering::Release);
+                let _ = thread_event_tx.try_send(());
                 apply_placement(overlay_hwnd, OverlayPlacement::Hidden);
             })
             .ok()?;
 
         Some(Self {
             target_id,
+            titlebar_color,
             expanded,
+            disclosure_progress,
             compact,
             visible,
+            event_rx,
             wake_tx,
+            native_hover,
             stop,
             worker: Some(worker),
         })
@@ -198,15 +1035,39 @@ impl TeamsWindowFollower {
         let _ = self.wake_tx.try_send(());
     }
 
-    pub fn set_target(&self, target_id: Option<u32>) {
-        self.target_id
-            .store(target_id.unwrap_or_default(), Ordering::Release);
-        self.wake();
+    pub fn subscribe(&self) -> Receiver<()> {
+        self.event_rx.clone()
     }
 
-    pub fn set_expanded(&self, expanded: bool) {
-        self.expanded.store(expanded, Ordering::Release);
-        self.wake();
+    pub fn set_target(&self, target_id: Option<u32>) {
+        let next = target_id.unwrap_or_default();
+        if self.target_id.swap(next, Ordering::AcqRel) != next {
+            if let Some(native_hover) = &self.native_hover {
+                native_hover.reset();
+            }
+            self.expanded.store(false, Ordering::Release);
+            self.disclosure_progress.store(0, Ordering::Release);
+            self.wake();
+        }
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.expanded.load(Ordering::Acquire)
+    }
+
+    pub fn titlebar_color(&self) -> u32 {
+        self.titlebar_color.load(Ordering::Acquire)
+    }
+
+    pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
+        DisclosureProgressPublisher {
+            progress: Arc::clone(&self.disclosure_progress),
+            wake_tx: self.wake_tx.clone(),
+        }
+    }
+
+    pub fn disclosure_progress(&self) -> f32 {
+        self.disclosure_progress.load(Ordering::Acquire) as f32 / DISCLOSURE_PROGRESS_MAX as f32
     }
 
     pub fn is_compact(&self) -> bool {
@@ -217,6 +1078,7 @@ impl TeamsWindowFollower {
         self.visible.load(Ordering::Acquire)
     }
 }
+
 impl Drop for TeamsWindowFollower {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -224,6 +1086,7 @@ impl Drop for TeamsWindowFollower {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.native_hover.take();
     }
 }
 
@@ -269,16 +1132,6 @@ fn suppress_window_border(hwnd: HWND) {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WindowMetrics {
-    window_left: i32,
-    window_top: i32,
-    client_screen_left: i32,
-    client_screen_top: i32,
-    client_width: i32,
-    client_height: i32,
-}
-
 fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     let mut client_rect = RECT::default();
     let mut window_rect = RECT::default();
@@ -298,8 +1151,7 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     }
 
     Some(WindowMetrics {
-        window_left: window_rect.left,
-        window_top: window_rect.top,
+        window_rect: window_rect.into(),
         client_screen_left: client_origin.x,
         client_screen_top: client_origin.y,
         client_width,
@@ -307,23 +1159,25 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     })
 }
 
-fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
-    let metrics = window_metrics(hwnd)?;
-    Some((metrics.client_width, metrics.client_height))
-}
-
 fn scale_logical(value: f32, actual: i32, logical: f32) -> i32 {
     ((value * actual as f32) / logical).round() as i32
 }
 
-fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RECT {
-    let surface_width = scale_logical(mode.logical_width(), width, WINDOW_WIDTH).clamp(1, width);
-    let surface_height =
-        scale_logical(mode.logical_height(), height, WINDOW_HEIGHT).clamp(1, height);
-    let surface_left = (width - surface_width) / 2;
-    let surface_top = (height - surface_height) / 2;
+fn surface_rect_for_size(
+    width: i32,
+    height: i32,
+    logical_width: f32,
+    logical_height: f32,
+) -> RectI {
+    let surface_width = scale_logical(logical_width, width, WINDOW_WIDTH).clamp(1, width);
+    let surface_height = scale_logical(logical_height, height, WINDOW_HEIGHT).clamp(1, height);
+    let expanded_height = scale_logical(EXPANDED_HEIGHT, height, WINDOW_HEIGHT).clamp(1, height);
+    let surface_left = width / 2 - surface_width / 2;
+    // Every mode starts at the title-bar top edge. The idle caption cells end at the
+    // caption bottom, while only the expanded island uses the reserved drop below it.
+    let surface_top = (height - expanded_height) / 2;
 
-    RECT {
+    RectI {
         left: surface_left,
         top: surface_top,
         right: surface_left + surface_width,
@@ -331,38 +1185,434 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RECT {
     }
 }
 
-fn apply_window_region(hwnd: HWND, mode: OverlayMode) {
-    let Some(metrics) = window_metrics(hwnd) else {
-        return;
-    };
+fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
+    surface_rect_for_size(width, height, mode.logical_width(), mode.logical_height())
+}
 
-    let client_left = metrics.client_screen_left - metrics.window_left;
-    let client_top = metrics.client_screen_top - metrics.window_top;
-    let surface = surface_rect(metrics.client_width, metrics.client_height, mode);
-    let height = surface.bottom.saturating_sub(surface.top).max(1);
-    let region = unsafe {
-        CreateRoundRectRgn(
-            client_left + surface.left,
-            client_top + surface.top,
-            client_left + surface.right + 1,
-            client_top + surface.bottom + 1,
-            height,
-            height,
+fn compact_surface_rect_for_presentation(
+    width: i32,
+    height: i32,
+    presentation: OverlayPresentation,
+) -> RectI {
+    surface_rect_for_size(
+        width,
+        height,
+        COMPACT_WIDTH,
+        if presentation.is_inline() {
+            INLINE_HEIGHT
+        } else {
+            COMPACT_HEIGHT
+        },
+    )
+}
+
+#[cfg(test)]
+fn disclosure_surface_rect(width: i32, height: i32, progress: u32) -> RectI {
+    disclosure_surface_rect_for_presentation(
+        width,
+        height,
+        progress,
+        OverlayPresentation::HoverIsland,
+    )
+}
+
+fn disclosure_surface_rect_for_presentation(
+    width: i32,
+    height: i32,
+    progress: u32,
+    presentation: OverlayPresentation,
+) -> RectI {
+    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT) as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+    let logical_height = if presentation.is_inline() {
+        INLINE_HEIGHT
+    } else {
+        disclosure_height(progress)
+    };
+    surface_rect_for_size(width, height, disclosure_width(progress), logical_height)
+}
+
+#[cfg(test)]
+fn hover_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
+    surface_rect(width, height, mode)
+}
+
+#[cfg(test)]
+fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
+    match mode {
+        OverlayMode::Collapsed => {
+            window_region_for_progress(metrics, OverlayPresentation::HoverIsland, false, 0)
+        }
+        OverlayMode::Expanded => window_region_for_progress(
+            metrics,
+            OverlayPresentation::HoverIsland,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        ),
+        OverlayMode::Inline => window_region_for_progress(
+            metrics,
+            OverlayPresentation::InlineTitlebar,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        ),
+        OverlayMode::Compact => {
+            window_region_for_progress(metrics, OverlayPresentation::HoverIsland, true, 0)
+        }
+    }
+}
+
+fn window_region_for_progress(
+    metrics: WindowMetrics,
+    presentation: OverlayPresentation,
+    compact: bool,
+    progress: u32,
+) -> WindowRegion {
+    let client_left = metrics
+        .client_screen_left
+        .saturating_sub(metrics.window_rect.left);
+    let client_top = metrics
+        .client_screen_top
+        .saturating_sub(metrics.window_rect.top);
+    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT);
+    let hover = if compact {
+        compact_surface_rect_for_presentation(
+            metrics.client_width,
+            metrics.client_height,
+            presentation,
+        )
+    } else {
+        disclosure_surface_rect_for_presentation(
+            metrics.client_width,
+            metrics.client_height,
+            progress,
+            presentation,
         )
     };
-    if region.is_null() {
-        return;
+    let normalized = progress as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+    let shape = if compact || presentation.is_inline() || progress == 0 {
+        WindowRegionShape::Rectangle
+    } else {
+        let caption_height = scale_logical(COLLAPSED_HEIGHT, metrics.client_height, WINDOW_HEIGHT)
+            .clamp(1, hover.height());
+        let animated_drop = hover.height().saturating_sub(caption_height);
+        let bottom_radius = scale_logical(
+            ISLAND_BOTTOM_RADIUS * normalized,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, animated_drop);
+        let shoulder_depth = scale_logical(
+            ISLAND_SHOULDER_DEPTH * normalized,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, animated_drop.saturating_sub(bottom_radius));
+        let shoulder_inset = scale_logical(
+            ISLAND_SHOULDER_INSET * normalized,
+            metrics.client_width,
+            WINDOW_WIDTH,
+        )
+        .clamp(0, hover.width().saturating_sub(1) / 2);
+        WindowRegionShape::Island {
+            shoulder_start: caption_height,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        }
+    };
+    WindowRegion {
+        left: client_left.saturating_add(hover.left),
+        top: client_top.saturating_add(hover.top),
+        right: client_left.saturating_add(hover.right),
+        bottom: client_top.saturating_add(hover.bottom),
+        shape,
+    }
+}
+
+fn desired_window_region(
+    hwnd: HWND,
+    presentation: OverlayPresentation,
+    compact: bool,
+    disclosure_progress: u32,
+) -> Option<WindowRegion> {
+    Some(window_region_for_progress(
+        window_metrics(hwnd)?,
+        presentation,
+        compact,
+        disclosure_progress,
+    ))
+}
+
+fn island_row_inset(
+    row: i32,
+    width: i32,
+    height: i32,
+    shoulder_start: i32,
+    shoulder_depth: i32,
+    shoulder_inset: i32,
+    bottom_radius: i32,
+) -> i32 {
+    let shoulder_row = row.saturating_sub(shoulder_start);
+    let mut inset = if row < shoulder_start {
+        0
+    } else if shoulder_depth <= 1 || shoulder_row >= shoulder_depth {
+        shoulder_inset
+    } else {
+        let phase = shoulder_row as f32 / (shoulder_depth - 1) as f32;
+        // A quarter-circle ease-out gives the join a horizontal tangent against
+        // the caption edge and a vertical tangent as it reaches the island body.
+        let eased = (1.0 - (1.0 - phase) * (1.0 - phase)).sqrt();
+        (shoulder_inset as f32 * eased).round() as i32
+    };
+
+    if bottom_radius > 0 {
+        let corner_start = height.saturating_sub(bottom_radius);
+        if row >= corner_start {
+            let phase = if bottom_radius <= 1 {
+                1.0
+            } else {
+                (row - corner_start) as f32 / (bottom_radius - 1) as f32
+            };
+            let circle = (1.0 - phase * phase).max(0.0).sqrt();
+            let corner_inset = (bottom_radius as f32 * (1.0 - circle)).round() as i32;
+            inset = shoulder_inset.saturating_add(corner_inset);
+        }
     }
 
+    inset.clamp(0, width.saturating_sub(1) / 2)
+}
+
+fn create_island_region(
+    desired: WindowRegion,
+    shoulder_start: i32,
+    shoulder_depth: i32,
+    shoulder_inset: i32,
+    bottom_radius: i32,
+) -> *mut c_void {
+    let width = desired.right.saturating_sub(desired.left);
+    let height = desired.bottom.saturating_sub(desired.top);
+    if width <= 0 || height <= 0 {
+        return null_mut();
+    }
+
+    let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+    if region.is_null() {
+        return null_mut();
+    }
+
+    let mut has_rows = false;
+    for row in 0..height {
+        let inset = island_row_inset(
+            row,
+            width,
+            height,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        );
+        let strip_left = desired.left.saturating_add(inset);
+        let strip_right = desired.right.saturating_sub(inset);
+        if strip_right <= strip_left {
+            continue;
+        }
+
+        let strip = unsafe {
+            CreateRectRgn(
+                strip_left,
+                desired.top.saturating_add(row),
+                strip_right,
+                desired.top.saturating_add(row).saturating_add(1),
+            )
+        };
+        if strip.is_null() {
+            unsafe {
+                let _ = DeleteObject(region);
+            }
+            return null_mut();
+        }
+        let combined = unsafe { CombineRgn(region, region, strip, RGN_OR) };
+        unsafe {
+            let _ = DeleteObject(strip);
+        }
+        if combined == 0 {
+            unsafe {
+                let _ = DeleteObject(region);
+            }
+            return null_mut();
+        }
+        has_rows = true;
+    }
+
+    if !has_rows {
+        unsafe {
+            let _ = DeleteObject(region);
+        }
+        return null_mut();
+    }
+    region
+}
+
+fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
+    let region = match desired.shape {
+        WindowRegionShape::Rectangle => unsafe {
+            CreateRectRgn(desired.left, desired.top, desired.right, desired.bottom)
+        },
+        WindowRegionShape::Island {
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        } => create_island_region(
+            desired,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        ),
+    };
+    if region.is_null() {
+        return false;
+    }
     let applied = unsafe { SetWindowRgn(hwnd.0, region, 1) };
     if applied == 0 {
         unsafe {
             let _ = DeleteObject(region);
         }
+        return false;
     }
+    true
 }
 
-fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement {
+fn caption_geometry(
+    window_rect: RectI,
+    visible_frame: RectI,
+    caption_relative: Option<RectI>,
+    fallback_height: i32,
+) -> Option<CaptionGeometry> {
+    if let Some(relative) = caption_relative {
+        let absolute = relative.offset(window_rect.left, window_rect.top);
+        let band = RectI {
+            left: visible_frame.left,
+            top: absolute.top.max(visible_frame.top),
+            right: visible_frame.right,
+            bottom: absolute.bottom.min(visible_frame.bottom),
+        };
+        let buttons_left = absolute.left.clamp(visible_frame.left, visible_frame.right);
+        if (24..=96).contains(&band.height()) && buttons_left > visible_frame.center_x() {
+            return Some(CaptionGeometry { band, buttons_left });
+        }
+    }
+
+    let maximum_height = visible_frame.height().min(96);
+    if maximum_height < 24 {
+        return None;
+    }
+    let height = fallback_height.clamp(24, maximum_height);
+    Some(CaptionGeometry {
+        band: RectI {
+            left: visible_frame.left,
+            top: visible_frame.top,
+            right: visible_frame.right,
+            bottom: visible_frame.top + height,
+        },
+        buttons_left: visible_frame.right - visible_frame.width() / 8,
+    })
+}
+
+fn calculate_placement(
+    target_window: RectI,
+    target_frame: RectI,
+    caption_relative: Option<RectI>,
+    overlay: WindowMetrics,
+    presentation: OverlayPresentation,
+) -> OverlayPlacement {
+    let full_surface = surface_rect(
+        overlay.client_width,
+        overlay.client_height,
+        if presentation.is_inline() {
+            OverlayMode::Inline
+        } else {
+            OverlayMode::Expanded
+        },
+    );
+    let compact_surface = compact_surface_rect_for_presentation(
+        overlay.client_width,
+        overlay.client_height,
+        presentation,
+    );
+    let full_width = full_surface.width();
+    let full_height = full_surface.height();
+    if full_width <= 0 || full_height <= 0 || target_frame.width() <= 0 {
+        return OverlayPlacement::Hidden;
+    }
+
+    let island_drop = if presentation.is_inline() {
+        0
+    } else {
+        scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, full_height)
+    };
+    let caption_fallback_height = if presentation.is_inline() {
+        // The visible inline surface is one logical pixel shorter than the caption.
+        // Keep the fallback caption at its full height so bottom anchoring leaves the
+        // DWM outer frame visible at the top.
+        scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24)
+    } else {
+        full_height.saturating_sub(island_drop).max(24)
+    };
+    let Some(caption) = caption_geometry(
+        target_window,
+        target_frame,
+        caption_relative,
+        caption_fallback_height,
+    ) else {
+        return OverlayPlacement::Hidden;
+    };
+    if full_height > caption.band.height().saturating_add(island_drop) {
+        return OverlayPlacement::Hidden;
+    }
+
+    let safe_left = target_frame.left + target_frame.width() / 6;
+    let safe_right = (caption.buttons_left - 8).min(target_frame.right - 8);
+    let available_width = safe_right.saturating_sub(safe_left);
+    let compact = available_width < full_width;
+    let active_surface = if compact {
+        compact_surface
+    } else {
+        full_surface
+    };
+    let preferred_center = target_frame.center_x();
+    let active_width = active_surface.width();
+    let left_extent = active_width / 2;
+    let right_extent = active_width - left_extent;
+    let minimum_center = safe_left.saturating_add(left_extent);
+    let maximum_center = safe_right.saturating_sub(right_extent);
+    if maximum_center < minimum_center {
+        return OverlayPlacement::Hidden;
+    }
+    let surface_center = preferred_center.clamp(minimum_center, maximum_center);
+
+    let client_offset_x = overlay.client_screen_left - overlay.window_rect.left;
+    let client_offset_y = overlay.client_screen_top - overlay.window_rect.top;
+    let desired_surface_left = surface_center - active_surface.width() / 2;
+    let x = desired_surface_left - client_offset_x - active_surface.left;
+
+    let desired_surface_bottom = caption.band.bottom.saturating_add(island_drop);
+    let desired_surface_top = desired_surface_bottom.saturating_sub(full_surface.height());
+    let y = desired_surface_top - client_offset_y - full_surface.top;
+    let placed_top = y + client_offset_y + full_surface.top;
+    let placed_bottom = y + client_offset_y + full_surface.bottom;
+    if placed_top < caption.band.top || placed_bottom > desired_surface_bottom {
+        return OverlayPlacement::Hidden;
+    }
+
+    OverlayPlacement::Visible { x, y, compact }
+}
+
+fn desired_placement(
+    overlay_hwnd: HWND,
+    target_hwnd: HWND,
+    presentation: OverlayPresentation,
+) -> OverlayPlacement {
     unsafe {
         if !IsWindow(Some(target_hwnd)).as_bool()
             || !IsWindowVisible(target_hwnd).as_bool()
@@ -372,82 +1622,22 @@ fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement 
         }
     }
 
-    let Some(target_rect) = extended_frame_bounds(target_hwnd) else {
+    let Some(target_window) = get_window_rect(target_hwnd) else {
         return OverlayPlacement::Hidden;
     };
-    let mut overlay_rect = RECT::default();
-    unsafe {
-        if GetWindowRect(overlay_hwnd, &mut overlay_rect).is_err() {
-            return OverlayPlacement::Hidden;
-        }
-    }
-
-    let target_width = target_rect.right.saturating_sub(target_rect.left);
-    let overlay_width = overlay_rect.right.saturating_sub(overlay_rect.left);
-    let overlay_height = overlay_rect.bottom.saturating_sub(overlay_rect.top);
-    if target_width <= 0 || overlay_width <= 0 || overlay_height <= 0 {
-        return OverlayPlacement::Hidden;
-    }
-
-    let Some(overlay_metrics) = window_metrics(overlay_hwnd) else {
+    let Some(target_frame) = extended_frame_bounds(target_hwnd) else {
         return OverlayPlacement::Hidden;
     };
-    let collapsed_surface = surface_rect(
-        overlay_metrics.client_width,
-        overlay_metrics.client_height,
-        OverlayMode::Collapsed,
-    );
-    let expanded_surface = surface_rect(
-        overlay_metrics.client_width,
-        overlay_metrics.client_height,
-        OverlayMode::Expanded,
-    );
-    let visible_top_offset = overlay_metrics
-        .client_screen_top
-        .saturating_sub(overlay_metrics.window_top)
-        .saturating_add(collapsed_surface.top);
-    let visible_height = collapsed_surface
-        .bottom
-        .saturating_sub(collapsed_surface.top);
-    let expanded_width = expanded_surface.right.saturating_sub(expanded_surface.left);
-    if visible_height <= 0 || expanded_width <= 0 {
+    let Some(overlay) = window_metrics(overlay_hwnd) else {
         return OverlayPlacement::Hidden;
-    }
-
-    let caption = caption_button_bounds(target_hwnd);
-    let caption_height = caption
-        .map(|rect| rect.bottom.saturating_sub(rect.top))
-        .filter(|height| *height >= 24 && *height <= 96)
-        .unwrap_or(visible_height + 4);
-    let caption_top = caption
-        .map(|rect| rect.top)
-        .filter(|top| *top >= 0 && *top <= 32)
-        .unwrap_or_default();
-    let caption_left = caption
-        .map(|rect| rect.left)
-        .filter(|left| *left > target_width / 2 && *left < target_width)
-        .unwrap_or(target_width * 7 / 8);
-
-    let safe_left = target_width / 6;
-    let safe_right = caption_left.saturating_sub(8).max(target_width / 2);
-    let available_width = safe_right.saturating_sub(safe_left);
-    let compact = available_width < expanded_width;
-    let window_center = target_width / 2;
-    let safe_center = if compact {
-        window_center
-    } else {
-        let minimum_center = safe_left.saturating_add(expanded_width / 2);
-        let maximum_center = safe_right.saturating_sub(expanded_width / 2);
-        window_center.clamp(minimum_center, maximum_center.max(minimum_center))
     };
-
-    let min_x = target_rect.left;
-    let max_x = target_rect.right.saturating_sub(overlay_width).max(min_x);
-    let x = (target_rect.left + safe_center - overlay_width / 2).clamp(min_x, max_x);
-    let visible_y = target_rect.top + caption_top + (caption_height - visible_height).max(0) / 2;
-    let y = visible_y.saturating_sub(visible_top_offset);
-
-    OverlayPlacement::Visible { x, y, compact }
+    calculate_placement(
+        target_window,
+        target_frame,
+        caption_button_bounds(target_hwnd),
+        overlay,
+        presentation,
+    )
 }
 
 fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
@@ -472,7 +1662,15 @@ fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
     }
 }
 
-fn caption_button_bounds(hwnd: HWND) -> Option<RECT> {
+fn get_window_rect(hwnd: HWND) -> Option<RectI> {
+    let mut rect = RECT::default();
+    unsafe {
+        GetWindowRect(hwnd, &mut rect).ok()?;
+    }
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect.into())
+}
+
+fn caption_button_bounds(hwnd: HWND) -> Option<RectI> {
     let mut rect = RECT::default();
     unsafe {
         DwmGetWindowAttribute(
@@ -483,10 +1681,10 @@ fn caption_button_bounds(hwnd: HWND) -> Option<RECT> {
         )
         .ok()?;
     }
-    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect.into())
 }
 
-fn extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
+fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
     let mut rect = RECT::default();
     unsafe {
         DwmGetWindowAttribute(
@@ -497,56 +1695,800 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
         )
         .ok()?;
     }
-    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rect_tuple(rect: RECT) -> (i32, i32, i32, i32) {
-        (rect.left, rect.top, rect.right, rect.bottom)
+    #[test]
+    fn colorref_is_converted_from_bgr_to_rgb() {
+        assert_eq!(colorref_to_rgb(COLORREF(0x0033_2211)), 0x112233);
     }
 
     #[test]
-    fn compact_mode_always_wins() {
-        assert_eq!(
-            OverlayMode::from_state(false, false),
-            OverlayMode::Collapsed
-        );
-        assert_eq!(OverlayMode::from_state(true, false), OverlayMode::Expanded);
-        assert_eq!(OverlayMode::from_state(false, true), OverlayMode::Compact);
-        assert_eq!(OverlayMode::from_state(true, true), OverlayMode::Compact);
+    fn representative_color_rejects_isolated_foreground_pixels() {
+        let samples = [0xf3f3f3, 0xf3f3f3, 0xf4f4f4, 0xf3f3f3, 0x202020];
+        assert_eq!(representative_color(&samples), Some(0xf3f3f3));
     }
 
     #[test]
-    fn region_matches_each_visible_surface() {
+    fn tiny_sampling_noise_does_not_trigger_a_palette_update() {
+        assert!(!colors_materially_differ(0xf3f3f3, 0xf5f4f3));
+        assert!(colors_materially_differ(0xf3f3f3, 0x202020));
+    }
+
+    #[test]
+    fn titlebar_samples_avoid_the_island_and_caption_buttons() {
+        let caption = CaptionGeometry {
+            band: RectI {
+                left: 0,
+                top: 10,
+                right: 1_200,
+                bottom: 40,
+            },
+            buttons_left: 1_050,
+        };
+        let points = titlebar_sample_points(caption);
+        assert!(!points.is_empty());
+        assert!(points.iter().all(|(x, y)| {
+            (*x <= 442 || *x >= 758) && *x < caption.buttons_left && (10..40).contains(y)
+        }));
+    }
+
+    #[test]
+    fn inline_presentation_is_selected_by_either_launch_flag() {
         assert_eq!(
-            rect_tuple(surface_rect(280, 40, OverlayMode::Collapsed)),
-            (94, 5, 186, 35)
+            OverlayPresentation::from_arguments([
+                String::from("snapbar.exe"),
+                String::from("--inline-titlebar"),
+            ]),
+            OverlayPresentation::InlineTitlebar
         );
         assert_eq!(
-            rect_tuple(surface_rect(280, 40, OverlayMode::Expanded)),
-            (4, 2, 276, 38)
+            OverlayPresentation::from_arguments([
+                String::from("snapbar.exe"),
+                String::from("--inline"),
+            ]),
+            OverlayPresentation::InlineTitlebar
         );
         assert_eq!(
-            rect_tuple(surface_rect(280, 40, OverlayMode::Compact)),
-            (120, 2, 160, 38)
+            OverlayPresentation::from_arguments([String::from("snapbar.exe")]),
+            OverlayPresentation::HoverIsland
         );
     }
 
     #[test]
-    fn scaled_regions_stay_centered_and_bounded() {
-        for mode in [
-            OverlayMode::Collapsed,
-            OverlayMode::Expanded,
-            OverlayMode::Compact,
+    fn capture_exclusion_is_the_release_default_but_development_can_opt_in() {
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe"], false),
+            OverlayCaptureMode::Excluded
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe", "--recordable-overlay"], false,),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe"], true),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::Excluded.display_affinity(),
+            WDA_EXCLUDEFROMCAPTURE
+        );
+        assert_eq!(OverlayCaptureMode::Recordable.display_affinity(), WDA_NONE);
+    }
+
+    #[test]
+    fn disclosure_requires_pointer_at_timer_boundaries() {
+        let mut machine = DisclosureMachine::default();
+        assert!(machine.pointer_enter().start_expand);
+        let effects = machine.expand_elapsed(false);
+        assert_eq!(effects.expanded_changed, None);
+        assert_eq!(machine.phase, DisclosurePhase::Collapsed);
+
+        assert!(machine.pointer_enter().start_expand);
+        let effects = machine.expand_elapsed(true);
+        assert_eq!(effects.expanded_changed, Some(true));
+        assert_eq!(machine.phase, DisclosurePhase::Expanded);
+    }
+
+    #[test]
+    fn reentry_cancels_pending_collapse() {
+        let mut machine = DisclosureMachine {
+            phase: DisclosurePhase::Expanded,
+        };
+        assert!(machine.pointer_leave().start_collapse);
+        assert_eq!(machine.phase, DisclosurePhase::CollapsePending);
+        let effects = machine.pointer_enter();
+        assert!(effects.cancel_collapse);
+        assert_eq!(machine.phase, DisclosurePhase::Expanded);
+        assert_eq!(machine.collapse_elapsed(true).expanded_changed, None);
+    }
+
+    #[test]
+    fn leaving_expanded_surface_always_collapses() {
+        let mut machine = DisclosureMachine {
+            phase: DisclosurePhase::Expanded,
+        };
+        assert!(machine.pointer_leave().start_collapse);
+        let effects = machine.collapse_elapsed(false);
+        assert_eq!(effects.expanded_changed, Some(false));
+        assert_eq!(machine.phase, DisclosurePhase::Collapsed);
+    }
+
+    #[test]
+    fn reset_cancels_pending_and_expanded_states() {
+        for phase in [
+            DisclosurePhase::ExpandPending,
+            DisclosurePhase::Expanded,
+            DisclosurePhase::CollapsePending,
         ] {
-            let rect = surface_rect(350, 50, mode);
-            assert!(((rect.left + rect.right) - 350).abs() <= 1);
-            assert!(((rect.top + rect.bottom) - 50).abs() <= 1);
-            assert!(rect.left >= 0 && rect.top >= 0);
-            assert!(rect.right <= 350 && rect.bottom <= 50);
+            let mut machine = DisclosureMachine { phase };
+            let effects = machine.reset();
+            assert!(effects.cancel_expand && effects.cancel_collapse);
+            assert_eq!(machine.phase, DisclosurePhase::Collapsed);
         }
+    }
+
+    #[test]
+    fn late_mouse_leave_after_reset_is_harmless() {
+        let mut machine = DisclosureMachine {
+            phase: DisclosurePhase::Expanded,
+        };
+        assert_eq!(machine.reset().expanded_changed, Some(false));
+        let late_leave = machine.pointer_leave();
+        assert!(late_leave.cancel_expand);
+        assert!(!late_leave.start_collapse);
+        assert_eq!(late_leave.expanded_changed, None);
+        assert_eq!(machine.phase, DisclosurePhase::Collapsed);
+    }
+
+    #[test]
+    fn regions_match_visible_surfaces() {
+        assert_eq!(
+            surface_rect(280, 48, OverlayMode::Collapsed),
+            RectI {
+                left: 94,
+                top: 1,
+                right: 186,
+                bottom: 31,
+            }
+        );
+        assert_eq!(
+            surface_rect(280, 48, OverlayMode::Expanded),
+            RectI {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 47,
+            }
+        );
+        assert_eq!(
+            surface_rect(280, 48, OverlayMode::Inline),
+            RectI {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 30,
+            }
+        );
+        assert_eq!(
+            surface_rect(280, 48, OverlayMode::Compact),
+            RectI {
+                left: 117,
+                top: 1,
+                right: 163,
+                bottom: 31,
+            }
+        );
+    }
+
+    #[test]
+    fn hover_regions_follow_the_full_island_silhouette() {
+        assert_eq!(
+            hover_rect(280, 48, OverlayMode::Collapsed),
+            surface_rect(280, 48, OverlayMode::Collapsed)
+        );
+        assert_eq!(
+            hover_rect(280, 48, OverlayMode::Expanded),
+            surface_rect(280, 48, OverlayMode::Expanded)
+        );
+        assert_eq!(
+            hover_rect(280, 48, OverlayMode::Compact),
+            surface_rect(280, 48, OverlayMode::Compact)
+        );
+    }
+
+    #[test]
+    fn hover_region_scales_with_dpi() {
+        assert_eq!(
+            hover_rect(420, 72, OverlayMode::Collapsed),
+            RectI {
+                left: 141,
+                top: 1,
+                right: 279,
+                bottom: 46,
+            }
+        );
+    }
+
+    #[test]
+    fn native_region_includes_the_client_origin_offset() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: -7,
+                top: -7,
+                right: 287,
+                bottom: 55,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Collapsed),
+            WindowRegion {
+                left: 101,
+                top: 8,
+                right: 193,
+                bottom: 38,
+                shape: WindowRegionShape::Rectangle,
+            }
+        );
+    }
+
+    #[test]
+    fn idle_regions_are_rectangular_but_expanded_region_has_curved_shoulders() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        for mode in [OverlayMode::Collapsed, OverlayMode::Compact] {
+            let region = window_region(metrics, mode);
+            assert_eq!(region.shape, WindowRegionShape::Rectangle);
+        }
+        let expanded = window_region(metrics, OverlayMode::Expanded);
+        assert_eq!(
+            expanded.shape,
+            WindowRegionShape::Island {
+                shoulder_start: 30,
+                shoulder_depth: 10,
+                shoulder_inset: 16,
+                bottom_radius: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn disclosure_geometry_grows_from_the_center_without_moving_the_top_anchor() {
+        assert_eq!(disclosure_width(0.0), COLLAPSED_WIDTH);
+        assert_eq!(disclosure_height(0.0), COLLAPSED_HEIGHT);
+        assert_eq!(disclosure_width(1.0), EXPANDED_WIDTH);
+        assert_eq!(disclosure_height(1.0), EXPANDED_HEIGHT);
+
+        let halfway = disclosure_surface_rect(280, 48, 500);
+        assert_eq!(
+            halfway,
+            RectI {
+                left: 49,
+                top: 1,
+                right: 231,
+                bottom: 39,
+            }
+        );
+        assert_eq!(halfway.center_x(), 140);
+        for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
+            assert_eq!(disclosure_surface_rect(280, 48, progress).top, 1);
+            assert_eq!(disclosure_surface_rect(280, 48, progress).center_x(), 140);
+        }
+    }
+
+    #[test]
+    fn inline_disclosure_only_grows_horizontally_inside_the_caption_band() {
+        for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
+            let surface = disclosure_surface_rect_for_presentation(
+                280,
+                48,
+                progress,
+                OverlayPresentation::InlineTitlebar,
+            );
+            assert_eq!(surface.top, 1);
+            assert_eq!(surface.bottom, 30);
+            assert_eq!(surface.height(), 29);
+            assert_eq!(surface.center_x(), 140);
+        }
+
+        assert_eq!(
+            disclosure_surface_rect_for_presentation(
+                280,
+                48,
+                DISCLOSURE_PROGRESS_MAX,
+                OverlayPresentation::InlineTitlebar,
+            )
+            .width(),
+            INLINE_WIDTH as i32,
+        );
+    }
+
+    #[test]
+    fn inline_native_region_is_rectangular_and_caption_contained() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Inline),
+            WindowRegion {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 30,
+                shape: WindowRegionShape::Rectangle,
+            }
+        );
+    }
+
+    #[test]
+    fn inline_compact_region_reserves_the_same_top_frame_inset() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region_for_progress(metrics, OverlayPresentation::InlineTitlebar, true, 0),
+            WindowRegion {
+                left: 117,
+                top: 1,
+                right: 163,
+                bottom: 30,
+                shape: WindowRegionShape::Rectangle,
+            }
+        );
+    }
+
+    #[test]
+    fn spring_overshoot_bulges_inside_the_fixed_overlay_envelope() {
+        assert_eq!(
+            disclosure_surface_rect(280, 48, DISCLOSURE_PROGRESS_LIMIT),
+            RectI {
+                left: 0,
+                top: 1,
+                right: 280,
+                bottom: 47,
+            }
+        );
+    }
+
+    #[test]
+    fn disclosure_region_scales_shoulders_with_dpi() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 420,
+                bottom: 72,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 420,
+            client_height: 72,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Expanded),
+            WindowRegion {
+                left: 6,
+                top: 1,
+                right: 414,
+                bottom: 70,
+                shape: WindowRegionShape::Island {
+                    shoulder_start: 45,
+                    shoulder_depth: 15,
+                    shoulder_inset: 24,
+                    bottom_radius: 9,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn island_rows_curve_in_at_the_root_and_round_out_at_the_bottom() {
+        assert_eq!(island_row_inset(0, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(29, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(30, 272, 46, 30, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(31, 272, 46, 30, 10, 16, 6), 7);
+        assert_eq!(island_row_inset(35, 272, 46, 30, 10, 16, 6), 14);
+        assert_eq!(island_row_inset(39, 272, 46, 30, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(40, 272, 46, 30, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(45, 272, 46, 30, 10, 16, 6), 22);
+    }
+
+    #[test]
+    fn native_region_retry_key_changes_with_the_client_origin() {
+        let first = WindowMetrics {
+            window_rect: RectI {
+                left: -7,
+                top: -7,
+                right: 287,
+                bottom: 55,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let shifted = WindowMetrics {
+            client_screen_left: 1,
+            ..first
+        };
+
+        assert_ne!(
+            window_region(first, OverlayMode::Collapsed),
+            window_region(shifted, OverlayMode::Collapsed)
+        );
+    }
+
+    #[test]
+    fn caption_bounds_are_converted_from_window_relative_space() {
+        let window = RectI {
+            left: -7,
+            top: -7,
+            right: 1927,
+            bottom: 1147,
+        };
+        let frame = RectI {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1140,
+        };
+        let caption = RectI {
+            left: 1684,
+            top: 7,
+            right: 1927,
+            bottom: 53,
+        };
+        let geometry = caption_geometry(window, frame, Some(caption), 42).unwrap();
+        assert_eq!(geometry.band.top, 0);
+        assert_eq!(geometry.band.bottom, 46);
+        assert_eq!(geometry.buttons_left, 1677);
+    }
+
+    #[test]
+    fn expanded_surface_is_anchored_to_the_caption_bottom_edge() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 350,
+                bottom: 50,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 350,
+            client_height: 50,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: -7,
+                top: -7,
+                right: 1927,
+                bottom: 1147,
+            },
+            RectI {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1140,
+            },
+            Some(RectI {
+                left: 1684,
+                top: 7,
+                right: 1927,
+                bottom: 53,
+            }),
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let expanded = surface_rect(350, 50, OverlayMode::Expanded);
+        assert!(y + expanded.top >= 0);
+        // Caption bottom (46) plus the scaled 16px island drop (17px here).
+        assert_eq!(y + expanded.bottom, 63);
+    }
+
+    #[test]
+    fn inline_surface_ends_at_the_caption_bottom_without_a_drop() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            Some(RectI {
+                left: 1167,
+                top: 0,
+                right: 1313,
+                bottom: 30,
+            }),
+            overlay,
+            OverlayPresentation::InlineTitlebar,
+        );
+
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        // Preserve the one-logical-pixel DWM outline at the top of the 30px caption.
+        assert_eq!(y + inline.top, 21);
+        assert_eq!(y + inline.bottom, 50);
+    }
+
+    #[test]
+    fn inline_fallback_caption_also_preserves_the_top_frame_outline() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            None,
+            overlay,
+            OverlayPresentation::InlineTitlebar,
+        );
+
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        assert_eq!(y + inline.top, 21);
+        assert_eq!(y + inline.bottom, 50);
+    }
+
+    #[test]
+    fn thirty_pixel_caption_accepts_expanded_surface() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            Some(RectI {
+                left: 1167,
+                top: 0,
+                right: 1313,
+                bottom: 30,
+            }),
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 811,
+                y: 19,
+                compact: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_surface_is_clamped_inside_caption_safe_span() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 0,
+                top: 0,
+                right: 500,
+                bottom: 100,
+            },
+            RectI {
+                left: 0,
+                top: 0,
+                right: 500,
+                bottom: 100,
+            },
+            Some(RectI {
+                left: 260,
+                top: 0,
+                right: 400,
+                bottom: 46,
+            }),
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 89,
+                y: 15,
+                compact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_surface_hides_when_caption_safe_span_is_too_narrow() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            RectI {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            Some(RectI {
+                left: 51,
+                top: 0,
+                right: 100,
+                bottom: 46,
+            }),
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        assert_eq!(placement, OverlayPlacement::Hidden);
+    }
+
+    #[test]
+    fn negative_monitor_coordinates_remain_valid() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 821,
+                top: -1455,
+                right: 3090,
+                bottom: -44,
+            },
+            RectI {
+                left: 828,
+                top: -1448,
+                right: 3083,
+                bottom: -51,
+            },
+            Some(RectI {
+                left: 1990,
+                top: 7,
+                right: 2269,
+                bottom: 53,
+            }),
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+        assert!(matches!(placement, OverlayPlacement::Visible { .. }));
     }
 }
