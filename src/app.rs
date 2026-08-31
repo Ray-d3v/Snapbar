@@ -33,6 +33,10 @@ const DISCLOSURE_MAX_PRESENTATION: f32 = 1.044;
 const EXPANDED_CONTROL_GAP: f32 = 6.0;
 const STATUS_CONTROL_WIDTH: f32 = 82.0;
 const ACTION_CONTROL_SIZE: f32 = 30.0;
+const CONTROL_VISUAL_INSET: f32 = 1.0;
+const STATUS_VISUAL_WIDTH: f32 = STATUS_CONTROL_WIDTH - CONTROL_VISUAL_INSET * 2.0;
+const ACTION_VISUAL_SIZE: f32 = ACTION_CONTROL_SIZE - CONTROL_VISUAL_INSET * 2.0;
+const HOVER_CONTROLS_OFFSET_Y: f32 = -CONTROL_VISUAL_INSET;
 const EXPANDED_CONTROLS_WIDTH: f32 =
     STATUS_CONTROL_WIDTH + ACTION_CONTROL_SIZE * 4.0 + EXPANDED_CONTROL_GAP * 4.0;
 const IDLE_CAPTURE_CENTER_X: f32 = -COLLAPSED_WIDTH / 2.0 + COMPACT_WIDTH + COMPACT_WIDTH / 2.0;
@@ -687,19 +691,27 @@ impl Render for Snapbar {
             .id("status-button")
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .justify_center()
             .w(px(STATUS_CONTROL_WIDTH))
-            .h(px(28.0))
-            .px(px(8.0))
-            .rounded(px(11.0))
+            .h(px(ACTION_CONTROL_SIZE))
             .cursor_pointer()
             .text_xs()
             .text_color(primary_text)
-            .hover(move |button| button.bg(rgb(palette.status_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_refresh_clicked))
-            .child(div().size(px(7.0)).rounded_full().bg(status_color))
-            .child(self.status_label());
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .w(px(STATUS_VISUAL_WIDTH))
+                    .h(px(ACTION_VISUAL_SIZE))
+                    .px(px(8.0))
+                    .rounded(px(11.0))
+                    .hover(move |button| button.bg(rgb(palette.status_hover)))
+                    .child(div().size(px(7.0)).rounded_full().bg(status_color))
+                    .child(self.status_label()),
+            );
 
         let capture = div()
             .id("capture-button")
@@ -707,9 +719,6 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(ACTION_CONTROL_SIZE))
-            .rounded_full()
-            .bg(capture_background)
-            .shadow_sm()
             .when(can_capture, |button| {
                 button
                     .cursor_pointer()
@@ -719,14 +728,21 @@ impl Render for Snapbar {
             })
             .when(!can_capture, |button| button.opacity(0.66))
             .child(
-                svg()
-                    .path("icons/camera.svg")
-                    .size(px(17.0))
-                    .text_color(if can_capture {
-                        rgb(0xffffff)
-                    } else {
-                        rgb(palette.disabled_icon)
-                    }),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ACTION_VISUAL_SIZE))
+                    .rounded_full()
+                    .bg(capture_background)
+                    .shadow_sm()
+                    .child(svg().path("icons/camera.svg").size(px(17.0)).text_color(
+                        if can_capture {
+                            rgb(0xffffff)
+                        } else {
+                            rgb(palette.disabled_icon)
+                        },
+                    )),
             );
 
         let save = div()
@@ -735,29 +751,36 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(ACTION_CONTROL_SIZE))
-            .rounded(px(10.0))
             .cursor_pointer()
-            .bg(if save_to_screenshots {
-                rgb(palette.save_background)
-            } else {
-                rgb(palette.control_background)
-            })
-            .hover(move |button| {
-                button.bg(if save_to_screenshots {
-                    rgb(palette.save_hover)
-                } else {
-                    rgb(palette.control_hover)
-                })
-            })
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_save_toggle_clicked))
-            .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
-                if save_to_screenshots {
-                    rgb(palette.save_icon)
-                } else {
-                    rgb(palette.control_icon)
-                },
-            ));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ACTION_VISUAL_SIZE))
+                    .rounded(px(9.0))
+                    .bg(if save_to_screenshots {
+                        rgb(palette.save_background)
+                    } else {
+                        rgb(palette.control_background)
+                    })
+                    .hover(move |button| {
+                        button.bg(if save_to_screenshots {
+                            rgb(palette.save_hover)
+                        } else {
+                            rgb(palette.control_hover)
+                        })
+                    })
+                    .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
+                        if save_to_screenshots {
+                            rgb(palette.save_icon)
+                        } else {
+                            rgb(palette.control_icon)
+                        },
+                    )),
+            );
 
         let refresh = div()
             .id("refresh-button")
@@ -765,17 +788,24 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(ACTION_CONTROL_SIZE))
-            .rounded(px(10.0))
             .cursor_pointer()
-            .bg(rgb(palette.control_background))
-            .hover(move |button| button.bg(rgb(palette.control_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(cx.listener(Self::on_refresh_clicked))
             .child(
-                svg()
-                    .path("icons/refresh.svg")
-                    .size(px(16.0))
-                    .text_color(rgb(palette.control_icon)),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ACTION_VISUAL_SIZE))
+                    .rounded(px(9.0))
+                    .bg(rgb(palette.control_background))
+                    .hover(move |button| button.bg(rgb(palette.control_hover)))
+                    .child(
+                        svg()
+                            .path("icons/refresh.svg")
+                            .size(px(16.0))
+                            .text_color(rgb(palette.control_icon)),
+                    ),
             );
 
         let quit = div()
@@ -784,22 +814,33 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(ACTION_CONTROL_SIZE))
-            .rounded(px(10.0))
             .cursor_pointer()
-            .bg(rgb(palette.control_background))
-            .hover(move |button| button.bg(rgb(palette.quit_hover)))
             .active(|button| button.opacity(0.72))
             .on_click(|_, _, cx| cx.quit())
             .child(
-                svg()
-                    .path("icons/power.svg")
-                    .size(px(16.0))
-                    .text_color(rgb(palette.danger_icon)),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ACTION_VISUAL_SIZE))
+                    .rounded(px(9.0))
+                    .bg(rgb(palette.control_background))
+                    .hover(move |button| button.bg(rgb(palette.quit_hover)))
+                    .child(
+                        svg()
+                            .path("icons/power.svg")
+                            .size(px(16.0))
+                            .text_color(rgb(palette.danger_icon)),
+                    ),
             );
 
         let expanded_content = div()
             .absolute()
-            .top(px(0.0))
+            .top(px(if presentation.is_inline() {
+                0.0
+            } else {
+                HOVER_CONTROLS_OFFSET_Y
+            }))
             .left(relative(0.5))
             .ml(px(-EXPANDED_WIDTH / 2.0 + EXPANDED_CONTENT_SHIFT_X))
             .flex()
@@ -1050,5 +1091,21 @@ mod tests {
         let controls_right = controls_left + EXPANDED_CONTROLS_WIDTH;
         assert!(controls_left >= -EXPANDED_WIDTH / 2.0);
         assert!(controls_right <= EXPANDED_WIDTH / 2.0);
+    }
+
+    #[test]
+    fn expanded_controls_gain_visual_padding_without_shrinking_hit_targets() {
+        assert_eq!(ACTION_CONTROL_SIZE, 30.0);
+        assert_eq!(ACTION_VISUAL_SIZE, 28.0);
+        assert_eq!(STATUS_CONTROL_WIDTH, 82.0);
+        assert_eq!(STATUS_VISUAL_WIDTH, 80.0);
+        assert_eq!(EXPANDED_CONTROL_GAP + CONTROL_VISUAL_INSET * 2.0, 8.0);
+
+        let visual_top = (HOVER_ISLAND_HEIGHT - ACTION_CONTROL_SIZE) / 2.0
+            + CONTROL_VISUAL_INSET
+            + HOVER_CONTROLS_OFFSET_Y;
+        let visual_bottom_margin = HOVER_ISLAND_HEIGHT - visual_top - ACTION_VISUAL_SIZE;
+        assert_eq!(visual_top, 7.5);
+        assert_eq!(visual_bottom_margin, 9.5);
     }
 }
