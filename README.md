@@ -69,13 +69,13 @@ Snapbarは会議コンテンツの上へ常時重ねず、Teamsの**タイトル
 
 ### 通常時
 
-- 約`92 × 30px`の領域を、最小化・最大化ボタンと同じ考え方の`46px`幅セル2個としてタイトルバー内へ収めます。
+- 30pxのタイトルバー帯の上端1 logical pxをWindowsの外周線用に残し、その下の約`92 × 29px`を、最小化・最大化ボタンと同じ考え方の`46px`幅セル2個として収めます。
 - 背景、影、ラベル、下方向のせり出しは表示せず、状態ドットと`16px`のカメラアイコンだけをタイトルバー上へ置きます。
-- ホバー入力範囲はこの`92 × 30px`の矩形と一致し、Teamsタイトルバーの縦幅を上端から下端まで覆います。左右の領域はTeamsへ透過するため、ウィンドウのドラッグを妨げません。
+- ホバー入力範囲はこの`92 × 29px`の矩形と一致します。上端の外周線と左右の領域はTeamsへ透過するため、枠線の描画やウィンドウのドラッグを妨げません。
 
 ### ホバー時
 
-約16ms（60Hz表示の約1フレーム）ホバーすると、タイトルバーへ接続したまま中央を基準に、Dynamic Island風の操作列へ約`272 × 46px`まで展開します。展開面はTeamsタイトルバーの実表示色へ追従し、ライトテーマでは暗い文字と操作面、ダークテーマでは明るい文字と操作面へ自動反転します。タイトルバー下端から根本が四分円状に内側へカーブし、同色の面が約`16px`下へ膨らみます。形状と内容は約150〜200msで展開し、ピークでわずかに膨らんでから約300msまでに収束します。下へ別メニューは開かず、中央の安全領域からも動きません。
+約16ms（60Hz表示の約1フレーム）ホバーすると、タイトルバーへ接続したまま中央を基準に、Dynamic Island風の操作列へ固定`272 × 46px`エンベロープ内で展開します。上端1 logical pxは終始透明に保ち、可視面を最大`272 × 45px`（タイトルバー内29px＋下方向16px）へ制限するため、Teamsの上部枠線は待機時・展開中・縮小中も消えません。展開面はTeamsタイトルバーの実表示色へ追従し、ライトテーマでは暗い文字と操作面、ダークテーマでは明るい文字と操作面へ自動反転します。タイトルバー下端から根本が四分円状に内側へカーブし、同色の面が約`16px`下へ膨らみます。形状と内容は約150〜200msで展開し、ピークでわずかに膨らんでから約300msまでに収束します。下へ別メニューは開かず、中央の安全領域からも動きません。
 
 未ホバー時のカメラアイコンと展開後の赤い撮影ボタンは、同じX座標へ固定しています。ホバー後もカーソルを横へ追い直す必要はありません。
 
@@ -203,9 +203,9 @@ Resident Snapbar process
 │  └─ debounced join / leave state
 └─ hidden GPUI title-bar control
    └─ active meeting detected → follow Teams title bar
-      ├─ default → 92 × 30 cells, 16 ms hover → 272 × 46 curved-root island
+      ├─ default → 92 × 29 cells, 16 ms hover → 272 × 45 visible island in a 272 × 46 envelope
       ├─ --inline-titlebar → 92 × 29 → 272 × 29 disclosure below the frame outline
-      ├─ narrow title bar → 46 × 30 camera-only caption cell
+      ├─ narrow title bar → 46 × 29 camera-only caption cell
       └─ shared content detected → start Windows Graphics Capture
          ├─ authoritative UIA shared-content BoundingRectangle
          ├─ cropped-only reusable CPU buffer

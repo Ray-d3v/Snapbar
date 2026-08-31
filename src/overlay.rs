@@ -66,10 +66,12 @@ pub const COLLAPSED_HEIGHT: f32 = 30.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
 pub const EXPANDED_HEIGHT: f32 = 46.0;
 pub const INLINE_WIDTH: f32 = EXPANDED_WIDTH;
-pub const INLINE_FRAME_INSET: f32 = 1.0;
-pub const INLINE_HEIGHT: f32 = COLLAPSED_HEIGHT - INLINE_FRAME_INSET;
+pub const TITLEBAR_FRAME_INSET: f32 = 1.0;
+pub const TITLEBAR_SURFACE_HEIGHT: f32 = COLLAPSED_HEIGHT - TITLEBAR_FRAME_INSET;
+pub const HOVER_ISLAND_HEIGHT: f32 = EXPANDED_HEIGHT - TITLEBAR_FRAME_INSET;
+pub const INLINE_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const COMPACT_WIDTH: f32 = 46.0;
-pub const COMPACT_HEIGHT: f32 = 30.0;
+pub const COMPACT_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
 pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
 pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
@@ -86,7 +88,8 @@ pub fn disclosure_width(progress: f32) -> f32 {
 }
 
 pub fn disclosure_height(progress: f32) -> f32 {
-    COLLAPSED_HEIGHT + (EXPANDED_HEIGHT - COLLAPSED_HEIGHT) * progress.clamp(0.0, 1.0)
+    TITLEBAR_SURFACE_HEIGHT
+        + (HOVER_ISLAND_HEIGHT - TITLEBAR_SURFACE_HEIGHT) * progress.clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -184,8 +187,8 @@ impl OverlayMode {
     pub const fn logical_height(self) -> f32 {
         match self {
             #[cfg(test)]
-            Self::Collapsed => COLLAPSED_HEIGHT,
-            Self::Expanded => EXPANDED_HEIGHT,
+            Self::Collapsed => TITLEBAR_SURFACE_HEIGHT,
+            Self::Expanded => HOVER_ISLAND_HEIGHT,
             Self::Inline => INLINE_HEIGHT,
             #[cfg(test)]
             Self::Compact => COMPACT_HEIGHT,
@@ -1291,8 +1294,12 @@ fn window_region_for_progress(
     let shape = if compact || presentation.is_inline() || progress == 0 {
         WindowRegionShape::Rectangle
     } else {
-        let caption_height = scale_logical(COLLAPSED_HEIGHT, metrics.client_height, WINDOW_HEIGHT)
-            .clamp(1, hover.height());
+        let caption_height = scale_logical(
+            TITLEBAR_SURFACE_HEIGHT,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(1, hover.height());
         let animated_drop = hover.height().saturating_sub(caption_height);
         let bottom_radius = scale_logical(
             ISLAND_BOTTOM_RADIUS * normalized,
@@ -1551,14 +1558,11 @@ fn calculate_placement(
     } else {
         scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, full_height)
     };
-    let caption_fallback_height = if presentation.is_inline() {
-        // The visible inline surface is one logical pixel shorter than the caption.
-        // Keep the fallback caption at its full height so bottom anchoring leaves the
-        // DWM outer frame visible at the top.
-        scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24)
-    } else {
-        full_height.saturating_sub(island_drop).max(24)
-    };
+    // Every presentation reserves one logical pixel above its visible surface for the
+    // DWM outer frame. Keep the fallback caption at its full nominal height so bottom
+    // anchoring leaves that outline unobscured.
+    let caption_fallback_height =
+        scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24);
     let Some(caption) = caption_geometry(
         target_window,
         target_frame,
@@ -1853,7 +1857,7 @@ mod tests {
                 left: 94,
                 top: 1,
                 right: 186,
-                bottom: 31,
+                bottom: 30,
             }
         );
         assert_eq!(
@@ -1862,7 +1866,7 @@ mod tests {
                 left: 4,
                 top: 1,
                 right: 276,
-                bottom: 47,
+                bottom: 46,
             }
         );
         assert_eq!(
@@ -1880,7 +1884,7 @@ mod tests {
                 left: 117,
                 top: 1,
                 right: 163,
-                bottom: 31,
+                bottom: 30,
             }
         );
     }
@@ -1909,7 +1913,7 @@ mod tests {
                 left: 141,
                 top: 1,
                 right: 279,
-                bottom: 46,
+                bottom: 45,
             }
         );
     }
@@ -1935,7 +1939,7 @@ mod tests {
                 left: 101,
                 top: 8,
                 right: 193,
-                bottom: 38,
+                bottom: 37,
                 shape: WindowRegionShape::Rectangle,
             }
         );
@@ -1964,7 +1968,7 @@ mod tests {
         assert_eq!(
             expanded.shape,
             WindowRegionShape::Island {
-                shoulder_start: 30,
+                shoulder_start: 29,
                 shoulder_depth: 10,
                 shoulder_inset: 16,
                 bottom_radius: 6,
@@ -1975,9 +1979,9 @@ mod tests {
     #[test]
     fn disclosure_geometry_grows_from_the_center_without_moving_the_top_anchor() {
         assert_eq!(disclosure_width(0.0), COLLAPSED_WIDTH);
-        assert_eq!(disclosure_height(0.0), COLLAPSED_HEIGHT);
+        assert_eq!(disclosure_height(0.0), TITLEBAR_SURFACE_HEIGHT);
         assert_eq!(disclosure_width(1.0), EXPANDED_WIDTH);
-        assert_eq!(disclosure_height(1.0), EXPANDED_HEIGHT);
+        assert_eq!(disclosure_height(1.0), HOVER_ISLAND_HEIGHT);
 
         let halfway = disclosure_surface_rect(280, 48, 500);
         assert_eq!(
@@ -1986,7 +1990,7 @@ mod tests {
                 left: 49,
                 top: 1,
                 right: 231,
-                bottom: 39,
+                bottom: 38,
             }
         );
         assert_eq!(halfway.center_x(), 140);
@@ -2085,7 +2089,7 @@ mod tests {
                 left: 0,
                 top: 1,
                 right: 280,
-                bottom: 47,
+                bottom: 46,
             }
         );
     }
@@ -2111,9 +2115,9 @@ mod tests {
                 left: 6,
                 top: 1,
                 right: 414,
-                bottom: 70,
+                bottom: 69,
                 shape: WindowRegionShape::Island {
-                    shoulder_start: 45,
+                    shoulder_start: 44,
                     shoulder_depth: 15,
                     shoulder_inset: 24,
                     bottom_radius: 9,
@@ -2124,14 +2128,14 @@ mod tests {
 
     #[test]
     fn island_rows_curve_in_at_the_root_and_round_out_at_the_bottom() {
-        assert_eq!(island_row_inset(0, 272, 46, 30, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(29, 272, 46, 30, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(30, 272, 46, 30, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(31, 272, 46, 30, 10, 16, 6), 7);
-        assert_eq!(island_row_inset(35, 272, 46, 30, 10, 16, 6), 14);
-        assert_eq!(island_row_inset(39, 272, 46, 30, 10, 16, 6), 16);
-        assert_eq!(island_row_inset(40, 272, 46, 30, 10, 16, 6), 16);
-        assert_eq!(island_row_inset(45, 272, 46, 30, 10, 16, 6), 22);
+        assert_eq!(island_row_inset(0, 272, 45, 29, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(28, 272, 45, 29, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(29, 272, 45, 29, 10, 16, 6), 0);
+        assert_eq!(island_row_inset(30, 272, 45, 29, 10, 16, 6), 7);
+        assert_eq!(island_row_inset(34, 272, 45, 29, 10, 16, 6), 14);
+        assert_eq!(island_row_inset(38, 272, 45, 29, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(39, 272, 45, 29, 10, 16, 6), 16);
+        assert_eq!(island_row_inset(44, 272, 45, 29, 10, 16, 6), 22);
     }
 
     #[test]
@@ -2320,7 +2324,51 @@ mod tests {
     }
 
     #[test]
-    fn thirty_pixel_caption_accepts_expanded_surface() {
+    fn hover_island_fallback_caption_also_preserves_the_top_frame_outline() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            None,
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let collapsed = surface_rect(280, 48, OverlayMode::Collapsed);
+        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        assert_eq!(y + collapsed.top, 21);
+        assert_eq!(y + collapsed.bottom, 50);
+        assert_eq!(y + expanded.top, 21);
+        assert_eq!(y + expanded.bottom, 66);
+    }
+
+    #[test]
+    fn hover_island_preserves_the_top_frame_outline_on_a_thirty_pixel_caption() {
         let overlay = WindowMetrics {
             window_rect: RectI {
                 left: 812,
@@ -2360,10 +2408,20 @@ mod tests {
             placement,
             OverlayPlacement::Visible {
                 x: 811,
-                y: 19,
+                y: 20,
                 compact: false,
             }
         );
+
+        let OverlayPlacement::Visible { y, .. } = placement else {
+            unreachable!();
+        };
+        let collapsed = surface_rect(280, 48, OverlayMode::Collapsed);
+        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        assert_eq!(y + collapsed.top, 21);
+        assert_eq!(y + collapsed.bottom, 50);
+        assert_eq!(y + expanded.top, 21);
+        assert_eq!(y + expanded.bottom, 66);
     }
 
     #[test]
@@ -2407,7 +2465,7 @@ mod tests {
             placement,
             OverlayPlacement::Visible {
                 x: 89,
-                y: 15,
+                y: 16,
                 compact: true,
             }
         );

@@ -7,9 +7,10 @@ use crate::{
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
-        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR, EXPANDED_HEIGHT,
-        EXPANDED_WIDTH, INLINE_HEIGHT, INLINE_WIDTH, OverlayCaptureMode, OverlayPresentation,
-        TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH, disclosure_height, disclosure_width,
+        COLLAPSED_WIDTH, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR, EXPANDED_HEIGHT, EXPANDED_WIDTH,
+        HOVER_ISLAND_HEIGHT, INLINE_HEIGHT, INLINE_WIDTH, OverlayCaptureMode, OverlayPresentation,
+        TITLEBAR_SURFACE_HEIGHT, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
+        disclosure_height, disclosure_width,
     },
     resident::ResidentController,
     settings::AppSettings,
@@ -596,13 +597,9 @@ impl Render for Snapbar {
         let presentation_height = if presentation.is_inline() {
             INLINE_HEIGHT
         } else {
-            EXPANDED_HEIGHT
+            HOVER_ISLAND_HEIGHT
         };
-        let caption_cell_height = if presentation.is_inline() {
-            INLINE_HEIGHT
-        } else {
-            COLLAPSED_HEIGHT
-        };
+        let caption_cell_height = TITLEBAR_SURFACE_HEIGHT;
         let save_to_screenshots = self.settings.save_to_screenshots;
         let palette = TitlebarPalette::for_surface(self.titlebar_color);
         let status_color = self.status_color(palette.is_light);
