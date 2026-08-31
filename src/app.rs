@@ -7,9 +7,9 @@ use crate::{
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
-        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_HEIGHT, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR,
-        EXPANDED_HEIGHT, EXPANDED_WIDTH, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
-        disclosure_height, disclosure_width,
+        COLLAPSED_HEIGHT, COLLAPSED_WIDTH, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR, EXPANDED_HEIGHT,
+        EXPANDED_WIDTH, INLINE_HEIGHT, INLINE_WIDTH, OverlayCaptureMode, OverlayPresentation,
+        TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH, disclosure_height, disclosure_width,
     },
     resident::ResidentController,
     settings::AppSettings,
@@ -24,6 +24,9 @@ use gpui_platform::application;
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const DISCLOSURE_SPRING_STIFFNESS: f32 = 900.0;
 const DISCLOSURE_SPRING_DAMPING: f32 = 46.0;
+const INLINE_DISCLOSURE_SPRING_STIFFNESS: f32 = 360.0;
+const INLINE_DISCLOSURE_SPRING_DAMPING: f32 = 28.0;
+const INLINE_DISCLOSURE_BOUNCE_RESTITUTION: f32 = 0.55;
 const DISCLOSURE_OVERSHOOT_GAIN: f32 = 2.0;
 const DISCLOSURE_MAX_PRESENTATION: f32 = 1.044;
 const EXPANDED_CONTROL_GAP: f32 = 6.0;
@@ -43,6 +46,32 @@ const EXPANDED_CONTENT_SHIFT_X: f32 = IDLE_CAPTURE_CENTER_X - EXPANDED_CAPTURE_C
 fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
     let phase = ((value - start) / (end - start)).clamp(0.0, 1.0);
     phase * phase * (3.0 - 2.0 * phase)
+}
+
+fn disclosure_spring_config(presentation: OverlayPresentation) -> SpringConfig {
+    if presentation.is_inline() {
+        SpringConfig::new(
+            INLINE_DISCLOSURE_SPRING_STIFFNESS,
+            INLINE_DISCLOSURE_SPRING_DAMPING,
+            1.0,
+        )
+    } else {
+        SpringConfig::new(DISCLOSURE_SPRING_STIFFNESS, DISCLOSURE_SPRING_DAMPING, 1.0)
+    }
+}
+
+fn inline_disclosure_progress(spring_position: f32) -> f32 {
+    if spring_position <= 1.0 {
+        spring_position.clamp(0.0, 1.0)
+    } else {
+        // Keep the title-bar silhouette bounded while retaining the tiny elastic
+        // settle that makes the Dynamic Island motion feel alive.
+        (1.0 - (spring_position - 1.0) * INLINE_DISCLOSURE_BOUNCE_RESTITUTION).max(0.0)
+    }
+}
+
+fn expanded_control_gap(content_progress: f32) -> f32 {
+    EXPANDED_CONTROL_GAP * smoothstep_between(0.12, 0.94, content_progress)
 }
 
 fn mix_rgb(base: u32, target: u32, amount: f32) -> u32 {
@@ -144,7 +173,24 @@ enum CaptureState {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DisclosureAnimationState {
+    generation: u64,
+    start: f32,
+}
+
+impl DisclosureAnimationState {
+    fn retarget(&mut self, current_progress: f32) {
+        // A new element id keeps the current visual position but intentionally
+        // drops velocity inherited from the opposite hover direction.
+        self.generation = self.generation.wrapping_add(1);
+        self.start = current_progress.clamp(0.0, DISCLOSURE_MAX_PRESENTATION);
+    }
+}
+
 struct Snapbar {
+    presentation: OverlayPresentation,
+    capture_mode: OverlayCaptureMode,
     targets: Vec<CaptureTarget>,
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
@@ -157,20 +203,28 @@ struct Snapbar {
     titlebar_color: u32,
     settings: AppSettings,
     expanded: bool,
+    disclosure_animation: DisclosureAnimationState,
     capture_state: CaptureState,
     capture_generation: u64,
     last_error: Option<String>,
 }
 
 impl Snapbar {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let follower = TeamsWindowFollower::start(window);
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        presentation: OverlayPresentation,
+        capture_mode: OverlayCaptureMode,
+    ) -> Self {
+        let follower = TeamsWindowFollower::start(window, presentation, capture_mode);
         let overlay_events = follower.as_ref().map(TeamsWindowFollower::subscribe);
         let titlebar_color = follower
             .as_ref()
             .map(TeamsWindowFollower::titlebar_color)
             .unwrap_or(DEFAULT_TITLEBAR_COLOR);
         let mut snapbar = Self {
+            presentation,
+            capture_mode,
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
@@ -183,6 +237,7 @@ impl Snapbar {
             titlebar_color,
             settings: AppSettings::load(),
             expanded: false,
+            disclosure_animation: DisclosureAnimationState::default(),
             capture_state: CaptureState::NoTarget,
             capture_generation: 0,
             last_error: None,
@@ -204,6 +259,16 @@ impl Snapbar {
         if let Some(follower) = &self.follower {
             follower.set_target(self.current_target().map(|target| target.id));
         }
+    }
+
+    fn retarget_disclosure(&mut self, expanded: bool, current_progress: f32) -> bool {
+        if self.expanded == expanded {
+            return false;
+        }
+
+        self.expanded = expanded;
+        self.disclosure_animation.retarget(current_progress);
+        true
     }
 
     fn start_resident_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -302,7 +367,7 @@ impl Snapbar {
         self.shared_content_hint = snapshot.shared_content_hint;
 
         if previous_id != next_id {
-            self.expanded = false;
+            self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             cx.notify();
         }
@@ -332,7 +397,7 @@ impl Snapbar {
                 self.capture_state = CaptureState::NoTarget;
                 self.last_error = None;
                 self.shared_content_hint = false;
-                self.expanded = false;
+                self.retarget_disclosure(false, 0.0);
                 self.compact_layout = false;
                 cx.notify();
                 self.sync_follower();
@@ -378,7 +443,7 @@ impl Snapbar {
     fn sync_overlay_state(&mut self) -> bool {
         let Some(follower) = self.follower.as_ref() else {
             let changed = self.expanded || self.compact_layout;
-            self.expanded = false;
+            self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             return changed;
         };
@@ -386,11 +451,12 @@ impl Snapbar {
         let compact = follower.is_compact();
         let expanded = follower.is_visible() && follower.is_expanded() && !compact;
         let titlebar_color = follower.titlebar_color();
+        let disclosure_progress = follower.disclosure_progress();
         let changed = self.compact_layout != compact
             || self.expanded != expanded
             || self.titlebar_color != titlebar_color;
         self.compact_layout = compact;
-        self.expanded = expanded;
+        self.retarget_disclosure(expanded, disclosure_progress);
         self.titlebar_color = titlebar_color;
         changed
     }
@@ -460,7 +526,10 @@ impl Snapbar {
 
                 match result {
                     Ok((receipt, save_result)) => {
-                        show_capture_flash(receipt.screen_rect);
+                        show_capture_flash(
+                            receipt.screen_rect,
+                            this.capture_mode.display_affinity(),
+                        );
                         let _ = receipt.frame_age;
                         let _ = receipt.latency;
                         this.capture_state = CaptureState::Copied;
@@ -518,6 +587,22 @@ impl Render for Snapbar {
             .as_ref()
             .is_some_and(CaptureEngine::is_ready)
             && self.capture_state != CaptureState::Capturing;
+        let presentation = self.presentation;
+        let presentation_width = if presentation.is_inline() {
+            INLINE_WIDTH
+        } else {
+            EXPANDED_WIDTH
+        };
+        let presentation_height = if presentation.is_inline() {
+            INLINE_HEIGHT
+        } else {
+            EXPANDED_HEIGHT
+        };
+        let caption_cell_height = if presentation.is_inline() {
+            INLINE_HEIGHT
+        } else {
+            COLLAPSED_HEIGHT
+        };
         let save_to_screenshots = self.settings.save_to_screenshots;
         let palette = TitlebarPalette::for_surface(self.titlebar_color);
         let status_color = self.status_color(palette.is_light);
@@ -550,7 +635,7 @@ impl Render for Snapbar {
                     .items_center()
                     .justify_center()
                     .w(px(COMPACT_WIDTH))
-                    .h(px(COMPACT_HEIGHT))
+                    .h(px(caption_cell_height))
                     .bg(idle_hit_surface)
                     .active(move |button| button.bg(idle_active_backplate))
                     .when(can_capture, |button| {
@@ -573,7 +658,7 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .w(px(COLLAPSED_WIDTH))
-            .h(px(COLLAPSED_HEIGHT))
+            .h(px(caption_cell_height))
             .child(
                 div()
                     .flex()
@@ -723,9 +808,8 @@ impl Render for Snapbar {
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(EXPANDED_CONTROL_GAP))
-            .w(px(EXPANDED_WIDTH))
-            .h(px(EXPANDED_HEIGHT))
+            .w(px(presentation_width))
+            .h(px(presentation_height))
             .px(px(7.0))
             .child(status)
             .child(save)
@@ -733,7 +817,9 @@ impl Render for Snapbar {
             .child(refresh)
             .child(quit);
 
-        let disclosure_target = self.expanded;
+        let disclosure_target = if self.expanded { 1.0 } else { 0.0 };
+        let disclosure_start = self.disclosure_animation.start;
+        let disclosure_generation = self.disclosure_animation.generation;
         let progress_publisher = self
             .follower
             .as_ref()
@@ -745,18 +831,16 @@ impl Render for Snapbar {
             .h(px(EXPANDED_HEIGHT))
             .bg(transparent_black())
             .with_spring(
-                "titlebar-disclosure-spring",
-                SpringAnimation::new(SpringConfig::new(
-                    DISCLOSURE_SPRING_STIFFNESS,
-                    DISCLOSURE_SPRING_DAMPING,
-                    1.0,
-                ))
-                .to(disclosure_target)
-                .from(false)
-                .with_epsilon(0.001),
-                move |surface, phase| {
-                    let spring_position = phase.0.max(0.0);
-                    let progress = if spring_position > 1.0 {
+                ("titlebar-disclosure-spring", disclosure_generation),
+                SpringAnimation::new(disclosure_spring_config(presentation))
+                    .to(disclosure_target)
+                    .from(disclosure_start)
+                    .with_epsilon(0.001),
+                move |surface, spring_position| {
+                    let spring_position = spring_position.max(0.0);
+                    let progress = if presentation.is_inline() {
+                        inline_disclosure_progress(spring_position)
+                    } else if spring_position > 1.0 {
                         1.0 + (spring_position - 1.0) * DISCLOSURE_OVERSHOOT_GAIN
                     } else {
                         spring_position
@@ -768,12 +852,17 @@ impl Render for Snapbar {
                     }
 
                     let surface_width = disclosure_width(progress);
-                    let surface_height = disclosure_height(progress);
+                    let surface_height = if presentation.is_inline() {
+                        INLINE_HEIGHT
+                    } else {
+                        disclosure_height(progress)
+                    };
                     let surface_alpha = (1.0 / 255.0
                         + (254.0 / 255.0) * smoothstep_between(0.0, 0.22, content_progress))
                     .clamp(1.0 / 255.0, 1.0);
                     let idle_alpha = 1.0 - smoothstep_between(0.12, 0.62, content_progress);
-                    let expanded_alpha = smoothstep_between(0.58, 0.92, content_progress);
+                    let expanded_alpha = smoothstep_between(0.16, 0.86, content_progress);
+                    let control_gap = expanded_control_gap(content_progress);
 
                     surface
                         .child(
@@ -791,8 +880,12 @@ impl Render for Snapbar {
                         .when(content_progress < 0.72, |surface| {
                             surface.child(idle_content.opacity(idle_alpha))
                         })
-                        .when(content_progress > 0.58, |surface| {
-                            surface.child(expanded_content.opacity(expanded_alpha))
+                        .when(content_progress > 0.12, |surface| {
+                            surface.child(
+                                expanded_content
+                                    .gap(px(control_gap))
+                                    .opacity(expanded_alpha),
+                            )
                         })
                 },
             );
@@ -817,13 +910,19 @@ impl Render for Snapbar {
 }
 
 pub fn run() {
-    application().with_assets(Assets).run(|cx: &mut App| {
+    let presentation = OverlayPresentation::from_command_line();
+    let capture_mode = OverlayCaptureMode::from_command_line();
+    application().with_assets(Assets).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
                 focus: false,
+                // This popup intentionally never activates. GPUI otherwise throttles
+                // inactive windows to 33.3 ms frames, which makes hover disclosure
+                // render at roughly 30 fps even on a high-refresh-rate display.
+                inactive_frame_interval: None,
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
@@ -832,7 +931,7 @@ pub fn run() {
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Snapbar::new(window, cx)),
+            move |window, cx| cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode)),
         )
         .expect("Snapbar window could not be created");
 
@@ -887,6 +986,65 @@ mod tests {
         let expanded_capture_center =
             EXPANDED_CAPTURE_CENTER_X_UNSHIFTED + EXPANDED_CONTENT_SHIFT_X;
         assert_eq!(expanded_capture_center, IDLE_CAPTURE_CENTER_X);
+    }
+
+    #[test]
+    fn inline_disclosure_has_a_visible_showcase_phase_before_reaching_the_row() {
+        let state = gpui::SpringState {
+            position: 0.0,
+            velocity: 0.0,
+        };
+        let spring = disclosure_spring_config(OverlayPresentation::InlineTitlebar);
+        let position_after_100ms = spring.step(state, 1.0, 0.1);
+        let position_after_180ms = spring.step(state, 1.0, 0.18);
+
+        assert!((0.62..=0.78).contains(&position_after_100ms.position));
+        assert!((0.98..=1.03).contains(&position_after_180ms.position));
+    }
+
+    #[test]
+    fn disclosure_retarget_keeps_position_but_starts_a_fresh_spring_generation() {
+        let mut animation = DisclosureAnimationState::default();
+        animation.retarget(0.63);
+
+        assert_eq!(animation.generation, 1);
+        assert_eq!(animation.start, 0.63);
+
+        animation.retarget(0.41);
+        assert_eq!(animation.generation, 2);
+        assert_eq!(animation.start, 0.41);
+    }
+
+    #[test]
+    fn expanded_controls_begin_fanning_before_the_old_disclosure_threshold() {
+        assert_eq!(expanded_control_gap(0.0), 0.0);
+        assert!(expanded_control_gap(0.42) > 0.0);
+        assert!(smoothstep_between(0.16, 0.86, 0.42) > 0.0);
+    }
+
+    #[test]
+    fn inline_disclosure_keeps_a_bounded_elastic_settle() {
+        assert_eq!(inline_disclosure_progress(1.0), 1.0);
+        assert!(inline_disclosure_progress(1.04) < 1.0);
+        assert!(inline_disclosure_progress(1.04) > 0.96);
+        assert!(inline_disclosure_progress(1.2) <= 1.0);
+    }
+
+    #[test]
+    fn expanded_controls_fan_out_without_moving_the_capture_anchor() {
+        let capture_center = |gap: f32| {
+            let controls_width = STATUS_CONTROL_WIDTH + ACTION_CONTROL_SIZE * 4.0 + gap * 4.0;
+            -controls_width / 2.0
+                + STATUS_CONTROL_WIDTH
+                + gap
+                + ACTION_CONTROL_SIZE
+                + gap
+                + ACTION_CONTROL_SIZE / 2.0
+        };
+
+        assert_eq!(expanded_control_gap(0.0), 0.0);
+        assert_eq!(expanded_control_gap(1.0), EXPANDED_CONTROL_GAP);
+        assert_eq!(capture_center(0.0), capture_center(EXPANDED_CONTROL_GAP));
     }
 
     #[test]

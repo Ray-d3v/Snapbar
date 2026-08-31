@@ -11,7 +11,7 @@ use windows::{
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, SW_SHOWNOACTIVATE,
             SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-            SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_STYLE, WS_EX_LAYERED,
+            SetWindowPos, ShowWindow, WINDOW_DISPLAY_AFFINITY, WINDOW_STYLE, WS_EX_LAYERED,
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
@@ -24,14 +24,14 @@ const SS_WHITERECT_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0000_0006);
 const FLASH_ALPHAS: [u8; 8] = [210, 210, 176, 136, 94, 56, 24, 0];
 const FLASH_STEP: Duration = Duration::from_millis(28);
 
-pub fn show_capture_flash(rect: ScreenRect) {
+pub fn show_capture_flash(rect: ScreenRect, display_affinity: WINDOW_DISPLAY_AFFINITY) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
     let _ = thread::Builder::new()
         .name("snapbar-flash".to_string())
         .spawn(move || {
-            let _ = flash_window(rect);
+            let _ = flash_window(rect, display_affinity);
         });
 }
 
@@ -87,7 +87,10 @@ pub(super) fn current_screen_rect(
     })
 }
 
-fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
+fn flash_window(
+    rect: ScreenRect,
+    display_affinity: WINDOW_DISPLAY_AFFINITY,
+) -> windows::core::Result<()> {
     let module = unsafe { GetModuleHandleW(None)? };
     let instance = HINSTANCE(module.0);
     let ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
@@ -110,7 +113,7 @@ fn flash_window(rect: ScreenRect) -> windows::core::Result<()> {
     };
 
     unsafe {
-        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let _ = SetWindowDisplayAffinity(hwnd, display_affinity);
         SetLayeredWindowAttributes(hwnd, COLORREF(0), FLASH_ALPHAS[0], LWA_ALPHA)?;
         SetWindowPos(
             hwnd,

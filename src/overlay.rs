@@ -27,14 +27,14 @@ use windows::Win32::{
         IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
         SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
-const EXPAND_DELAY_MS: u32 = 50;
+const EXPAND_DELAY_MS: u32 = 16;
 const COLLAPSE_DELAY_MS: u32 = 50;
 const SAFETY_INTERVAL_MS: u32 = 250;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
@@ -65,6 +65,9 @@ pub const COLLAPSED_WIDTH: f32 = 92.0;
 pub const COLLAPSED_HEIGHT: f32 = 30.0;
 pub const EXPANDED_WIDTH: f32 = 272.0;
 pub const EXPANDED_HEIGHT: f32 = 46.0;
+pub const INLINE_WIDTH: f32 = EXPANDED_WIDTH;
+pub const INLINE_FRAME_INSET: f32 = 1.0;
+pub const INLINE_HEIGHT: f32 = COLLAPSED_HEIGHT - INLINE_FRAME_INSET;
 pub const COMPACT_WIDTH: f32 = 46.0;
 pub const COMPACT_HEIGHT: f32 = 30.0;
 pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
@@ -86,11 +89,83 @@ pub fn disclosure_height(progress: f32) -> f32 {
     COLLAPSED_HEIGHT + (EXPANDED_HEIGHT - COLLAPSED_HEIGHT) * progress.clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayPresentation {
+    #[default]
+    HoverIsland,
+    InlineTitlebar,
+}
+
+impl OverlayPresentation {
+    pub const fn is_inline(self) -> bool {
+        matches!(self, Self::InlineTitlebar)
+    }
+
+    pub fn from_command_line() -> Self {
+        Self::from_arguments(std::env::args())
+    }
+
+    fn from_arguments<I, S>(arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if arguments.into_iter().any(|argument| {
+            matches!(
+                argument.as_ref().to_str(),
+                Some("--inline") | Some("--inline-titlebar")
+            )
+        }) {
+            Self::InlineTitlebar
+        } else {
+            Self::HoverIsland
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayCaptureMode {
+    #[default]
+    Excluded,
+    Recordable,
+}
+
+impl OverlayCaptureMode {
+    pub fn from_command_line() -> Self {
+        Self::from_arguments(std::env::args_os(), cfg!(debug_assertions))
+    }
+
+    fn from_arguments<I, S>(arguments: I, debug_build: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if debug_build
+            || arguments
+                .into_iter()
+                .any(|argument| matches!(argument.as_ref().to_str(), Some("--recordable-overlay")))
+        {
+            Self::Recordable
+        } else {
+            Self::Excluded
+        }
+    }
+
+    pub(crate) const fn display_affinity(self) -> WINDOW_DISPLAY_AFFINITY {
+        match self {
+            Self::Excluded => WDA_EXCLUDEFROMCAPTURE,
+            Self::Recordable => WDA_NONE,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverlayMode {
     #[cfg(test)]
     Collapsed,
     Expanded,
+    Inline,
+    #[cfg(test)]
     Compact,
 }
 
@@ -100,6 +175,8 @@ impl OverlayMode {
             #[cfg(test)]
             Self::Collapsed => COLLAPSED_WIDTH,
             Self::Expanded => EXPANDED_WIDTH,
+            Self::Inline => INLINE_WIDTH,
+            #[cfg(test)]
             Self::Compact => COMPACT_WIDTH,
         }
     }
@@ -109,6 +186,8 @@ impl OverlayMode {
             #[cfg(test)]
             Self::Collapsed => COLLAPSED_HEIGHT,
             Self::Expanded => EXPANDED_HEIGHT,
+            Self::Inline => INLINE_HEIGHT,
+            #[cfg(test)]
             Self::Compact => COMPACT_HEIGHT,
         }
     }
@@ -792,7 +871,11 @@ pub struct TeamsWindowFollower {
 }
 
 impl TeamsWindowFollower {
-    pub fn start(window: &Window) -> Option<Self> {
+    pub fn start(
+        window: &Window,
+        presentation: OverlayPresentation,
+        capture_mode: OverlayCaptureMode,
+    ) -> Option<Self> {
         let overlay_hwnd = window_hwnd(window)?;
         configure_overlay_window(overlay_hwnd);
         unsafe {
@@ -808,14 +891,14 @@ impl TeamsWindowFollower {
         let stop = Arc::new(AtomicBool::new(false));
         let (wake_tx, wake_rx) = sync_channel(1);
         let (event_tx, event_rx) = async_channel::bounded(1);
-        let native_hover = NativeHoverSubclass::install(
+        let native_hover = Some(NativeHoverSubclass::install(
             overlay_hwnd,
             Arc::clone(&expanded),
             Arc::clone(&compact),
             Arc::clone(&visible),
             wake_tx.clone(),
             event_tx.clone(),
-        )?;
+        )?);
 
         let thread_target_id = Arc::clone(&target_id);
         let thread_titlebar_color = Arc::clone(&titlebar_color);
@@ -825,13 +908,15 @@ impl TeamsWindowFollower {
         let thread_visible = Arc::clone(&visible);
         let thread_stop = Arc::clone(&stop);
         let thread_event_tx = event_tx.clone();
+        let thread_presentation = presentation;
+        let display_affinity = capture_mode.display_affinity();
         let overlay_value = overlay_hwnd.0 as isize;
         let worker = thread::Builder::new()
             .name("snapbar-window-follow".to_string())
             .spawn(move || {
                 let overlay_hwnd = HWND(overlay_value as *mut c_void);
                 unsafe {
-                    let _ = SetWindowDisplayAffinity(overlay_hwnd, WDA_EXCLUDEFROMCAPTURE);
+                    let _ = SetWindowDisplayAffinity(overlay_hwnd, display_affinity);
                 }
 
                 let mut previous_placement = None;
@@ -846,7 +931,7 @@ impl TeamsWindowFollower {
                         OverlayPlacement::Hidden
                     } else {
                         let target_hwnd = HWND(target_id as usize as *mut c_void);
-                        desired_placement(overlay_hwnd, target_hwnd)
+                        desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
                     };
 
                     let visible_now = matches!(placement, OverlayPlacement::Visible { .. });
@@ -874,7 +959,7 @@ impl TeamsWindowFollower {
 
                     let visibility_changed = visible_now != previous_visible;
                     let compact_changed = compact_now != previous_compact;
-                    if visibility_changed || compact_changed {
+                    if visibility_changed || compact_changed || target_changed {
                         if !visible_now || compact_now {
                             thread_expanded.store(false, Ordering::Release);
                             thread_disclosure_progress.store(0, Ordering::Release);
@@ -891,7 +976,12 @@ impl TeamsWindowFollower {
                         thread_disclosure_progress.store(0, Ordering::Release);
                         0
                     };
-                    match desired_window_region(overlay_hwnd, compact_now, disclosure_progress) {
+                    match desired_window_region(
+                        overlay_hwnd,
+                        thread_presentation,
+                        compact_now,
+                        disclosure_progress,
+                    ) {
                         Some(region) if previous_region_state != Some(region) => {
                             if apply_window_region(overlay_hwnd, region) {
                                 previous_region_state = Some(region);
@@ -935,7 +1025,7 @@ impl TeamsWindowFollower {
             visible,
             event_rx,
             wake_tx,
-            native_hover: Some(native_hover),
+            native_hover,
             stop,
             worker: Some(worker),
         })
@@ -974,6 +1064,10 @@ impl TeamsWindowFollower {
             progress: Arc::clone(&self.disclosure_progress),
             wake_tx: self.wake_tx.clone(),
         }
+    }
+
+    pub fn disclosure_progress(&self) -> f32 {
+        self.disclosure_progress.load(Ordering::Acquire) as f32 / DISCLOSURE_PROGRESS_MAX as f32
     }
 
     pub fn is_compact(&self) -> bool {
@@ -1095,14 +1189,46 @@ fn surface_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
     surface_rect_for_size(width, height, mode.logical_width(), mode.logical_height())
 }
 
-fn disclosure_surface_rect(width: i32, height: i32, progress: u32) -> RectI {
-    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT) as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+fn compact_surface_rect_for_presentation(
+    width: i32,
+    height: i32,
+    presentation: OverlayPresentation,
+) -> RectI {
     surface_rect_for_size(
         width,
         height,
-        disclosure_width(progress),
-        disclosure_height(progress),
+        COMPACT_WIDTH,
+        if presentation.is_inline() {
+            INLINE_HEIGHT
+        } else {
+            COMPACT_HEIGHT
+        },
     )
+}
+
+#[cfg(test)]
+fn disclosure_surface_rect(width: i32, height: i32, progress: u32) -> RectI {
+    disclosure_surface_rect_for_presentation(
+        width,
+        height,
+        progress,
+        OverlayPresentation::HoverIsland,
+    )
+}
+
+fn disclosure_surface_rect_for_presentation(
+    width: i32,
+    height: i32,
+    progress: u32,
+    presentation: OverlayPresentation,
+) -> RectI {
+    let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT) as f32 / DISCLOSURE_PROGRESS_MAX as f32;
+    let logical_height = if presentation.is_inline() {
+        INLINE_HEIGHT
+    } else {
+        disclosure_height(progress)
+    };
+    surface_rect_for_size(width, height, disclosure_width(progress), logical_height)
 }
 
 #[cfg(test)]
@@ -1113,16 +1239,30 @@ fn hover_rect(width: i32, height: i32, mode: OverlayMode) -> RectI {
 #[cfg(test)]
 fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
     match mode {
-        OverlayMode::Collapsed => window_region_for_progress(metrics, false, 0),
-        OverlayMode::Expanded => {
-            window_region_for_progress(metrics, false, DISCLOSURE_PROGRESS_MAX)
+        OverlayMode::Collapsed => {
+            window_region_for_progress(metrics, OverlayPresentation::HoverIsland, false, 0)
         }
-        OverlayMode::Compact => window_region_for_progress(metrics, true, 0),
+        OverlayMode::Expanded => window_region_for_progress(
+            metrics,
+            OverlayPresentation::HoverIsland,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        ),
+        OverlayMode::Inline => window_region_for_progress(
+            metrics,
+            OverlayPresentation::InlineTitlebar,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        ),
+        OverlayMode::Compact => {
+            window_region_for_progress(metrics, OverlayPresentation::HoverIsland, true, 0)
+        }
     }
 }
 
 fn window_region_for_progress(
     metrics: WindowMetrics,
+    presentation: OverlayPresentation,
     compact: bool,
     progress: u32,
 ) -> WindowRegion {
@@ -1134,16 +1274,21 @@ fn window_region_for_progress(
         .saturating_sub(metrics.window_rect.top);
     let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT);
     let hover = if compact {
-        surface_rect(
+        compact_surface_rect_for_presentation(
             metrics.client_width,
             metrics.client_height,
-            OverlayMode::Compact,
+            presentation,
         )
     } else {
-        disclosure_surface_rect(metrics.client_width, metrics.client_height, progress)
+        disclosure_surface_rect_for_presentation(
+            metrics.client_width,
+            metrics.client_height,
+            progress,
+            presentation,
+        )
     };
     let normalized = progress as f32 / DISCLOSURE_PROGRESS_MAX as f32;
-    let shape = if compact || progress == 0 {
+    let shape = if compact || presentation.is_inline() || progress == 0 {
         WindowRegionShape::Rectangle
     } else {
         let caption_height = scale_logical(COLLAPSED_HEIGHT, metrics.client_height, WINDOW_HEIGHT)
@@ -1185,11 +1330,13 @@ fn window_region_for_progress(
 
 fn desired_window_region(
     hwnd: HWND,
+    presentation: OverlayPresentation,
     compact: bool,
     disclosure_progress: u32,
 ) -> Option<WindowRegion> {
     Some(window_region_for_progress(
         window_metrics(hwnd)?,
+        presentation,
         compact,
         disclosure_progress,
     ))
@@ -1377,26 +1524,41 @@ fn calculate_placement(
     target_frame: RectI,
     caption_relative: Option<RectI>,
     overlay: WindowMetrics,
+    presentation: OverlayPresentation,
 ) -> OverlayPlacement {
-    let expanded_surface = surface_rect(
+    let full_surface = surface_rect(
         overlay.client_width,
         overlay.client_height,
-        OverlayMode::Expanded,
+        if presentation.is_inline() {
+            OverlayMode::Inline
+        } else {
+            OverlayMode::Expanded
+        },
     );
-    let compact_surface = surface_rect(
+    let compact_surface = compact_surface_rect_for_presentation(
         overlay.client_width,
         overlay.client_height,
-        OverlayMode::Compact,
+        presentation,
     );
-    let expanded_width = expanded_surface.width();
-    let expanded_height = expanded_surface.height();
-    if expanded_width <= 0 || expanded_height <= 0 || target_frame.width() <= 0 {
+    let full_width = full_surface.width();
+    let full_height = full_surface.height();
+    if full_width <= 0 || full_height <= 0 || target_frame.width() <= 0 {
         return OverlayPlacement::Hidden;
     }
 
-    let island_drop =
-        scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, expanded_height);
-    let caption_fallback_height = expanded_height.saturating_sub(island_drop).max(24);
+    let island_drop = if presentation.is_inline() {
+        0
+    } else {
+        scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, full_height)
+    };
+    let caption_fallback_height = if presentation.is_inline() {
+        // The visible inline surface is one logical pixel shorter than the caption.
+        // Keep the fallback caption at its full height so bottom anchoring leaves the
+        // DWM outer frame visible at the top.
+        scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24)
+    } else {
+        full_height.saturating_sub(island_drop).max(24)
+    };
     let Some(caption) = caption_geometry(
         target_window,
         target_frame,
@@ -1405,18 +1567,18 @@ fn calculate_placement(
     ) else {
         return OverlayPlacement::Hidden;
     };
-    if expanded_height > caption.band.height().saturating_add(island_drop) {
+    if full_height > caption.band.height().saturating_add(island_drop) {
         return OverlayPlacement::Hidden;
     }
 
     let safe_left = target_frame.left + target_frame.width() / 6;
     let safe_right = (caption.buttons_left - 8).min(target_frame.right - 8);
     let available_width = safe_right.saturating_sub(safe_left);
-    let compact = available_width < expanded_width;
+    let compact = available_width < full_width;
     let active_surface = if compact {
         compact_surface
     } else {
-        expanded_surface
+        full_surface
     };
     let preferred_center = target_frame.center_x();
     let active_width = active_surface.width();
@@ -1435,10 +1597,10 @@ fn calculate_placement(
     let x = desired_surface_left - client_offset_x - active_surface.left;
 
     let desired_surface_bottom = caption.band.bottom.saturating_add(island_drop);
-    let desired_surface_top = desired_surface_bottom.saturating_sub(expanded_surface.height());
-    let y = desired_surface_top - client_offset_y - expanded_surface.top;
-    let placed_top = y + client_offset_y + expanded_surface.top;
-    let placed_bottom = y + client_offset_y + expanded_surface.bottom;
+    let desired_surface_top = desired_surface_bottom.saturating_sub(full_surface.height());
+    let y = desired_surface_top - client_offset_y - full_surface.top;
+    let placed_top = y + client_offset_y + full_surface.top;
+    let placed_bottom = y + client_offset_y + full_surface.bottom;
     if placed_top < caption.band.top || placed_bottom > desired_surface_bottom {
         return OverlayPlacement::Hidden;
     }
@@ -1446,7 +1608,11 @@ fn calculate_placement(
     OverlayPlacement::Visible { x, y, compact }
 }
 
-fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement {
+fn desired_placement(
+    overlay_hwnd: HWND,
+    target_hwnd: HWND,
+    presentation: OverlayPresentation,
+) -> OverlayPlacement {
     unsafe {
         if !IsWindow(Some(target_hwnd)).as_bool()
             || !IsWindowVisible(target_hwnd).as_bool()
@@ -1470,6 +1636,7 @@ fn desired_placement(overlay_hwnd: HWND, target_hwnd: HWND) -> OverlayPlacement 
         target_frame,
         caption_button_bounds(target_hwnd),
         overlay,
+        presentation,
     )
 }
 
@@ -1571,6 +1738,49 @@ mod tests {
     }
 
     #[test]
+    fn inline_presentation_is_selected_by_either_launch_flag() {
+        assert_eq!(
+            OverlayPresentation::from_arguments([
+                String::from("snapbar.exe"),
+                String::from("--inline-titlebar"),
+            ]),
+            OverlayPresentation::InlineTitlebar
+        );
+        assert_eq!(
+            OverlayPresentation::from_arguments([
+                String::from("snapbar.exe"),
+                String::from("--inline"),
+            ]),
+            OverlayPresentation::InlineTitlebar
+        );
+        assert_eq!(
+            OverlayPresentation::from_arguments([String::from("snapbar.exe")]),
+            OverlayPresentation::HoverIsland
+        );
+    }
+
+    #[test]
+    fn capture_exclusion_is_the_release_default_but_development_can_opt_in() {
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe"], false),
+            OverlayCaptureMode::Excluded
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe", "--recordable-overlay"], false,),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe"], true),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::Excluded.display_affinity(),
+            WDA_EXCLUDEFROMCAPTURE
+        );
+        assert_eq!(OverlayCaptureMode::Recordable.display_affinity(), WDA_NONE);
+    }
+
+    #[test]
     fn disclosure_requires_pointer_at_timer_boundaries() {
         let mut machine = DisclosureMachine::default();
         assert!(machine.pointer_enter().start_expand);
@@ -1653,6 +1863,15 @@ mod tests {
                 top: 1,
                 right: 276,
                 bottom: 47,
+            }
+        );
+        assert_eq!(
+            surface_rect(280, 48, OverlayMode::Inline),
+            RectI {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 30,
             }
         );
         assert_eq!(
@@ -1775,6 +1994,87 @@ mod tests {
             assert_eq!(disclosure_surface_rect(280, 48, progress).top, 1);
             assert_eq!(disclosure_surface_rect(280, 48, progress).center_x(), 140);
         }
+    }
+
+    #[test]
+    fn inline_disclosure_only_grows_horizontally_inside_the_caption_band() {
+        for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
+            let surface = disclosure_surface_rect_for_presentation(
+                280,
+                48,
+                progress,
+                OverlayPresentation::InlineTitlebar,
+            );
+            assert_eq!(surface.top, 1);
+            assert_eq!(surface.bottom, 30);
+            assert_eq!(surface.height(), 29);
+            assert_eq!(surface.center_x(), 140);
+        }
+
+        assert_eq!(
+            disclosure_surface_rect_for_presentation(
+                280,
+                48,
+                DISCLOSURE_PROGRESS_MAX,
+                OverlayPresentation::InlineTitlebar,
+            )
+            .width(),
+            INLINE_WIDTH as i32,
+        );
+    }
+
+    #[test]
+    fn inline_native_region_is_rectangular_and_caption_contained() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region(metrics, OverlayMode::Inline),
+            WindowRegion {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 30,
+                shape: WindowRegionShape::Rectangle,
+            }
+        );
+    }
+
+    #[test]
+    fn inline_compact_region_reserves_the_same_top_frame_inset() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region_for_progress(metrics, OverlayPresentation::InlineTitlebar, true, 0),
+            WindowRegion {
+                left: 117,
+                top: 1,
+                right: 163,
+                bottom: 30,
+                shape: WindowRegionShape::Rectangle,
+            }
+        );
     }
 
     #[test]
@@ -1919,6 +2219,7 @@ mod tests {
                 bottom: 53,
             }),
             overlay,
+            OverlayPresentation::HoverIsland,
         );
         let OverlayPlacement::Visible { y, compact, .. } = placement else {
             panic!("expected visible placement");
@@ -1928,6 +2229,94 @@ mod tests {
         assert!(y + expanded.top >= 0);
         // Caption bottom (46) plus the scaled 16px island drop (17px here).
         assert_eq!(y + expanded.bottom, 63);
+    }
+
+    #[test]
+    fn inline_surface_ends_at_the_caption_bottom_without_a_drop() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            Some(RectI {
+                left: 1167,
+                top: 0,
+                right: 1313,
+                bottom: 30,
+            }),
+            overlay,
+            OverlayPresentation::InlineTitlebar,
+        );
+
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        // Preserve the one-logical-pixel DWM outline at the top of the 30px caption.
+        assert_eq!(y + inline.top, 21);
+        assert_eq!(y + inline.bottom, 50);
+    }
+
+    #[test]
+    fn inline_fallback_caption_also_preserves_the_top_frame_outline() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 812,
+                top: 516,
+                right: 1108,
+                bottom: 572,
+            },
+            client_screen_left: 820,
+            client_screen_top: 516,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_placement(
+            RectI {
+                left: 299,
+                top: 20,
+                right: 1619,
+                bottom: 845,
+            },
+            RectI {
+                left: 306,
+                top: 20,
+                right: 1612,
+                bottom: 838,
+            },
+            None,
+            overlay,
+            OverlayPresentation::InlineTitlebar,
+        );
+
+        let OverlayPlacement::Visible { y, compact, .. } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        assert_eq!(y + inline.top, 21);
+        assert_eq!(y + inline.bottom, 50);
     }
 
     #[test]
@@ -1964,6 +2353,7 @@ mod tests {
                 bottom: 30,
             }),
             overlay,
+            OverlayPresentation::HoverIsland,
         );
 
         assert_eq!(
@@ -2010,6 +2400,7 @@ mod tests {
                 bottom: 46,
             }),
             overlay,
+            OverlayPresentation::HoverIsland,
         );
 
         assert_eq!(
@@ -2056,6 +2447,7 @@ mod tests {
                 bottom: 46,
             }),
             overlay,
+            OverlayPresentation::HoverIsland,
         );
 
         assert_eq!(placement, OverlayPlacement::Hidden);
@@ -2095,6 +2487,7 @@ mod tests {
                 bottom: 53,
             }),
             overlay,
+            OverlayPresentation::HoverIsland,
         );
         assert!(matches!(placement, OverlayPlacement::Visible { .. }));
     }
