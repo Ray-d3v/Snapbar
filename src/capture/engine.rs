@@ -12,6 +12,7 @@ use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame::{DirtyRegion, Frame},
     graphics_capture_api::InternalCaptureControl,
+    monitor::Monitor as CaptureMonitor,
     settings::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -21,18 +22,39 @@ use windows_capture::{
 use xcap::Window;
 
 use super::{
-    CaptureReceipt, ScreenRect,
+    CaptureReceipt, LocalMonitorCaptureTarget, ScreenRect,
     content_detector::PixelRect,
     copy_rgba_to_clipboard,
     flash::current_screen_rect,
+    local_share::validate_local_monitor_target,
     uia::{WindowGeometry, detect_content_rect},
 };
 
 const BACKUP_CACHE_INTERVAL: Duration = Duration::from_millis(750);
 const FRESH_FRAME_WAIT: Duration = Duration::from_millis(45);
+const LOCAL_FRESH_FRAME_WAIT: Duration = Duration::from_millis(120);
 const DETECTION_RETRY_INTERVAL: Duration = Duration::from_millis(750);
 const FULL_REDETECTION_INTERVAL: Duration = Duration::from_secs(8);
 const READY_TIMEOUT: Duration = Duration::from_millis(1_200);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureSource {
+    RemoteTeamsWindow(u32),
+    LocalMonitor(LocalMonitorCaptureTarget),
+}
+
+impl CaptureSource {
+    fn remote_target_id(&self) -> Option<u32> {
+        match self {
+            Self::RemoteTeamsWindow(target_id) => Some(*target_id),
+            Self::LocalMonitor(_) => None,
+        }
+    }
+
+    fn is_local_monitor(&self) -> bool {
+        matches!(self, Self::LocalMonitor(_))
+    }
+}
 
 #[derive(Clone)]
 pub struct CaptureEngine {
@@ -58,8 +80,9 @@ impl Drop for EngineInner {
 }
 
 pub(super) struct SharedState {
-    target_id: u32,
+    source: CaptureSource,
     capture_requested: AtomicBool,
+    has_cached_frame: AtomicBool,
     state: Mutex<RuntimeState>,
     ready: Condvar,
 }
@@ -91,26 +114,55 @@ pub(super) struct FrameHandler {
 }
 
 impl CaptureEngine {
-    pub fn start(target_id: u32) -> Result<Self> {
+    pub fn start_source(source: CaptureSource) -> Result<Self> {
         let shared = Arc::new(SharedState {
-            target_id,
+            source: source.clone(),
             capture_requested: AtomicBool::new(false),
+            has_cached_frame: AtomicBool::new(false),
             state: Mutex::new(RuntimeState::default()),
             ready: Condvar::new(),
         });
-        let target = CaptureWindow::from_raw_hwnd(target_id as usize as *mut c_void);
-        let settings = Settings::new(
-            target,
-            CursorCaptureSettings::WithoutCursor,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Rgba8,
-            Arc::clone(&shared),
-        );
-        let control = FrameHandler::start_free_threaded(settings)
-            .map_err(|error| anyhow!("Teams共有画面のキャプチャを開始できませんでした: {error}"))?;
+        let control = match source {
+            CaptureSource::RemoteTeamsWindow(target_id) => {
+                let target = CaptureWindow::from_raw_hwnd(target_id as usize as *mut c_void);
+                let settings = Settings::new(
+                    target,
+                    CursorCaptureSettings::WithoutCursor,
+                    DrawBorderSettings::WithoutBorder,
+                    SecondaryWindowSettings::Default,
+                    MinimumUpdateIntervalSettings::Default,
+                    DirtyRegionSettings::Default,
+                    ColorFormat::Rgba8,
+                    Arc::clone(&shared),
+                );
+                FrameHandler::start_free_threaded(settings).map_err(|error| {
+                    anyhow!("Teams共有画面のキャプチャを開始できませんでした: {error}")
+                })?
+            }
+            CaptureSource::LocalMonitor(target) => {
+                if !validate_local_monitor_target(&target)? {
+                    return Err(anyhow!(
+                        "Teamsが共有しているモニターを再確認できませんでした"
+                    ));
+                }
+                let monitor = CaptureMonitor::from_raw_hmonitor(
+                    target.monitor_handle as usize as *mut c_void,
+                );
+                let settings = Settings::new(
+                    monitor,
+                    CursorCaptureSettings::WithoutCursor,
+                    DrawBorderSettings::WithoutBorder,
+                    SecondaryWindowSettings::Default,
+                    MinimumUpdateIntervalSettings::Default,
+                    DirtyRegionSettings::Default,
+                    ColorFormat::Rgba8,
+                    Arc::clone(&shared),
+                );
+                FrameHandler::start_free_threaded(settings).map_err(|error| {
+                    anyhow!("自分のTeams共有画面のキャプチャを開始できませんでした: {error}")
+                })?
+            }
+        };
 
         Ok(Self {
             inner: Arc::new(EngineInner {
@@ -121,16 +173,16 @@ impl CaptureEngine {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner
-            .shared
-            .state
-            .lock()
-            .ok()
-            .is_some_and(|state| state.latest.is_some())
+        self.inner.shared.has_cached_frame.load(Ordering::Acquire)
+    }
+
+    pub fn is_local_monitor(&self) -> bool {
+        self.inner.shared.source.is_local_monitor()
     }
 
     pub fn copy_latest_to_clipboard(&self) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
+        let local_monitor = self.inner.shared.source.is_local_monitor();
         let (baseline_sequence, had_frame) = self
             .inner
             .shared
@@ -143,7 +195,9 @@ impl CaptureEngine {
             .capture_requested
             .store(true, Ordering::Release);
 
-        let timeout = if had_frame {
+        let timeout = if local_monitor {
+            LOCAL_FRESH_FRAME_WAIT
+        } else if had_frame {
             FRESH_FRAME_WAIT
         } else {
             READY_TIMEOUT
@@ -184,6 +238,20 @@ impl CaptureEngine {
             .capture_requested
             .store(false, Ordering::Release);
 
+        if local_monitor && state.frame_sequence <= baseline_sequence {
+            return Err(anyhow!(
+                "自分の共有画面の新しいフレームを取得できませんでした"
+            ));
+        }
+
+        if let CaptureSource::LocalMonitor(target) = &self.inner.shared.source
+            && !validate_local_monitor_target(target)?
+        {
+            return Err(anyhow!(
+                "Teamsの共有対象が変わったため、誤撮影を防ぐために停止しました"
+            ));
+        }
+
         let cached = state.latest.as_ref().ok_or_else(|| {
             state.last_error.clone().map_or_else(
                 || anyhow!("共有コンテンツを準備中です。少し待ってからもう一度撮影してください"),
@@ -198,13 +266,15 @@ impl CaptureEngine {
         let frame_age = cached.captured_at.elapsed();
         drop(state);
 
-        let screen_rect = current_screen_rect(
-            self.inner.shared.target_id,
-            content_rect,
-            source_width,
-            source_height,
-        )
-        .unwrap_or(fallback_screen_rect);
+        let screen_rect = self
+            .inner
+            .shared
+            .source
+            .remote_target_id()
+            .and_then(|target_id| {
+                current_screen_rect(target_id, content_rect, source_width, source_height)
+            })
+            .unwrap_or(fallback_screen_rect);
 
         Ok(CaptureReceipt {
             screen_rect,
@@ -235,6 +305,9 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         let now = Instant::now();
         let source_size = (frame.width(), frame.height());
         let requested = self.shared.capture_requested.swap(false, Ordering::AcqRel);
+        if let CaptureSource::LocalMonitor(target) = self.shared.source.clone() {
+            return self.on_local_monitor_frame(frame, now, requested, target);
+        }
         let (current_rect, has_latest) = self
             .shared
             .state
@@ -308,6 +381,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
                     if needs_detection {
                         state.latest = None;
                         state.content_rect = None;
+                        self.shared.has_cached_frame.store(false, Ordering::Release);
                     }
                     state.last_error = Some(message);
                 }
@@ -323,6 +397,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             state.latest = None;
             state.content_rect = None;
             state.last_error = Some("選択中のTeamsウィンドウが閉じられました".to_string());
+            self.shared.has_cached_frame.store(false, Ordering::Release);
         }
         self.shared.ready.notify_all();
         Ok(())
@@ -330,13 +405,77 @@ impl GraphicsCaptureApiHandler for FrameHandler {
 }
 
 impl FrameHandler {
+    fn on_local_monitor_frame(
+        &mut self,
+        frame: &mut Frame,
+        captured_at: Instant,
+        requested: bool,
+        target: LocalMonitorCaptureTarget,
+    ) -> std::result::Result<(), String> {
+        let source_size = (frame.width(), frame.height());
+        let has_latest = self
+            .shared
+            .state
+            .lock()
+            .map(|state| state.latest.is_some())
+            .unwrap_or(false);
+        let needs_cache = requested
+            || !has_latest
+            || self
+                .last_cache_update
+                .is_none_or(|last| captured_at.duration_since(last) >= BACKUP_CACHE_INTERVAL);
+        if !needs_cache {
+            return Ok(());
+        }
+
+        let result = (|| -> Result<()> {
+            if source_size != (target.screen_rect.width, target.screen_rect.height) {
+                return Err(anyhow!(
+                    "共有モニターのサイズが変わったため再検出が必要です"
+                ));
+            }
+            if !validate_local_monitor_target(&target)? {
+                return Err(anyhow!("Teamsが共有しているモニターを確認できませんでした"));
+            }
+
+            self.cache_crop(
+                frame,
+                PixelRect::new(0, 0, source_size.0, source_size.1),
+                captured_at,
+                Some(target.screen_rect),
+            )
+        })();
+
+        match result {
+            Ok(()) => {
+                self.last_source_size = Some(source_size);
+                self.last_cache_update = Some(captured_at);
+            }
+            Err(error) => {
+                if let Ok(mut state) = self.shared.state.lock() {
+                    state.latest = None;
+                    state.content_rect = None;
+                    state.last_error = Some(error.to_string());
+                    self.shared.has_cached_frame.store(false, Ordering::Release);
+                }
+                self.shared.ready.notify_all();
+            }
+        }
+        Ok(())
+    }
+
     fn detect_and_cache(&mut self, frame: &mut Frame, captured_at: Instant) -> Result<()> {
         let source_width = frame.width();
         let source_height = frame.height();
-        let target = find_target_window(self.shared.target_id)?;
+        let target_id = self
+            .shared
+            .source
+            .remote_target_id()
+            .ok_or_else(|| anyhow!("Teams会議ウィンドウの対象がありません"))?;
+        let target = find_target_window(target_id)?;
         let geometry =
             WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
-        let content_rect = detect_content_rect(self.shared.target_id, geometry)?.ok_or_else(|| {
+        let content_rect = detect_content_rect(target_id, geometry)?.ok_or_else(|| {
             anyhow!(
                 "Teamsの確定UIA共有要素を取得できませんでした。精度優先のため画像推定は自動採用しません。メニューから会議・共有を再検出してください"
             )
@@ -364,12 +503,9 @@ impl FrameHandler {
 
         let fallback_screen_rect = known_screen_rect
             .or_else(|| {
-                current_screen_rect(
-                    self.shared.target_id,
-                    content_rect,
-                    source_width,
-                    source_height,
-                )
+                self.shared.source.remote_target_id().and_then(|target_id| {
+                    current_screen_rect(target_id, content_rect, source_width, source_height)
+                })
             })
             .or_else(|| {
                 self.shared.state.lock().ok().and_then(|state| {
@@ -438,6 +574,7 @@ impl FrameHandler {
         state.content_rect = Some(content_rect);
         state.last_error = None;
         state.frame_sequence = state.frame_sequence.wrapping_add(1);
+        self.shared.has_cached_frame.store(true, Ordering::Release);
         drop(state);
         self.shared.ready.notify_all();
         Ok(())

@@ -20,8 +20,10 @@ use windows::{
             WindowsAndMessaging::{
                 EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumChildWindows,
-                GetClassNameW, GetMessageW, IsIconic, IsWindow, IsWindowVisible, MSG,
-                PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+                GWL_EXSTYLE, GetClassNameW, GetMessageW, GetWindowDisplayAffinity, GetWindowLongW,
+                IsIconic, IsWindow, IsWindowVisible, MSG, PostThreadMessageW,
+                WDA_EXCLUDEFROMCAPTURE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+                WS_EX_TOPMOST,
             },
         },
     },
@@ -29,15 +31,17 @@ use windows::{
 };
 use xcap::Window;
 
-use crate::capture::CaptureTarget;
+use crate::capture::{CaptureTarget, LocalMonitorCaptureTarget, detect_local_monitor_target};
 
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(700);
 const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(40);
 const ENTRY_STABLE_FOR: Duration = Duration::from_millis(600);
 const ENTRY_FALLBACK_STABLE_FOR: Duration = Duration::from_millis(1_100);
 const EXIT_STABLE_FOR: Duration = Duration::from_millis(1_400);
+const PRESENTER_TOOLBAR_EXIT_STABLE_FOR: Duration = Duration::from_millis(450);
 const REQUIRED_ENTRY_SCANS: u8 = 2;
 const REQUIRED_EXIT_SCANS: u8 = 2;
+const REQUIRED_PRESENTER_TOOLBAR_EXIT_SCANS: u8 = 2;
 
 static WIN_EVENT_SIGNAL: OnceLock<Weak<ScanSignal>> = OnceLock::new();
 
@@ -47,6 +51,9 @@ pub struct MeetingSnapshot {
     pub target: Option<CaptureTarget>,
     pub minimized: bool,
     pub shared_content_hint: bool,
+    pub presenter_toolbar_id: Option<u32>,
+    pub local_share_active: bool,
+    pub local_monitor_target: Option<LocalMonitorCaptureTarget>,
 }
 
 pub struct MeetingMonitor {
@@ -174,6 +181,63 @@ struct MeetingEvidence {
     score: i32,
 }
 
+#[derive(Default)]
+struct TeamsScan {
+    meetings: Vec<MeetingEvidence>,
+    presenter_toolbars: Vec<PresenterToolbarEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresenterToolbarEvidence {
+    id: u32,
+    score: i32,
+    local_share_active: bool,
+}
+
+#[derive(Default)]
+struct PresenterToolbarState {
+    active: Option<u32>,
+    missing_since: Option<Instant>,
+    missing_scans: u8,
+}
+
+impl PresenterToolbarState {
+    fn update(&mut self, now: Instant, evidence: Vec<PresenterToolbarEvidence>) -> Option<u32> {
+        if let Some(active) = self.active {
+            if evidence.iter().any(|candidate| candidate.id == active) {
+                self.missing_since = None;
+                self.missing_scans = 0;
+                return Some(active);
+            }
+
+            if let Some(replacement) = evidence.iter().max_by_key(|candidate| candidate.score) {
+                self.active = Some(replacement.id);
+                self.missing_since = None;
+                self.missing_scans = 0;
+                return self.active;
+            }
+
+            self.missing_scans = self.missing_scans.saturating_add(1);
+            let missing_since = *self.missing_since.get_or_insert(now);
+            if self.missing_scans < REQUIRED_PRESENTER_TOOLBAR_EXIT_SCANS
+                || now.duration_since(missing_since) < PRESENTER_TOOLBAR_EXIT_STABLE_FOR
+            {
+                return Some(active);
+            }
+
+            self.active = None;
+            self.missing_since = None;
+            self.missing_scans = 0;
+        }
+
+        self.active = evidence
+            .into_iter()
+            .max_by_key(|candidate| candidate.score)
+            .map(|candidate| candidate.id);
+        self.active
+    }
+}
+
 impl MeetingEvidence {
     fn has_maintenance_signal(&self) -> bool {
         self.has_leave_control || self.has_call_control || self.has_video || self.has_shared_content
@@ -289,14 +353,29 @@ fn run_monitor(
     stop: Arc<AtomicBool>,
 ) {
     let mut state = DebouncedMeetingState::default();
+    let mut presenter_toolbar = PresenterToolbarState::default();
     while !stop.load(Ordering::Acquire) {
         signal.wait(&stop);
         if stop.load(Ordering::Acquire) {
             break;
         }
 
-        let evidence = scan_meeting_windows().unwrap_or_default();
-        let active = state.update(Instant::now(), evidence);
+        let now = Instant::now();
+        let scan = scan_meeting_windows().unwrap_or_default();
+        let active = state.update(now, scan.meetings);
+        let presenter_evidence = scan.presenter_toolbars;
+        let next_presenter_toolbar = presenter_toolbar.update(now, presenter_evidence.clone());
+        let next_local_share_active = next_presenter_toolbar.is_some_and(|active_id| {
+            presenter_evidence
+                .iter()
+                .find(|candidate| candidate.id == active_id)
+                .is_some_and(|candidate| candidate.local_share_active)
+        });
+        let next_local_monitor_target = next_local_share_active
+            .then(detect_local_monitor_target)
+            .transpose()
+            .unwrap_or_default()
+            .flatten();
         if let Ok(mut current) = snapshot.lock() {
             let next_target = active.as_ref().map(|meeting| meeting.target.clone());
             let next_minimized = active.as_ref().is_some_and(|meeting| meeting.minimized);
@@ -306,22 +385,28 @@ fn run_monitor(
             if current.target != next_target
                 || current.minimized != next_minimized
                 || current.shared_content_hint != next_shared
+                || current.presenter_toolbar_id != next_presenter_toolbar
+                || current.local_share_active != next_local_share_active
+                || current.local_monitor_target != next_local_monitor_target
             {
                 current.generation = current.generation.wrapping_add(1);
                 current.target = next_target;
                 current.minimized = next_minimized;
                 current.shared_content_hint = next_shared;
+                current.presenter_toolbar_id = next_presenter_toolbar;
+                current.local_share_active = next_local_share_active;
+                current.local_monitor_target = next_local_monitor_target;
             }
         }
     }
 }
 
-fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
+fn scan_meeting_windows() -> Result<TeamsScan> {
     let windows = Window::all().context("Teamsウィンドウ一覧を取得できませんでした")?;
     let automation = UIAutomation::new()
         .or_else(|_| UIAutomation::new_direct())
         .ok();
-    let mut meetings = Vec::new();
+    let mut scan = TeamsScan::default();
 
     for (z_index, window) in windows.into_iter().enumerate() {
         let id = match window.id() {
@@ -341,6 +426,27 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
         let minimized = unsafe { IsIconic(hwnd).as_bool() };
         let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
         let focused = window.is_focused().unwrap_or(false);
+        let width = i32::try_from(window.width().unwrap_or_default()).unwrap_or(i32::MAX);
+        let height = i32::try_from(window.height().unwrap_or_default()).unwrap_or(i32::MAX);
+        let topmost = window_is_topmost(hwnd);
+        let display_affinity = window_display_affinity(hwnd);
+        if let Some(mut score) =
+            presenter_toolbar_score(&title, width, height, visible, topmost, display_affinity)
+        {
+            let local_share_active = automation.as_ref().is_some_and(|automation| {
+                inspect_presenter_toolbar_uia(automation, id).unwrap_or(false)
+            });
+            if local_share_active {
+                score += 40;
+            }
+            scan.presenter_toolbars.push(PresenterToolbarEvidence {
+                id,
+                score,
+                local_share_active,
+            });
+            continue;
+        }
+
         let classes = inspect_child_classes(hwnd);
         let uia = automation
             .as_ref()
@@ -376,7 +482,7 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
         }
         score += 20_i32.saturating_sub(z_index.min(20) as i32);
 
-        meetings.push(MeetingEvidence {
+        scan.meetings.push(MeetingEvidence {
             target: CaptureTarget {
                 id,
                 title,
@@ -394,7 +500,7 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
         });
     }
 
-    meetings.sort_by(|left, right| {
+    scan.meetings.sort_by(|left, right| {
         right
             .score
             .cmp(&left.score)
@@ -402,7 +508,74 @@ fn scan_meeting_windows() -> Result<Vec<MeetingEvidence>> {
             .then_with(|| right.visible.cmp(&left.visible))
             .then_with(|| right.has_webview.cmp(&left.has_webview))
     });
-    Ok(meetings)
+    scan.presenter_toolbars
+        .sort_by_key(|candidate| std::cmp::Reverse(candidate.score));
+    Ok(scan)
+}
+
+fn presenter_toolbar_score(
+    title: &str,
+    width: i32,
+    height: i32,
+    visible: bool,
+    topmost: bool,
+    display_affinity: Option<u32>,
+) -> Option<i32> {
+    if !(220..=1_600).contains(&width)
+        || !(24..=100).contains(&height)
+        || width < height.saturating_mul(3)
+    {
+        return None;
+    }
+
+    let title = normalize_name(title);
+    let named_toolbar = [
+        "共有コントロールバー",
+        "共有ツールバー",
+        "発表者ツールバー",
+        "sharecontrolbar",
+        "sharingcontrolbar",
+        "sharingtoolbar",
+        "presentertoolbar",
+        "presentationtoolbar",
+    ]
+    .iter()
+    .any(|hint| title.contains(hint));
+    let excluded_from_capture = display_affinity == Some(WDA_EXCLUDEFROMCAPTURE.0);
+
+    // The toolbar title changes to the meeting title after it is expanded or
+    // activated. Its compact horizontal geometry, capture exclusion, and
+    // topmost band remain stable enough to retain the same HWND.
+    if !named_toolbar && !(excluded_from_capture && topmost) {
+        return None;
+    }
+
+    let mut score = 0;
+    if named_toolbar {
+        score += 100;
+    }
+    if excluded_from_capture {
+        score += 60;
+    }
+    if topmost {
+        score += 20;
+    }
+    if visible {
+        score += 10;
+    }
+    Some(score)
+}
+
+fn window_display_affinity(hwnd: HWND) -> Option<u32> {
+    let mut affinity = 0_u32;
+    unsafe {
+        GetWindowDisplayAffinity(hwnd, &mut affinity).ok()?;
+    }
+    Some(affinity)
+}
+
+fn window_is_topmost(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
 }
 
 fn is_teams_window(app_name: &str, title: &str) -> bool {
@@ -415,6 +588,59 @@ fn is_teams_window(app_name: &str, title: &str) -> bool {
         || title.ends_with(" - microsoft teams")
         || title.starts_with("microsoft teams |")
         || title.starts_with("microsoft teams -")
+}
+
+fn inspect_presenter_toolbar_uia(automation: &UIAutomation, target_id: u32) -> Result<bool> {
+    let root = automation
+        .element_from_handle(Handle::from(target_id as isize))
+        .context("Teams発表者ツールバーのUIAルートを取得できませんでした")?;
+    let condition = automation
+        .create_true_condition()
+        .context("Teams発表者ツールバーのUIA検索条件を作成できませんでした")?;
+    let elements = root
+        .find_all(TreeScope::Subtree, &condition)
+        .context("Teams発表者ツールバーのUIAを走査できませんでした")?;
+
+    Ok(elements.into_iter().any(|element| {
+        if element.is_offscreen().unwrap_or(true) {
+            return false;
+        }
+        let name = normalize_name(&element.get_name().unwrap_or_default());
+        let automation_id = element.get_automation_id().unwrap_or_default();
+        presenter_element_confirms_local_share(
+            &name,
+            &automation_id,
+            element.get_control_type().ok(),
+        )
+    }))
+}
+
+fn presenter_element_confirms_local_share(
+    name: &str,
+    automation_id: &str,
+    control_type: Option<ControlType>,
+) -> bool {
+    let is_button = matches!(
+        control_type,
+        Some(ControlType::Button | ControlType::SplitButton | ControlType::MenuItem)
+    );
+    let stop_action = (name.contains("共有") && (name.contains("停止") || name.contains("終了")))
+        || ["stopsharing", "stopshare", "endsharing", "stoppresenting"]
+            .iter()
+            .any(|hint| name.contains(hint));
+    let sharing_status = (name.contains("共有しています")
+        && (name.contains("画面") || name.contains("スクリーン") || name.contains("ウィンドウ")))
+        || [
+            "sharingyourscreen",
+            "sharingyourwindow",
+            "youaresharing",
+            "youresharing",
+        ]
+        .iter()
+        .any(|hint| name.contains(hint));
+
+    (is_button && automation_id.eq_ignore_ascii_case("share-button") && stop_action)
+        || (is_button && sharing_status)
 }
 
 fn inspect_meeting_uia(
@@ -542,7 +768,10 @@ fn normalize_name(value: &str) -> String {
         .chars()
         .filter(|character| {
             !character.is_whitespace()
-                && !matches!(character, '_' | '-' | '–' | '—' | '・' | '/' | '\\')
+                && !matches!(
+                    character,
+                    '_' | '-' | '–' | '—' | '・' | '/' | '\\' | '\'' | '’'
+                )
         })
         .flat_map(|character| character.to_lowercase())
         .collect()
@@ -657,12 +886,14 @@ unsafe extern "system" fn win_event_callback(
 #[cfg(test)]
 mod tests {
     use super::{
-        DebouncedMeetingState, MeetingEvidence, REQUIRED_ENTRY_SCANS, is_call_control,
-        is_leave_control, is_shared_content_name, normalize_name,
+        DebouncedMeetingState, MeetingEvidence, PresenterToolbarEvidence, PresenterToolbarState,
+        REQUIRED_ENTRY_SCANS, is_call_control, is_leave_control, is_shared_content_name,
+        normalize_name, presenter_element_confirms_local_share, presenter_toolbar_score,
     };
     use crate::capture::CaptureTarget;
     use std::time::{Duration, Instant};
     use uiautomation::types::ControlType;
+    use windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE;
 
     fn evidence(
         id: u32,
@@ -686,6 +917,14 @@ mod tests {
             has_call_control: call_control,
             has_shared_content: shared,
             score: 300,
+        }
+    }
+
+    fn toolbar_evidence(id: u32) -> PresenterToolbarEvidence {
+        PresenterToolbarEvidence {
+            id,
+            score: 190,
+            local_share_active: true,
         }
     }
 
@@ -720,6 +959,93 @@ mod tests {
             Some(ControlType::Text)
         ));
         assert!(!is_call_control("share-button", Some(ControlType::Button)));
+    }
+
+    #[test]
+    fn presenter_toolbar_requires_an_active_local_share_action() {
+        assert!(presenter_element_confirms_local_share(
+            &normalize_name("共有を停止"),
+            "share-button",
+            Some(ControlType::Button),
+        ));
+        assert!(presenter_element_confirms_local_share(
+            &normalize_name("You're sharing your screen"),
+            "",
+            Some(ControlType::Button),
+        ));
+        assert!(!presenter_element_confirms_local_share(
+            &normalize_name("共有"),
+            "share-button",
+            Some(ControlType::Button),
+        ));
+    }
+
+    #[test]
+    fn presenter_toolbar_is_detected_before_and_after_its_title_changes() {
+        assert!(
+            presenter_toolbar_score(
+                "共有コントロール バー | Microsoft Teams",
+                297,
+                35,
+                true,
+                true,
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            presenter_toolbar_score(
+                "Meeting | Microsoft Teams",
+                790,
+                55,
+                true,
+                true,
+                Some(WDA_EXCLUDEFROMCAPTURE.0),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn ordinary_teams_windows_are_not_presenter_toolbars() {
+        assert!(
+            presenter_toolbar_score("Meeting | Microsoft Teams", 1_200, 800, true, false, None,)
+                .is_none()
+        );
+        assert!(
+            presenter_toolbar_score("Calendar | Microsoft Teams", 900, 55, true, true, None,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn presenter_toolbar_survives_one_missing_scan() {
+        let started = Instant::now();
+        let mut state = PresenterToolbarState::default();
+        let evidence = toolbar_evidence(77);
+        assert_eq!(state.update(started, vec![evidence]), Some(77));
+        assert_eq!(
+            state.update(started + Duration::from_millis(200), Vec::new()),
+            Some(77)
+        );
+        assert_eq!(
+            state.update(started + Duration::from_millis(700), Vec::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn presenter_toolbar_switches_immediately_when_teams_recreates_its_hwnd() {
+        let started = Instant::now();
+        let mut state = PresenterToolbarState::default();
+        assert_eq!(state.update(started, vec![toolbar_evidence(77)]), Some(77));
+        assert_eq!(
+            state.update(
+                started + Duration::from_millis(10),
+                vec![toolbar_evidence(88)]
+            ),
+            Some(88)
+        );
     }
 
     #[test]

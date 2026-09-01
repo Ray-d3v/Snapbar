@@ -23,15 +23,17 @@ use windows::Win32::{
         Gdi::{GetDC, GetPixel, ReleaseDC},
     },
     UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic,
-        IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
-        WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GW_HWNDPREV, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+        HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
+        WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     },
 };
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
+const PRESENTER_FOLLOW_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
 const EXPAND_DELAY_MS: u32 = 16;
@@ -72,11 +74,14 @@ pub const HOVER_ISLAND_HEIGHT: f32 = EXPANDED_HEIGHT - TITLEBAR_FRAME_INSET;
 pub const INLINE_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const COMPACT_WIDTH: f32 = 46.0;
 pub const COMPACT_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
-pub const ISLAND_BOTTOM_RADIUS: f32 = 6.0;
+pub const ISLAND_BOTTOM_RADIUS: f32 = 8.0;
 pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
 pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
 pub const ISLAND_DROP: f32 = 16.0;
+pub const PRESENTER_COLLAPSED_HEIGHT: f32 = 39.0;
+pub const PRESENTER_CORNER_RADIUS: f32 = 16.0;
 pub const DEFAULT_TITLEBAR_COLOR: u32 = 0x111111;
+pub const PRESENTER_TOOLBAR_COLOR: u32 = 0x202020;
 
 pub fn disclosure_width(progress: f32) -> f32 {
     COLLAPSED_WIDTH
@@ -90,6 +95,11 @@ pub fn disclosure_width(progress: f32) -> f32 {
 pub fn disclosure_height(progress: f32) -> f32 {
     TITLEBAR_SURFACE_HEIGHT
         + (HOVER_ISLAND_HEIGHT - TITLEBAR_SURFACE_HEIGHT) * progress.clamp(0.0, 1.0)
+}
+
+pub fn presenter_disclosure_height(progress: f32) -> f32 {
+    PRESENTER_COLLAPSED_HEIGHT
+        + (HOVER_ISLAND_HEIGHT - PRESENTER_COLLAPSED_HEIGHT) * progress.clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -681,6 +691,13 @@ enum OverlayPlacement {
     Visible { x: i32, y: i32, compact: bool },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayZOrderAnchor {
+    Topmost,
+    NotTopmost,
+    After(isize),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct WindowMetrics {
     window_rect: RectI,
@@ -707,6 +724,9 @@ enum WindowRegionShape {
         shoulder_depth: i32,
         shoulder_inset: i32,
         bottom_radius: i32,
+    },
+    RoundedRectangle {
+        corner_radius: i32,
     },
 }
 
@@ -860,7 +880,10 @@ impl DisclosureProgressPublisher {
 }
 
 pub struct TeamsWindowFollower {
+    overlay_hwnd: isize,
+    capture_mode: OverlayCaptureMode,
     target_id: Arc<AtomicU32>,
+    presenter_toolbar_id: Arc<AtomicU32>,
     titlebar_color: Arc<AtomicU32>,
     expanded: Arc<AtomicBool>,
     disclosure_progress: Arc<AtomicU32>,
@@ -886,6 +909,7 @@ impl TeamsWindowFollower {
         }
 
         let target_id = Arc::new(AtomicU32::new(0));
+        let presenter_toolbar_id = Arc::new(AtomicU32::new(0));
         let titlebar_color = Arc::new(AtomicU32::new(DEFAULT_TITLEBAR_COLOR));
         let expanded = Arc::new(AtomicBool::new(false));
         let disclosure_progress = Arc::new(AtomicU32::new(0));
@@ -904,6 +928,7 @@ impl TeamsWindowFollower {
         )?);
 
         let thread_target_id = Arc::clone(&target_id);
+        let thread_presenter_toolbar_id = Arc::clone(&presenter_toolbar_id);
         let thread_titlebar_color = Arc::clone(&titlebar_color);
         let thread_expanded = Arc::clone(&expanded);
         let thread_disclosure_progress = Arc::clone(&disclosure_progress);
@@ -927,10 +952,20 @@ impl TeamsWindowFollower {
                 let mut previous_visible = false;
                 let mut previous_compact = false;
                 let mut previous_target_id = 0;
+                let mut previous_presenter_toolbar_id = 0;
                 let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
                 while !thread_stop.load(Ordering::Acquire) {
                     let target_id = thread_target_id.load(Ordering::Acquire);
-                    let placement = if target_id == 0 {
+                    let presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);
+                    let presenter_attached = presenter_toolbar_id != 0;
+                    let placement = if presenter_attached {
+                        let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
+                        desired_presenter_placement(
+                            overlay_hwnd,
+                            presenter_hwnd,
+                            thread_presentation,
+                        )
+                    } else if target_id == 0 {
                         OverlayPlacement::Hidden
                     } else {
                         let target_hwnd = HWND(target_id as usize as *mut c_void);
@@ -944,12 +979,19 @@ impl TeamsWindowFollower {
                     thread_compact.store(compact_now, Ordering::Release);
 
                     let target_changed = target_id != previous_target_id;
+                    let presenter_changed = presenter_toolbar_id != previous_presenter_toolbar_id;
+                    let anchor_changed = target_changed || presenter_changed;
                     if visible_now
-                        && (target_changed
+                        && (anchor_changed
                             || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
                     {
-                        let target_hwnd = HWND(target_id as usize as *mut c_void);
-                        if let Some(sampled_color) = sample_titlebar_color(target_hwnd) {
+                        let sampled_color = if presenter_attached {
+                            Some(PRESENTER_TOOLBAR_COLOR)
+                        } else {
+                            let target_hwnd = HWND(target_id as usize as *mut c_void);
+                            sample_titlebar_color(target_hwnd)
+                        };
+                        if let Some(sampled_color) = sampled_color {
                             let current_color = thread_titlebar_color.load(Ordering::Acquire);
                             if colors_materially_differ(current_color, sampled_color) {
                                 thread_titlebar_color.store(sampled_color, Ordering::Release);
@@ -959,10 +1001,11 @@ impl TeamsWindowFollower {
                         last_titlebar_sample = Instant::now();
                     }
                     previous_target_id = target_id;
+                    previous_presenter_toolbar_id = presenter_toolbar_id;
 
                     let visibility_changed = visible_now != previous_visible;
                     let compact_changed = compact_now != previous_compact;
-                    if visibility_changed || compact_changed || target_changed {
+                    if visibility_changed || compact_changed || anchor_changed {
                         if !visible_now || compact_now {
                             thread_expanded.store(false, Ordering::Release);
                             thread_disclosure_progress.store(0, Ordering::Release);
@@ -983,6 +1026,7 @@ impl TeamsWindowFollower {
                         overlay_hwnd,
                         thread_presentation,
                         compact_now,
+                        presenter_attached,
                         disclosure_progress,
                     ) {
                         Some(region) if previous_region_state != Some(region) => {
@@ -994,6 +1038,15 @@ impl TeamsWindowFollower {
                         None => previous_region_state = None,
                     }
 
+                    if visible_now {
+                        let anchor_hwnd = if presenter_attached {
+                            HWND(presenter_toolbar_id as usize as *mut c_void)
+                        } else {
+                            HWND(target_id as usize as *mut c_void)
+                        };
+                        sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
+                    }
+
                     if previous_placement != Some(placement) {
                         apply_placement(overlay_hwnd, placement);
                         if visible_now {
@@ -1002,7 +1055,9 @@ impl TeamsWindowFollower {
                         previous_placement = Some(placement);
                     }
 
-                    let wait = if target_id == 0 {
+                    let wait = if presenter_attached {
+                        PRESENTER_FOLLOW_INTERVAL
+                    } else if target_id == 0 {
                         IDLE_INTERVAL
                     } else {
                         FOLLOW_INTERVAL
@@ -1020,7 +1075,10 @@ impl TeamsWindowFollower {
             .ok()?;
 
         Some(Self {
+            overlay_hwnd: overlay_hwnd.0 as isize,
+            capture_mode,
             target_id,
+            presenter_toolbar_id,
             titlebar_color,
             expanded,
             disclosure_progress,
@@ -1045,6 +1103,18 @@ impl TeamsWindowFollower {
     pub fn set_target(&self, target_id: Option<u32>) {
         let next = target_id.unwrap_or_default();
         if self.target_id.swap(next, Ordering::AcqRel) != next {
+            if let Some(native_hover) = &self.native_hover {
+                native_hover.reset();
+            }
+            self.expanded.store(false, Ordering::Release);
+            self.disclosure_progress.store(0, Ordering::Release);
+            self.wake();
+        }
+    }
+
+    pub fn set_presenter_toolbar(&self, presenter_toolbar_id: Option<u32>) {
+        let next = presenter_toolbar_id.unwrap_or_default();
+        if self.presenter_toolbar_id.swap(next, Ordering::AcqRel) != next {
             if let Some(native_hover) = &self.native_hover {
                 native_hover.reset();
             }
@@ -1079,6 +1149,33 @@ impl TeamsWindowFollower {
 
     pub fn is_visible(&self) -> bool {
         self.visible.load(Ordering::Acquire)
+    }
+
+    pub fn exclude_overlay_from_capture(&self) -> Option<TemporaryOverlayCaptureExclusion> {
+        let hwnd = HWND(self.overlay_hwnd as *mut c_void);
+        unsafe {
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).ok()?;
+        }
+        Some(TemporaryOverlayCaptureExclusion {
+            hwnd: self.overlay_hwnd,
+            restore: self.capture_mode.display_affinity(),
+        })
+    }
+}
+
+pub struct TemporaryOverlayCaptureExclusion {
+    hwnd: isize,
+    restore: WINDOW_DISPLAY_AFFINITY,
+}
+
+impl Drop for TemporaryOverlayCaptureExclusion {
+    fn drop(&mut self) {
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        unsafe {
+            if IsWindow(Some(hwnd)).as_bool() {
+                let _ = SetWindowDisplayAffinity(hwnd, self.restore);
+            }
+        }
     }
 }
 
@@ -1219,14 +1316,27 @@ fn disclosure_surface_rect(width: i32, height: i32, progress: u32) -> RectI {
     )
 }
 
+#[cfg(test)]
 fn disclosure_surface_rect_for_presentation(
     width: i32,
     height: i32,
     progress: u32,
     presentation: OverlayPresentation,
 ) -> RectI {
+    disclosure_surface_rect_for_attachment(width, height, progress, presentation, false)
+}
+
+fn disclosure_surface_rect_for_attachment(
+    width: i32,
+    height: i32,
+    progress: u32,
+    presentation: OverlayPresentation,
+    presenter_attached: bool,
+) -> RectI {
     let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT) as f32 / DISCLOSURE_PROGRESS_MAX as f32;
-    let logical_height = if presentation.is_inline() {
+    let logical_height = if presenter_attached {
+        presenter_disclosure_height(progress)
+    } else if presentation.is_inline() {
         INLINE_HEIGHT
     } else {
         disclosure_height(progress)
@@ -1263,10 +1373,21 @@ fn window_region(metrics: WindowMetrics, mode: OverlayMode) -> WindowRegion {
     }
 }
 
+#[cfg(test)]
 fn window_region_for_progress(
     metrics: WindowMetrics,
     presentation: OverlayPresentation,
     compact: bool,
+    progress: u32,
+) -> WindowRegion {
+    window_region_for_attachment(metrics, presentation, compact, false, progress)
+}
+
+fn window_region_for_attachment(
+    metrics: WindowMetrics,
+    presentation: OverlayPresentation,
+    compact: bool,
+    presenter_attached: bool,
     progress: u32,
 ) -> WindowRegion {
     let client_left = metrics
@@ -1277,21 +1398,39 @@ fn window_region_for_progress(
         .saturating_sub(metrics.window_rect.top);
     let progress = progress.min(DISCLOSURE_PROGRESS_LIMIT);
     let hover = if compact {
-        compact_surface_rect_for_presentation(
-            metrics.client_width,
-            metrics.client_height,
-            presentation,
-        )
+        if presenter_attached {
+            surface_rect_for_size(
+                metrics.client_width,
+                metrics.client_height,
+                COMPACT_WIDTH,
+                PRESENTER_COLLAPSED_HEIGHT,
+            )
+        } else {
+            compact_surface_rect_for_presentation(
+                metrics.client_width,
+                metrics.client_height,
+                presentation,
+            )
+        }
     } else {
-        disclosure_surface_rect_for_presentation(
+        disclosure_surface_rect_for_attachment(
             metrics.client_width,
             metrics.client_height,
             progress,
             presentation,
+            presenter_attached,
         )
     };
     let normalized = progress as f32 / DISCLOSURE_PROGRESS_MAX as f32;
-    let shape = if compact || presentation.is_inline() || progress == 0 {
+    let shape = if presenter_attached {
+        let corner_radius = scale_logical(
+            PRESENTER_CORNER_RADIUS,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, hover.width().min(hover.height()) / 2);
+        WindowRegionShape::RoundedRectangle { corner_radius }
+    } else if compact || presentation.is_inline() || progress == 0 {
         WindowRegionShape::Rectangle
     } else {
         let caption_height = scale_logical(
@@ -1312,7 +1451,10 @@ fn window_region_for_progress(
             metrics.client_height,
             WINDOW_HEIGHT,
         )
-        .clamp(0, animated_drop.saturating_sub(bottom_radius));
+        // Keep the concave root independent from the bottom corner radius. The
+        // two curves can overlap near their tangents without shortening the
+        // shoulder when the lower corners are made rounder.
+        .clamp(0, animated_drop);
         let shoulder_inset = scale_logical(
             ISLAND_SHOULDER_INSET * normalized,
             metrics.client_width,
@@ -1339,12 +1481,14 @@ fn desired_window_region(
     hwnd: HWND,
     presentation: OverlayPresentation,
     compact: bool,
+    presenter_attached: bool,
     disclosure_progress: u32,
 ) -> Option<WindowRegion> {
-    Some(window_region_for_progress(
+    Some(window_region_for_attachment(
         window_metrics(hwnd)?,
         presentation,
         compact,
+        presenter_attached,
         disclosure_progress,
     ))
 }
@@ -1388,12 +1532,29 @@ fn island_row_inset(
     inset.clamp(0, width.saturating_sub(1) / 2)
 }
 
-fn create_island_region(
+fn rounded_rectangle_row_inset(row: i32, width: i32, height: i32, corner_radius: i32) -> i32 {
+    let corner_radius = corner_radius.clamp(0, width.min(height) / 2);
+    if corner_radius <= 0 {
+        return 0;
+    }
+
+    let edge_distance = row.min(height.saturating_sub(1).saturating_sub(row));
+    if edge_distance >= corner_radius {
+        0
+    } else {
+        let phase = if corner_radius <= 1 {
+            1.0
+        } else {
+            (corner_radius - 1 - edge_distance) as f32 / (corner_radius - 1) as f32
+        };
+        let circle = (1.0 - phase * phase).max(0.0).sqrt();
+        (corner_radius as f32 * (1.0 - circle)).round() as i32
+    }
+}
+
+fn create_row_region(
     desired: WindowRegion,
-    shoulder_start: i32,
-    shoulder_depth: i32,
-    shoulder_inset: i32,
-    bottom_radius: i32,
+    mut row_inset: impl FnMut(i32, i32, i32) -> i32,
 ) -> *mut c_void {
     let width = desired.right.saturating_sub(desired.left);
     let height = desired.bottom.saturating_sub(desired.top);
@@ -1408,15 +1569,7 @@ fn create_island_region(
 
     let mut has_rows = false;
     for row in 0..height {
-        let inset = island_row_inset(
-            row,
-            width,
-            height,
-            shoulder_start,
-            shoulder_depth,
-            shoulder_inset,
-            bottom_radius,
-        );
+        let inset = row_inset(row, width, height);
         let strip_left = desired.left.saturating_add(inset);
         let strip_right = desired.right.saturating_sub(inset);
         if strip_right <= strip_left {
@@ -1459,6 +1612,32 @@ fn create_island_region(
     region
 }
 
+fn create_island_region(
+    desired: WindowRegion,
+    shoulder_start: i32,
+    shoulder_depth: i32,
+    shoulder_inset: i32,
+    bottom_radius: i32,
+) -> *mut c_void {
+    create_row_region(desired, |row, width, height| {
+        island_row_inset(
+            row,
+            width,
+            height,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        )
+    })
+}
+
+fn create_rounded_rectangle_region(desired: WindowRegion, corner_radius: i32) -> *mut c_void {
+    create_row_region(desired, |row, width, height| {
+        rounded_rectangle_row_inset(row, width, height, corner_radius)
+    })
+}
+
 fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
     let region = match desired.shape {
         WindowRegionShape::Rectangle => unsafe {
@@ -1476,6 +1655,9 @@ fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
             shoulder_inset,
             bottom_radius,
         ),
+        WindowRegionShape::RoundedRectangle { corner_radius } => {
+            create_rounded_rectangle_region(desired, corner_radius)
+        }
     };
     if region.is_null() {
         return false;
@@ -1612,6 +1794,76 @@ fn calculate_placement(
     OverlayPlacement::Visible { x, y, compact }
 }
 
+fn calculate_presenter_placement(
+    presenter_frame: RectI,
+    overlay: WindowMetrics,
+    presentation: OverlayPresentation,
+) -> OverlayPlacement {
+    let full_surface = surface_rect(
+        overlay.client_width,
+        overlay.client_height,
+        if presentation.is_inline() {
+            OverlayMode::Inline
+        } else {
+            OverlayMode::Expanded
+        },
+    );
+    let compact_surface = compact_surface_rect_for_presentation(
+        overlay.client_width,
+        overlay.client_height,
+        presentation,
+    );
+    if presenter_frame.width() <= 0
+        || presenter_frame.height() <= 0
+        || full_surface.width() <= 0
+        || full_surface.height() <= 0
+    {
+        return OverlayPlacement::Hidden;
+    }
+
+    let compact = presenter_frame.width() < full_surface.width();
+    let active_surface = if compact {
+        compact_surface
+    } else {
+        full_surface
+    };
+    let client_offset_x = overlay.client_screen_left - overlay.window_rect.left;
+    let client_offset_y = overlay.client_screen_top - overlay.window_rect.top;
+    let desired_surface_left = presenter_frame.center_x() - active_surface.width() / 2;
+    let x = desired_surface_left - client_offset_x - active_surface.left;
+    // Attach the first visible row directly to the presenter toolbar's lower edge.
+    // The overlay window keeps its one-pixel transparent frame above that row, so
+    // the two surfaces read as one shape without covering Teams controls.
+    let y = presenter_frame.bottom - client_offset_y - active_surface.top;
+
+    OverlayPlacement::Visible { x, y, compact }
+}
+
+fn desired_presenter_placement(
+    overlay_hwnd: HWND,
+    presenter_hwnd: HWND,
+    presentation: OverlayPresentation,
+) -> OverlayPlacement {
+    unsafe {
+        if !IsWindow(Some(presenter_hwnd)).as_bool()
+            || !IsWindowVisible(presenter_hwnd).as_bool()
+            || IsIconic(presenter_hwnd).as_bool()
+        {
+            return OverlayPlacement::Hidden;
+        }
+    }
+
+    let Some(presenter_frame) =
+        extended_frame_bounds(presenter_hwnd).or_else(|| get_window_rect(presenter_hwnd))
+    else {
+        return OverlayPlacement::Hidden;
+    };
+    let Some(overlay) = window_metrics(overlay_hwnd) else {
+        return OverlayPlacement::Hidden;
+    };
+    calculate_presenter_placement(presenter_frame, overlay, presentation)
+}
+
 fn desired_placement(
     overlay_hwnd: HWND,
     target_hwnd: HWND,
@@ -1653,16 +1905,78 @@ fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
             OverlayPlacement::Visible { x, y, .. } => {
                 let _ = SetWindowPos(
                     overlay_hwnd,
-                    Some(HWND_TOPMOST),
+                    None,
                     x,
                     y,
                     0,
                     0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
                 );
-                let _ = ShowWindow(overlay_hwnd, SW_SHOWNOACTIVATE);
             }
         }
+    }
+}
+
+fn choose_overlay_z_order_anchor(
+    target_topmost: bool,
+    overlay_topmost: bool,
+    overlay: isize,
+    window_above_target: Option<(isize, bool)>,
+) -> Option<OverlayZOrderAnchor> {
+    match window_above_target {
+        Some((above, _)) if above == overlay && target_topmost == overlay_topmost => None,
+        Some((above, _)) if above == overlay => Some(if target_topmost {
+            OverlayZOrderAnchor::Topmost
+        } else {
+            OverlayZOrderAnchor::NotTopmost
+        }),
+        Some((_, above_topmost)) if above_topmost != target_topmost => Some(if target_topmost {
+            OverlayZOrderAnchor::Topmost
+        } else {
+            OverlayZOrderAnchor::NotTopmost
+        }),
+        Some((above, _)) => Some(OverlayZOrderAnchor::After(above)),
+        None => Some(if target_topmost {
+            OverlayZOrderAnchor::Topmost
+        } else {
+            OverlayZOrderAnchor::NotTopmost
+        }),
+    }
+}
+
+fn window_is_topmost(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
+}
+
+fn sync_overlay_z_order(overlay_hwnd: HWND, target_hwnd: HWND) {
+    let target_topmost = window_is_topmost(target_hwnd);
+    let overlay_topmost = window_is_topmost(overlay_hwnd);
+    let window_above_target = unsafe { GetWindow(target_hwnd, GW_HWNDPREV).ok() }
+        .map(|above| (above.0 as isize, window_is_topmost(above)));
+    let Some(anchor) = choose_overlay_z_order_anchor(
+        target_topmost,
+        overlay_topmost,
+        overlay_hwnd.0 as isize,
+        window_above_target,
+    ) else {
+        return;
+    };
+    let insert_after = match anchor {
+        OverlayZOrderAnchor::Topmost => HWND_TOPMOST,
+        OverlayZOrderAnchor::NotTopmost => HWND_NOTOPMOST,
+        OverlayZOrderAnchor::After(window) => HWND(window as *mut c_void),
+    };
+
+    unsafe {
+        let _ = SetWindowPos(
+            overlay_hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
     }
 }
 
@@ -1782,6 +2096,50 @@ mod tests {
             WDA_EXCLUDEFROMCAPTURE
         );
         assert_eq!(OverlayCaptureMode::Recordable.display_affinity(), WDA_NONE);
+    }
+
+    #[test]
+    fn z_order_is_unchanged_when_overlay_is_already_directly_above_teams() {
+        assert_eq!(
+            choose_overlay_z_order_anchor(false, false, 20, Some((20, false))),
+            None
+        );
+        assert_eq!(
+            choose_overlay_z_order_anchor(true, true, 20, Some((20, true))),
+            None
+        );
+    }
+
+    #[test]
+    fn z_order_drops_a_topmost_overlay_into_the_normal_teams_band() {
+        assert_eq!(
+            choose_overlay_z_order_anchor(false, true, 20, Some((20, true))),
+            Some(OverlayZOrderAnchor::NotTopmost)
+        );
+        assert_eq!(
+            choose_overlay_z_order_anchor(false, true, 20, Some((10, true))),
+            Some(OverlayZOrderAnchor::NotTopmost)
+        );
+    }
+
+    #[test]
+    fn z_order_places_overlay_after_an_unrelated_window_above_teams() {
+        assert_eq!(
+            choose_overlay_z_order_anchor(false, false, 20, Some((10, false))),
+            Some(OverlayZOrderAnchor::After(10))
+        );
+    }
+
+    #[test]
+    fn z_order_can_follow_a_topmost_teams_window_without_becoming_globally_frontmost() {
+        assert_eq!(
+            choose_overlay_z_order_anchor(true, false, 20, None),
+            Some(OverlayZOrderAnchor::Topmost)
+        );
+        assert_eq!(
+            choose_overlay_z_order_anchor(true, true, 20, Some((10, true))),
+            Some(OverlayZOrderAnchor::After(10))
+        );
     }
 
     #[test]
@@ -1971,7 +2329,7 @@ mod tests {
                 shoulder_start: 29,
                 shoulder_depth: 10,
                 shoulder_inset: 16,
-                bottom_radius: 6,
+                bottom_radius: 8,
             }
         );
     }
@@ -2120,7 +2478,7 @@ mod tests {
                     shoulder_start: 44,
                     shoulder_depth: 15,
                     shoulder_inset: 24,
-                    bottom_radius: 9,
+                    bottom_radius: 12,
                 },
             }
         );
@@ -2128,14 +2486,106 @@ mod tests {
 
     #[test]
     fn island_rows_curve_in_at_the_root_and_round_out_at_the_bottom() {
-        assert_eq!(island_row_inset(0, 272, 45, 29, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(28, 272, 45, 29, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(29, 272, 45, 29, 10, 16, 6), 0);
-        assert_eq!(island_row_inset(30, 272, 45, 29, 10, 16, 6), 7);
-        assert_eq!(island_row_inset(34, 272, 45, 29, 10, 16, 6), 14);
-        assert_eq!(island_row_inset(38, 272, 45, 29, 10, 16, 6), 16);
-        assert_eq!(island_row_inset(39, 272, 45, 29, 10, 16, 6), 16);
-        assert_eq!(island_row_inset(44, 272, 45, 29, 10, 16, 6), 22);
+        assert_eq!(island_row_inset(0, 272, 45, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(28, 272, 45, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(29, 272, 45, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(30, 272, 45, 29, 10, 16, 8), 7);
+        assert_eq!(island_row_inset(34, 272, 45, 29, 10, 16, 8), 14);
+        assert_eq!(island_row_inset(38, 272, 45, 29, 10, 16, 8), 16);
+        assert_eq!(island_row_inset(40, 272, 45, 29, 10, 16, 8), 17);
+        assert_eq!(island_row_inset(42, 272, 45, 29, 10, 16, 8), 18);
+        assert_eq!(island_row_inset(44, 272, 45, 29, 10, 16, 8), 24);
+    }
+
+    #[test]
+    fn presenter_region_uses_a_plain_rounded_rectangle_instead_of_the_titlebar_shape() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region_for_attachment(metrics, OverlayPresentation::HoverIsland, false, true, 0,),
+            WindowRegion {
+                left: 94,
+                top: 1,
+                right: 186,
+                bottom: 40,
+                shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
+            }
+        );
+        assert_eq!(
+            window_region_for_attachment(
+                metrics,
+                OverlayPresentation::HoverIsland,
+                false,
+                true,
+                DISCLOSURE_PROGRESS_MAX,
+            ),
+            WindowRegion {
+                left: 4,
+                top: 1,
+                right: 276,
+                bottom: 46,
+                shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
+            }
+        );
+    }
+
+    #[test]
+    fn presenter_compact_region_keeps_the_same_rounded_rectangle_language() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+
+        assert_eq!(
+            window_region_for_attachment(
+                metrics,
+                OverlayPresentation::InlineTitlebar,
+                true,
+                true,
+                0,
+            ),
+            WindowRegion {
+                left: 117,
+                top: 1,
+                right: 163,
+                bottom: 40,
+                shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
+            }
+        );
+    }
+
+    #[test]
+    fn presenter_rounded_rectangle_rows_round_all_four_corners_evenly() {
+        assert_eq!(rounded_rectangle_row_inset(0, 272, 45, 16), 16);
+        assert_eq!(rounded_rectangle_row_inset(1, 272, 45, 16), 10);
+        assert_eq!(rounded_rectangle_row_inset(2, 272, 45, 16), 8);
+        assert_eq!(rounded_rectangle_row_inset(3, 272, 45, 16), 6);
+        assert_eq!(rounded_rectangle_row_inset(5, 272, 45, 16), 4);
+        assert_eq!(rounded_rectangle_row_inset(15, 272, 45, 16), 0);
+        assert_eq!(rounded_rectangle_row_inset(22, 272, 45, 16), 0);
+        assert_eq!(rounded_rectangle_row_inset(41, 272, 45, 16), 6);
+        assert_eq!(rounded_rectangle_row_inset(42, 272, 45, 16), 8);
+        assert_eq!(rounded_rectangle_row_inset(43, 272, 45, 16), 10);
+        assert_eq!(rounded_rectangle_row_inset(44, 272, 45, 16), 16);
     }
 
     #[test]
@@ -2509,6 +2959,115 @@ mod tests {
         );
 
         assert_eq!(placement, OverlayPlacement::Hidden);
+    }
+
+    #[test]
+    fn presenter_overlay_attaches_to_the_toolbar_bottom_center() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_presenter_placement(
+            RectI {
+                left: 812,
+                top: 8,
+                right: 1_109,
+                bottom: 43,
+            },
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 820,
+                y: 42,
+                compact: false,
+            }
+        );
+        let OverlayPlacement::Visible { x, y, .. } = placement else {
+            unreachable!();
+        };
+        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        assert_eq!(x + expanded.left + expanded.width() / 2, 960);
+        assert_eq!(y + expanded.top, 43);
+    }
+
+    #[test]
+    fn presenter_overlay_tracks_toolbar_expansion_without_a_second_anchor() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_presenter_placement(
+            RectI {
+                left: 566,
+                top: 8,
+                right: 1_356,
+                bottom: 63,
+            },
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        assert_eq!(
+            placement,
+            OverlayPlacement::Visible {
+                x: 821,
+                y: 62,
+                compact: false,
+            }
+        );
+    }
+
+    #[test]
+    fn presenter_overlay_supports_negative_monitor_coordinates() {
+        let overlay = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let placement = calculate_presenter_placement(
+            RectI {
+                left: -1_500,
+                top: -1_430,
+                right: -710,
+                bottom: -1_375,
+            },
+            overlay,
+            OverlayPresentation::HoverIsland,
+        );
+
+        let OverlayPlacement::Visible { x, y, compact } = placement else {
+            panic!("expected visible placement");
+        };
+        assert!(!compact);
+        assert!(x < 0);
+        assert!(y < 0);
     }
 
     #[test]

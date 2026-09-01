@@ -12,9 +12,15 @@ use std::{
 mod content_detector;
 mod engine;
 mod flash;
+mod local_share;
 mod uia;
 
-pub use self::{engine::CaptureEngine, flash::show_capture_flash};
+pub(crate) use self::local_share::detect_local_monitor_target;
+pub use self::{
+    engine::{CaptureEngine, CaptureSource},
+    flash::show_capture_flash,
+    local_share::LocalMonitorCaptureTarget,
+};
 use anyhow::{Context as _, Result, anyhow};
 use arboard::{Clipboard, ImageData};
 use image::{ColorType, ImageFormat};

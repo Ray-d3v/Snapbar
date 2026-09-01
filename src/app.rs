@@ -1,16 +1,17 @@
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use crate::{
     assets::Assets,
     capture::{
-        CaptureEngine, CaptureTarget, save_clipboard_image_to_screenshots, show_capture_flash,
+        CaptureEngine, CaptureSource, CaptureTarget, LocalMonitorCaptureTarget,
+        save_clipboard_image_to_screenshots, show_capture_flash,
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
     overlay::{
         COLLAPSED_WIDTH, COMPACT_WIDTH, DEFAULT_TITLEBAR_COLOR, EXPANDED_HEIGHT, EXPANDED_WIDTH,
         HOVER_ISLAND_HEIGHT, INLINE_HEIGHT, INLINE_WIDTH, OverlayCaptureMode, OverlayPresentation,
         TITLEBAR_SURFACE_HEIGHT, TeamsWindowFollower, WINDOW_HEIGHT, WINDOW_WIDTH,
-        disclosure_height, disclosure_width,
+        disclosure_height, disclosure_width, presenter_disclosure_height,
     },
     resident::ResidentController,
     settings::AppSettings,
@@ -23,6 +24,7 @@ use gpui::{
 use gpui_platform::application;
 
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const RECORDABLE_OVERLAY_EXCLUSION_SETTLE: Duration = Duration::from_millis(34);
 const DISCLOSURE_SPRING_STIFFNESS: f32 = 900.0;
 const DISCLOSURE_SPRING_DAMPING: f32 = 46.0;
 const INLINE_DISCLOSURE_SPRING_STIFFNESS: f32 = 360.0;
@@ -30,6 +32,7 @@ const INLINE_DISCLOSURE_SPRING_DAMPING: f32 = 28.0;
 const INLINE_DISCLOSURE_BOUNCE_RESTITUTION: f32 = 0.55;
 const DISCLOSURE_OVERSHOOT_GAIN: f32 = 2.0;
 const DISCLOSURE_MAX_PRESENTATION: f32 = 1.044;
+const TITLEBAR_SURFACE_REVEAL_END: f32 = 0.10;
 const EXPANDED_CONTROL_GAP: f32 = 6.0;
 const STATUS_CONTROL_WIDTH: f32 = 82.0;
 const ACTION_CONTROL_SIZE: f32 = 30.0;
@@ -37,6 +40,8 @@ const CONTROL_VISUAL_INSET: f32 = 1.0;
 const STATUS_VISUAL_WIDTH: f32 = STATUS_CONTROL_WIDTH - CONTROL_VISUAL_INSET * 2.0;
 const ACTION_VISUAL_SIZE: f32 = ACTION_CONTROL_SIZE - CONTROL_VISUAL_INSET * 2.0;
 const HOVER_CONTROLS_OFFSET_Y: f32 = -CONTROL_VISUAL_INSET;
+const PRESENTER_IDLE_CONTENT_OFFSET_Y: f32 = 5.0;
+const PRESENTER_CONTROLS_OFFSET_Y: f32 = 0.0;
 const EXPANDED_CONTROLS_WIDTH: f32 =
     STATUS_CONTROL_WIDTH + ACTION_CONTROL_SIZE * 4.0 + EXPANDED_CONTROL_GAP * 4.0;
 const IDLE_CAPTURE_CENTER_X: f32 = -COLLAPSED_WIDTH / 2.0 + COMPACT_WIDTH + COMPACT_WIDTH / 2.0;
@@ -51,6 +56,16 @@ const EXPANDED_CONTENT_SHIFT_X: f32 = IDLE_CAPTURE_CENTER_X - EXPANDED_CAPTURE_C
 fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
     let phase = ((value - start) / (end - start)).clamp(0.0, 1.0);
     phase * phase * (3.0 - 2.0 * phase)
+}
+
+fn disclosure_surface_alpha(presenter_attached: bool, content_progress: f32) -> f32 {
+    if presenter_attached {
+        return 1.0;
+    }
+
+    (1.0 / 255.0
+        + (254.0 / 255.0) * smoothstep_between(0.0, TITLEBAR_SURFACE_REVEAL_END, content_progress))
+    .clamp(1.0 / 255.0, 1.0)
 }
 
 fn disclosure_spring_config(presentation: OverlayPresentation) -> SpringConfig {
@@ -121,6 +136,14 @@ struct TitlebarPalette {
     save_icon: u32,
     danger_icon: u32,
     is_light: bool,
+}
+
+fn idle_camera_color(palette: TitlebarPalette, can_capture: bool) -> u32 {
+    if can_capture {
+        palette.primary_text
+    } else {
+        palette.secondary_text
+    }
 }
 
 impl TitlebarPalette {
@@ -204,6 +227,9 @@ struct Snapbar {
     resident: ResidentController,
     last_monitor_generation: u64,
     shared_content_hint: bool,
+    presenter_toolbar_id: Option<u32>,
+    local_share_active: bool,
+    local_monitor_target: Option<LocalMonitorCaptureTarget>,
     compact_layout: bool,
     titlebar_color: u32,
     settings: AppSettings,
@@ -238,6 +264,9 @@ impl Snapbar {
             resident: ResidentController::start(),
             last_monitor_generation: u64::MAX,
             shared_content_hint: false,
+            presenter_toolbar_id: None,
+            local_share_active: false,
+            local_monitor_target: None,
             compact_layout: false,
             titlebar_color,
             settings: AppSettings::load(),
@@ -260,9 +289,28 @@ impl Snapbar {
         self.targets.get(self.selected_target)
     }
 
+    fn current_capture_source(&self) -> Option<CaptureSource> {
+        if let Some(target) = self.local_monitor_target.as_ref() {
+            return Some(CaptureSource::LocalMonitor(target.clone()));
+        }
+        if self.shared_content_hint {
+            self.current_target()
+                .map(|target| CaptureSource::RemoteTeamsWindow(target.id))
+        } else {
+            None
+        }
+    }
+
+    fn has_capture_context(&self) -> bool {
+        self.current_target().is_some()
+            || self.presenter_toolbar_id.is_some()
+            || self.local_share_active
+    }
+
     fn sync_follower(&self) {
         if let Some(follower) = &self.follower {
             follower.set_target(self.current_target().map(|target| target.id));
+            follower.set_presenter_toolbar(self.presenter_toolbar_id);
         }
     }
 
@@ -349,7 +397,7 @@ impl Snapbar {
                 self.capture_state = CaptureState::WaitingForShare;
             }
             Some(_) => {}
-            None if self.current_target().is_none() => {
+            None if !self.has_capture_context() => {
                 self.capture_state = CaptureState::NoTarget;
             }
             None if self.capture_state != CaptureState::Capturing => {
@@ -367,11 +415,15 @@ impl Snapbar {
     fn apply_meeting_snapshot(&mut self, snapshot: MeetingSnapshot, cx: &mut Context<Self>) {
         self.last_monitor_generation = snapshot.generation;
         let previous_id = self.current_target().map(|target| target.id);
+        let previous_source = self.current_capture_source();
         let next_id = snapshot.target.as_ref().map(|target| target.id);
-        let was_shared = self.shared_content_hint;
+        let previous_presenter_toolbar_id = self.presenter_toolbar_id;
+        self.presenter_toolbar_id = snapshot.presenter_toolbar_id;
         self.shared_content_hint = snapshot.shared_content_hint;
+        self.local_share_active = snapshot.local_share_active;
+        self.local_monitor_target = snapshot.local_monitor_target;
 
-        if previous_id != next_id {
+        if previous_id != next_id || previous_presenter_toolbar_id != self.presenter_toolbar_id {
             self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             cx.notify();
@@ -381,32 +433,34 @@ impl Snapbar {
             Some(target) => {
                 self.targets = vec![target];
                 self.selected_target = 0;
-                self.sync_follower();
-
-                if self.shared_content_hint {
-                    if previous_id != next_id || !was_shared || self.capture_engine.is_none() {
-                        self.restart_capture_engine();
-                    }
-                } else {
-                    self.capture_generation = self.capture_generation.wrapping_add(1);
-                    self.capture_engine = None;
-                    self.capture_state = CaptureState::WaitingForShare;
-                    self.last_error = None;
-                }
             }
             None => {
-                self.capture_generation = self.capture_generation.wrapping_add(1);
-                self.capture_engine = None;
                 self.targets.clear();
                 self.selected_target = 0;
-                self.capture_state = CaptureState::NoTarget;
-                self.last_error = None;
-                self.shared_content_hint = false;
-                self.retarget_disclosure(false, 0.0);
-                self.compact_layout = false;
-                cx.notify();
-                self.sync_follower();
             }
+        }
+        self.sync_follower();
+
+        let next_source = self.current_capture_source();
+        if next_source.is_some()
+            && (previous_source != next_source || self.capture_engine.is_none())
+        {
+            self.restart_capture_engine();
+        } else if next_source.is_none() {
+            self.capture_generation = self.capture_generation.wrapping_add(1);
+            self.capture_engine = None;
+            self.capture_state = if self.has_capture_context() {
+                CaptureState::WaitingForShare
+            } else {
+                CaptureState::NoTarget
+            };
+            self.last_error = None;
+        }
+
+        if !self.has_capture_context() {
+            self.retarget_disclosure(false, 0.0);
+            self.compact_layout = false;
+            cx.notify();
         }
     }
 
@@ -414,18 +468,17 @@ impl Snapbar {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.capture_engine = None;
         self.sync_follower();
-        let Some(target_id) = self.current_target().map(|target| target.id) else {
-            self.capture_state = CaptureState::NoTarget;
+        let Some(source) = self.current_capture_source() else {
+            self.capture_state = if self.has_capture_context() {
+                CaptureState::WaitingForShare
+            } else {
+                CaptureState::NoTarget
+            };
             self.last_error = None;
             return;
         };
-        if !self.shared_content_hint {
-            self.capture_state = CaptureState::WaitingForShare;
-            self.last_error = None;
-            return;
-        }
 
-        match CaptureEngine::start(target_id) {
+        match CaptureEngine::start_source(source) {
             Ok(engine) => {
                 self.capture_engine = Some(engine);
                 self.capture_state = CaptureState::WaitingForShare;
@@ -440,7 +493,7 @@ impl Snapbar {
 
     fn request_redetection(&mut self) {
         self.meeting_monitor.request_scan();
-        if self.current_target().is_some() && self.shared_content_hint {
+        if self.current_capture_source().is_some() {
             self.restart_capture_engine();
         }
     }
@@ -494,7 +547,7 @@ impl Snapbar {
 
         let Some(engine) = self.capture_engine.clone() else {
             self.meeting_monitor.request_scan();
-            self.capture_state = if self.current_target().is_some() {
+            self.capture_state = if self.has_capture_context() {
                 CaptureState::WaitingForShare
             } else {
                 CaptureState::NoTarget
@@ -509,15 +562,46 @@ impl Snapbar {
             return;
         }
 
+        let local_monitor_capture = engine.is_local_monitor();
+        let overlay_exclusion = if local_monitor_capture {
+            match self
+                .follower
+                .as_ref()
+                .map(TeamsWindowFollower::exclude_overlay_from_capture)
+            {
+                Some(Some(exclusion)) => Some(exclusion),
+                Some(None) => {
+                    self.capture_state = CaptureState::Error;
+                    self.last_error = Some(
+                        "Snapbarを共有画面から一時的に除外できなかったため撮影を停止しました"
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         self.capture_generation = self.capture_generation.wrapping_add(1);
         let generation = self.capture_generation;
         let save_to_screenshots = self.settings.save_to_screenshots;
         self.capture_state = CaptureState::Capturing;
         self.last_error = None;
         cx.notify();
+        let wait_for_overlay_exclusion = local_monitor_capture
+            && self.capture_mode == OverlayCaptureMode::Recordable
+            && overlay_exclusion.is_some();
 
         let task = cx.background_executor().spawn(async move {
+            let overlay_exclusion = overlay_exclusion;
+            if wait_for_overlay_exclusion {
+                thread::sleep(RECORDABLE_OVERLAY_EXCLUSION_SETTLE);
+            }
             let receipt = engine.copy_latest_to_clipboard()?;
+            drop(overlay_exclusion);
             let save_result = save_to_screenshots.then(save_clipboard_image_to_screenshots);
             Ok::<_, anyhow::Error>((receipt, save_result))
         });
@@ -593,22 +677,29 @@ impl Render for Snapbar {
             .is_some_and(CaptureEngine::is_ready)
             && self.capture_state != CaptureState::Capturing;
         let presentation = self.presentation;
+        let presenter_attached = self.presenter_toolbar_id.is_some();
         let presentation_width = if presentation.is_inline() {
             INLINE_WIDTH
         } else {
             EXPANDED_WIDTH
         };
-        let presentation_height = if presentation.is_inline() {
+        let presentation_height = if presenter_attached {
+            HOVER_ISLAND_HEIGHT
+        } else if presentation.is_inline() {
             INLINE_HEIGHT
         } else {
             HOVER_ISLAND_HEIGHT
         };
         let caption_cell_height = TITLEBAR_SURFACE_HEIGHT;
+        let idle_content_offset_y = if presenter_attached {
+            PRESENTER_IDLE_CONTENT_OFFSET_Y
+        } else {
+            0.0
+        };
         let save_to_screenshots = self.settings.save_to_screenshots;
         let palette = TitlebarPalette::for_surface(self.titlebar_color);
         let status_color = self.status_color(palette.is_light);
         let primary_text = rgb(palette.primary_text);
-        let secondary_text = rgb(palette.secondary_text);
         let island_background = rgb(palette.surface);
         // A non-zero alpha keeps the layered HWND interactive while remaining visually
         // indistinguishable from the Teams title bar at rest.
@@ -620,40 +711,46 @@ impl Render for Snapbar {
             CaptureState::Error => rgb(0xd1444c),
             CaptureState::Idle | CaptureState::Copied => rgb(0xe5484d),
         };
+        let idle_camera_icon = || {
+            svg()
+                .path("icons/camera.svg")
+                .size(px(16.0))
+                .text_color(rgb(idle_camera_color(palette, can_capture)))
+        };
 
         let compact_camera = div()
             .id("titlebar-surface")
-            .flex()
-            .items_start()
-            .justify_center()
+            .relative()
             .w(px(COMPACT_WIDTH))
             .h(px(EXPANDED_HEIGHT))
-            .bg(transparent_black())
+            .bg(if presenter_attached {
+                island_background
+            } else {
+                rgba(0x00000000)
+            })
             .child(
                 div()
                     .id("compact-capture-button")
+                    .absolute()
+                    .top(px(idle_content_offset_y))
+                    .left(px(0.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .w(px(COMPACT_WIDTH))
                     .h(px(caption_cell_height))
                     .bg(idle_hit_surface)
+                    .cursor_pointer()
                     .active(move |button| button.bg(idle_active_backplate))
                     .when(can_capture, |button| {
                         button.on_click(cx.listener(Self::on_capture_clicked))
                     })
-                    .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
-                        if can_capture {
-                            rgb(0xe5484d)
-                        } else {
-                            rgb(palette.disabled_icon)
-                        },
-                    )),
+                    .child(idle_camera_icon()),
             );
 
         let idle_content = div()
             .absolute()
-            .top(px(0.0))
+            .top(px(idle_content_offset_y))
             .left(relative(0.5))
             .ml(px(-COLLAPSED_WIDTH / 2.0))
             .flex()
@@ -678,13 +775,8 @@ impl Render for Snapbar {
                     .w(px(COMPACT_WIDTH))
                     .h_full()
                     .bg(idle_hit_surface)
-                    .child(svg().path("icons/camera.svg").size(px(16.0)).text_color(
-                        if can_capture {
-                            primary_text
-                        } else {
-                            secondary_text
-                        },
-                    )),
+                    .cursor_pointer()
+                    .child(idle_camera_icon()),
             );
 
         let status = div()
@@ -836,7 +928,9 @@ impl Render for Snapbar {
 
         let expanded_content = div()
             .absolute()
-            .top(px(if presentation.is_inline() {
+            .top(px(if presenter_attached {
+                PRESENTER_CONTROLS_OFFSET_Y
+            } else if presentation.is_inline() {
                 0.0
             } else {
                 HOVER_CONTROLS_OFFSET_Y
@@ -890,14 +984,15 @@ impl Render for Snapbar {
                     }
 
                     let surface_width = disclosure_width(progress);
-                    let surface_height = if presentation.is_inline() {
+                    let surface_height = if presenter_attached {
+                        presenter_disclosure_height(progress)
+                    } else if presentation.is_inline() {
                         INLINE_HEIGHT
                     } else {
                         disclosure_height(progress)
                     };
-                    let surface_alpha = (1.0 / 255.0
-                        + (254.0 / 255.0) * smoothstep_between(0.0, 0.22, content_progress))
-                    .clamp(1.0 / 255.0, 1.0);
+                    let surface_alpha =
+                        disclosure_surface_alpha(presenter_attached, content_progress);
                     let idle_alpha = 1.0 - smoothstep_between(0.12, 0.62, content_progress);
                     let expanded_alpha = smoothstep_between(0.16, 0.86, content_progress);
                     let control_gap = expanded_control_gap(content_progress);
@@ -911,8 +1006,8 @@ impl Render for Snapbar {
                                 .ml(px(-surface_width / 2.0))
                                 .w(px(surface_width))
                                 .h(px(surface_height))
-                                // SetWindowRgn supplies the animated concave shoulders and
-                                // rounded bottom; this fill is clipped to that exact shape.
+                                // SetWindowRgn supplies either the caption-attached island or
+                                // the presenter-toolbar rounded rectangle and clips this fill.
                                 .bg(island_background.opacity(surface_alpha)),
                         )
                         .when(content_progress < 0.72, |surface| {
@@ -995,6 +1090,16 @@ mod tests {
     }
 
     #[test]
+    fn idle_camera_stays_neutral_until_hover_disclosure() {
+        for surface in [0x111111, 0xf3f3f3] {
+            let palette = TitlebarPalette::for_surface(surface);
+            assert_eq!(idle_camera_color(palette, true), palette.primary_text);
+            assert_eq!(idle_camera_color(palette, false), palette.secondary_text);
+            assert_ne!(idle_camera_color(palette, true), 0xe5484d);
+        }
+    }
+
+    #[test]
     fn titlebar_palette_inverts_text_and_controls_for_light_and_dark() {
         let dark = TitlebarPalette::for_surface(0x111111);
         let light = TitlebarPalette::for_surface(0xf3f3f3);
@@ -1017,6 +1122,17 @@ mod tests {
             assert!(contrast_ratio(palette.primary_text, palette.surface) >= 4.5);
             assert!(contrast_ratio(palette.secondary_text, palette.surface) >= 4.5);
         }
+    }
+
+    #[test]
+    fn presenter_surface_is_visible_before_hover_while_titlebar_surface_stays_transparent() {
+        assert_eq!(disclosure_surface_alpha(true, 0.0), 1.0);
+        assert_eq!(disclosure_surface_alpha(true, 1.0), 1.0);
+        assert_eq!(disclosure_surface_alpha(false, 0.0), 1.0 / 255.0);
+        assert_eq!(
+            disclosure_surface_alpha(false, TITLEBAR_SURFACE_REVEAL_END),
+            1.0
+        );
     }
 
     #[test]
