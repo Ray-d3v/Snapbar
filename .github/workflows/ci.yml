@@ -95,8 +95,8 @@ jobs:
           $notes = @"
           Windows 11向けのSnapbarベータビルドです。
 
-          - Snapbar-Setup-x64.exe: タイトルバー内だけで展開し、Windowsサインイン時の自動起動が既定で有効なユーザー単位インストーラー
-          - Snapbar-portable-x64.exe: ポータブル実行ファイル（同じ表示は --inline-titlebar を付けて起動）
+          - Snapbar-Setup-x64.exe: ホバー時にタイトルバー下へせり出すアイランド表示で、Windowsサインイン時の自動起動が既定で有効なユーザー単位インストーラー
+          - Snapbar-portable-x64.exe: インストール不要のポータブル実行ファイル（引数なしで同じアイランド表示）
 
           主な変更:
 
@@ -111,6 +111,6 @@ jobs:
             "dist/Snapbar-Setup-x64.exe" `
             "dist/Snapbar-portable-x64.exe" `
             --target $env:GITHUB_SHA `
-            --title "Snapbar $tag（タイトルバー内表示版）" `
+            --title "Snapbar $tag（タイトルバーアイランド版）" `
             --notes $notes `
             --prerelease
