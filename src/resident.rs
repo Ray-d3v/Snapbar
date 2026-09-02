@@ -30,6 +30,8 @@ use windows::{
     core::w,
 };
 
+use crate::shutdown::defer_cleanup;
+
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 41;
 const TRAY_ICON_ID: u32 = 1;
 const MENU_RESCAN: u32 = 1001;
@@ -87,7 +89,9 @@ impl Drop for ResidentController {
             }
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            defer_cleanup("snapbar-notification-area-stop", move || {
+                let _ = worker.join();
+            });
         }
     }
 }

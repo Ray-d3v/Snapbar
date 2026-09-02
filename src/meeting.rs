@@ -32,6 +32,7 @@ use windows::{
 use xcap::Window;
 
 use crate::capture::{CaptureTarget, LocalMonitorCaptureTarget, detect_local_monitor_target};
+use crate::shutdown::defer_cleanup;
 
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(700);
 const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(40);
@@ -131,8 +132,13 @@ impl Drop for MeetingMonitor {
                     PostThreadMessageW(thread_id, WM_QUIT, Default::default(), Default::default());
             }
         }
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        let workers = std::mem::take(&mut self.workers);
+        if !workers.is_empty() {
+            defer_cleanup("snapbar-meeting-stop", move || {
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
         }
     }
 }

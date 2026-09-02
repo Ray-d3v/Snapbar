@@ -29,6 +29,7 @@ use super::{
     local_share::validate_local_monitor_target,
     uia::{WindowGeometry, detect_content_rect},
 };
+use crate::shutdown::defer_cleanup;
 
 const BACKUP_CACHE_INTERVAL: Duration = Duration::from_millis(750);
 const FRESH_FRAME_WAIT: Duration = Duration::from_millis(45);
@@ -74,7 +75,10 @@ impl Drop for EngineInner {
             .ok()
             .and_then(|mut control| control.take());
         if let Some(control) = control {
-            let _ = control.stop();
+            control.halt_handle().store(true, Ordering::Release);
+            defer_cleanup("snapbar-capture-stop", move || {
+                let _ = control.stop();
+            });
         }
     }
 }

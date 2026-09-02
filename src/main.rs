@@ -17,6 +17,8 @@ mod overlay;
 mod resident;
 #[cfg(target_os = "windows")]
 mod settings;
+#[cfg(target_os = "windows")]
+mod shutdown;
 
 #[cfg(target_os = "windows")]
 fn main() {

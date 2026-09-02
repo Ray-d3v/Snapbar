@@ -32,6 +32,8 @@ use windows::Win32::{
     },
 };
 
+use crate::shutdown::defer_cleanup;
+
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const PRESENTER_FOLLOW_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -1151,6 +1153,23 @@ impl TeamsWindowFollower {
         self.visible.load(Ordering::Acquire)
     }
 
+    pub fn begin_shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.target_id.store(0, Ordering::Release);
+        self.presenter_toolbar_id.store(0, Ordering::Release);
+        self.expanded.store(false, Ordering::Release);
+        self.disclosure_progress.store(0, Ordering::Release);
+        self.compact.store(false, Ordering::Release);
+        self.visible.store(false, Ordering::Release);
+        self.wake();
+
+        let hwnd = HWND(self.overlay_hwnd as *mut c_void);
+        post_overlay_message(hwnd, WM_APP_RESET_DISCLOSURE);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
     pub fn exclude_overlay_from_capture(&self) -> Option<TemporaryOverlayCaptureExclusion> {
         let hwnd = HWND(self.overlay_hwnd as *mut c_void);
         unsafe {
@@ -1181,10 +1200,11 @@ impl Drop for TemporaryOverlayCaptureExclusion {
 
 impl Drop for TeamsWindowFollower {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        self.wake();
+        self.begin_shutdown();
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            defer_cleanup("snapbar-window-follow-stop", move || {
+                let _ = worker.join();
+            });
         }
         self.native_hover.take();
     }

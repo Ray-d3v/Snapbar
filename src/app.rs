@@ -238,6 +238,7 @@ struct Snapbar {
     capture_state: CaptureState,
     capture_generation: u64,
     last_error: Option<String>,
+    quitting: bool,
 }
 
 impl Snapbar {
@@ -275,6 +276,7 @@ impl Snapbar {
             capture_state: CaptureState::NoTarget,
             capture_generation: 0,
             last_error: None,
+            quitting: false,
         };
         let snapshot = snapbar.meeting_monitor.snapshot();
         snapbar.apply_meeting_snapshot(snapshot, cx);
@@ -364,7 +366,7 @@ impl Snapbar {
 
     fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
         if self.resident.quit_requested() {
-            cx.quit();
+            self.begin_quit(cx);
             return;
         }
 
@@ -538,6 +540,24 @@ impl Snapbar {
             }
         }
         cx.notify();
+    }
+
+    fn begin_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        if let Some(follower) = self.follower.take() {
+            follower.begin_shutdown();
+            drop(follower);
+        }
+        self.capture_engine = None;
+        cx.quit();
+    }
+
+    fn on_quit_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.begin_quit(cx);
     }
 
     fn on_capture_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -908,7 +928,7 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .cursor_pointer()
             .active(|button| button.opacity(0.72))
-            .on_click(|_, _, cx| cx.quit())
+            .on_click(cx.listener(Self::on_quit_clicked))
             .child(
                 div()
                     .flex()
