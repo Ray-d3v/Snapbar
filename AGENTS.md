@@ -39,7 +39,7 @@
 - Keep idle and compact title-bar affordances visually transparent like native caption cells. Use the opaque-black square-top, concave-shoulder, rounded-bottom material only for the expanded island.
 - Keep the native input region aligned to the currently visible collapsed, expanded, or compact silhouette. Use one shared geometry source and one native-region writer.
 - During disclosure, animate one shared progress value for both painting and the native region. The expanded region must retain a square top, concave shoulders at the caption boundary, and rounded bottom corners while it grows from the centered idle surface.
-- Keep the control out of Alt+Tab and the taskbar, do not activate it when shown or clicked, and exclude it from screen capture.
+- Keep the control out of Alt+Tab and the taskbar, and do not activate it when shown or clicked. Include the title-bar UI and successful-capture flash in screen sharing and recordings by default; `--exclude-overlay-from-capture` is the explicit opt-out.
 - Prefer small, direct changes. Do not introduce Electron, Tauri, another webview, a background service, or cloud authentication.
 
 ## Quality gates

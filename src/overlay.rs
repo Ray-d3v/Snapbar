@@ -140,29 +140,30 @@ impl OverlayPresentation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OverlayCaptureMode {
-    #[default]
     Excluded,
+    #[default]
     Recordable,
 }
 
 impl OverlayCaptureMode {
     pub fn from_command_line() -> Self {
-        Self::from_arguments(std::env::args_os(), cfg!(debug_assertions))
+        Self::from_arguments(std::env::args_os())
     }
 
-    fn from_arguments<I, S>(arguments: I, debug_build: bool) -> Self
+    fn from_arguments<I, S>(arguments: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        if debug_build
-            || arguments
-                .into_iter()
-                .any(|argument| matches!(argument.as_ref().to_str(), Some("--recordable-overlay")))
-        {
-            Self::Recordable
-        } else {
+        if arguments.into_iter().any(|argument| {
+            matches!(
+                argument.as_ref().to_str(),
+                Some("--exclude-overlay-from-capture")
+            )
+        }) {
             Self::Excluded
+        } else {
+            Self::Recordable
         }
     }
 
@@ -2098,18 +2099,22 @@ mod tests {
     }
 
     #[test]
-    fn capture_exclusion_is_the_release_default_but_development_can_opt_in() {
+    fn capture_is_recordable_by_default_but_can_be_explicitly_excluded() {
         assert_eq!(
-            OverlayCaptureMode::from_arguments(["snapbar.exe"], false),
+            OverlayCaptureMode::from_arguments(["snapbar.exe"]),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe", "--recordable-overlay"]),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments([
+                "snapbar.exe",
+                "--recordable-overlay",
+                "--exclude-overlay-from-capture",
+            ]),
             OverlayCaptureMode::Excluded
-        );
-        assert_eq!(
-            OverlayCaptureMode::from_arguments(["snapbar.exe", "--recordable-overlay"], false,),
-            OverlayCaptureMode::Recordable
-        );
-        assert_eq!(
-            OverlayCaptureMode::from_arguments(["snapbar.exe"], true),
-            OverlayCaptureMode::Recordable
         );
         assert_eq!(
             OverlayCaptureMode::Excluded.display_affinity(),
