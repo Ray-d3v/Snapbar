@@ -23,6 +23,7 @@ jobs:
           cat .github/snapbar-patch/part-*.patch > /tmp/snapbar.patch
           git apply --check /tmp/snapbar.patch
           git apply /tmp/snapbar.patch
+          git checkout -- .github/workflows/ci.yml
           rm -rf .github/snapbar-patch
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
