@@ -857,10 +857,10 @@ fn dwm_caption_color(hwnd: HWND) -> Option<u32> {
     (!matches!(color.0, DWMWA_COLOR_DEFAULT | DWMWA_COLOR_NONE)).then(|| colorref_to_rgb(color))
 }
 
-fn sample_titlebar_color(hwnd: HWND) -> Option<u32> {
+fn sample_titlebar_color(hwnd: HWND, caption_height: i32) -> Option<u32> {
     let window = get_window_rect(hwnd)?;
     let frame = extended_frame_bounds(hwnd).unwrap_or(window);
-    let caption = caption_geometry(window, frame, caption_button_bounds(hwnd), 32)?;
+    let caption = caption_geometry(window, frame, caption_button_bounds(hwnd), caption_height)?;
     representative_color(&sample_screen_colors(&titlebar_sample_points(caption)))
         .or_else(|| dwm_caption_color(hwnd))
 }
@@ -992,7 +992,10 @@ impl TeamsWindowFollower {
                             Some(PRESENTER_TOOLBAR_COLOR)
                         } else {
                             let target_hwnd = HWND(target_id as usize as *mut c_void);
-                            sample_titlebar_color(target_hwnd)
+                            let caption_height = window_metrics(overlay_hwnd)
+                                .map(nominal_caption_height)
+                                .unwrap_or(32);
+                            sample_titlebar_color(target_hwnd, caption_height)
                         };
                         if let Some(sampled_color) = sampled_color {
                             let current_color = thread_titlebar_color.load(Ordering::Acquire);
@@ -1282,6 +1285,22 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
 
 fn scale_logical(value: f32, actual: i32, logical: f32) -> i32 {
     ((value * actual as f32) / logical).round() as i32
+}
+
+fn nominal_caption_height(overlay: WindowMetrics) -> i32 {
+    scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24)
+}
+
+fn nominal_island_drop(overlay: WindowMetrics) -> i32 {
+    let caption_height = nominal_caption_height(overlay);
+    // Scale the two logical edges before subtracting them. Scaling the 16px size
+    // independently can round away the reserved top-outline pixel at custom DPIs.
+    let caption_and_drop = scale_logical(
+        COLLAPSED_HEIGHT + ISLAND_DROP,
+        overlay.client_height,
+        WINDOW_HEIGHT,
+    );
+    caption_and_drop.saturating_sub(caption_height)
 }
 
 fn surface_rect_for_size(
@@ -1697,35 +1716,56 @@ fn caption_geometry(
     window_rect: RectI,
     visible_frame: RectI,
     caption_relative: Option<RectI>,
-    fallback_height: i32,
+    caption_height: i32,
 ) -> Option<CaptionGeometry> {
-    if let Some(relative) = caption_relative {
-        let absolute = relative.offset(window_rect.left, window_rect.top);
-        let band = RectI {
-            left: visible_frame.left,
-            top: absolute.top.max(visible_frame.top),
-            right: visible_frame.right,
-            bottom: absolute.bottom.min(visible_frame.bottom),
-        };
-        let buttons_left = absolute.left.clamp(visible_frame.left, visible_frame.right);
-        if (24..=96).contains(&band.height()) && buttons_left > visible_frame.center_x() {
-            return Some(CaptionGeometry { band, buttons_left });
-        }
-    }
-
-    let maximum_height = visible_frame.height().min(96);
-    if maximum_height < 24 {
+    if visible_frame.width() <= 0 || visible_frame.height() < 24 {
         return None;
     }
-    let height = fallback_height.clamp(24, maximum_height);
+
+    // DWMWA_CAPTION_BUTTON_BOUNDS describes only the caption-button area. Its top
+    // and height are not the title-bar band and can shrink when a window is
+    // maximized. Preserve a healthy bottom anchor so 30px and 46px Teams title
+    // bars keep their existing alignment, but make the occupied band at least the
+    // product's fixed logical height. Invalid vertical data falls back to the top
+    // of the visible DWM frame. The rectangle's X remains the button exclusion.
+    let height = caption_height.clamp(24, visible_frame.height());
+    let absolute_caption =
+        caption_relative.map(|relative| relative.offset(window_rect.left, window_rect.top));
+    let minimum_bottom = visible_frame
+        .top
+        .saturating_add(height)
+        .min(visible_frame.bottom);
+    let maximum_bottom = visible_frame
+        .top
+        .saturating_add(height.saturating_mul(2))
+        .min(visible_frame.bottom);
+    let observed_bottom = absolute_caption.and_then(|absolute| {
+        let clipped_top = absolute.top.max(visible_frame.top);
+        let clipped_bottom = absolute.bottom.min(visible_frame.bottom);
+        (clipped_bottom > clipped_top && clipped_bottom <= maximum_bottom).then_some(clipped_bottom)
+    });
+    let bottom = observed_bottom
+        .unwrap_or(minimum_bottom)
+        .max(minimum_bottom);
+
+    let fallback_buttons_left = visible_frame.right - visible_frame.width() / 8;
+    let buttons_left = absolute_caption
+        .and_then(|absolute| {
+            let intersects_frame =
+                absolute.right > visible_frame.left && absolute.left < visible_frame.right;
+            let left = absolute.left.clamp(visible_frame.left, visible_frame.right);
+            (intersects_frame && left > visible_frame.center_x()).then_some(left)
+        })
+        .unwrap_or(fallback_buttons_left);
+
     Some(CaptionGeometry {
         band: RectI {
             left: visible_frame.left,
-            top: visible_frame.top,
+            top: bottom - height,
             right: visible_frame.right,
-            bottom: visible_frame.top + height,
+            bottom,
         },
-        buttons_left: visible_frame.right - visible_frame.width() / 8,
+        buttons_left,
     })
 }
 
@@ -1759,18 +1799,17 @@ fn calculate_placement(
     let island_drop = if presentation.is_inline() {
         0
     } else {
-        scale_logical(ISLAND_DROP, overlay.client_height, WINDOW_HEIGHT).clamp(0, full_height)
+        nominal_island_drop(overlay).clamp(0, full_height)
     };
     // Every presentation reserves one logical pixel above its visible surface for the
-    // DWM outer frame. Keep the fallback caption at its full nominal height so bottom
-    // anchoring leaves that outline unobscured.
-    let caption_fallback_height =
-        scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24);
+    // DWM outer frame. Keep the nominal caption at its full fixed height so bottom
+    // anchoring leaves that outline unobscured independently of caption-button Y.
+    let caption_height = nominal_caption_height(overlay);
     let Some(caption) = caption_geometry(
         target_window,
         target_frame,
         caption_relative,
-        caption_fallback_height,
+        caption_height,
     ) else {
         return OverlayPlacement::Hidden;
     };
@@ -2639,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn caption_bounds_are_converted_from_window_relative_space() {
+    fn caption_button_x_is_converted_without_using_its_vertical_extent() {
         let window = RectI {
             left: -7,
             top: -7,
@@ -2659,13 +2698,48 @@ mod tests {
             bottom: 53,
         };
         let geometry = caption_geometry(window, frame, Some(caption), 42).unwrap();
-        assert_eq!(geometry.band.top, 0);
+        assert_eq!(geometry.band.top, 4);
         assert_eq!(geometry.band.bottom, 46);
         assert_eq!(geometry.buttons_left, 1677);
+
+        let short_maximized_buttons = RectI { top: 25, ..caption };
+        assert_eq!(
+            caption_geometry(window, frame, Some(short_maximized_buttons), 42),
+            Some(geometry)
+        );
+
+        let clipped_bottom = RectI {
+            top: 7,
+            bottom: 35,
+            ..caption
+        };
+        let promoted = caption_geometry(window, frame, Some(clipped_bottom), 42).unwrap();
+        assert_eq!(promoted.band.top, 0);
+        assert_eq!(promoted.band.bottom, 42);
+        assert_eq!(promoted.buttons_left, geometry.buttons_left);
+
+        let implausibly_deep = RectI {
+            top: 7,
+            bottom: 150,
+            ..caption
+        };
+        let fallback = caption_geometry(window, frame, Some(implausibly_deep), 42).unwrap();
+        assert_eq!(fallback.band.top, 0);
+        assert_eq!(fallback.band.bottom, 42);
+
+        let invalid_horizontal_bounds = RectI {
+            left: 100,
+            right: 300,
+            ..caption
+        };
+        let horizontal_fallback =
+            caption_geometry(window, frame, Some(invalid_horizontal_bounds), 42).unwrap();
+        assert_eq!(horizontal_fallback.band, geometry.band);
+        assert_eq!(horizontal_fallback.buttons_left, 1_680);
     }
 
     #[test]
-    fn expanded_surface_is_anchored_to_the_caption_bottom_edge() {
+    fn expanded_surface_preserves_a_healthy_observed_caption_bottom_edge() {
         let overlay = WindowMetrics {
             window_rect: RectI {
                 left: 0,
@@ -2706,7 +2780,7 @@ mod tests {
         assert!(!compact);
         let expanded = surface_rect(350, 50, OverlayMode::Expanded);
         assert!(y + expanded.top >= 0);
-        // Caption bottom (46) plus the scaled 16px island drop (17px here).
+        // Preserve the healthy observed caption bottom (46) and add the scaled drop.
         assert_eq!(y + expanded.bottom, 63);
     }
 
@@ -2944,6 +3018,74 @@ mod tests {
                 compact: true,
             }
         );
+    }
+
+    #[test]
+    fn short_maximized_caption_buttons_do_not_hide_at_common_or_custom_dpis() {
+        for (client_width, client_height) in [
+            (280, 48),
+            (321, 55),
+            (338, 58),
+            (350, 60),
+            (420, 72),
+            (490, 84),
+            (560, 96),
+        ] {
+            let overlay = WindowMetrics {
+                window_rect: RectI {
+                    left: 0,
+                    top: 0,
+                    right: client_width,
+                    bottom: client_height,
+                },
+                client_screen_left: 0,
+                client_screen_top: 0,
+                client_width,
+                client_height,
+            };
+            let target_window = RectI {
+                left: -8,
+                top: -8,
+                right: 1_928,
+                bottom: 1_088,
+            };
+            let target_frame = RectI {
+                left: 0,
+                top: 0,
+                right: 1_920,
+                bottom: 1_080,
+            };
+            let caption_buttons = RectI {
+                left: 1_608,
+                top: 8,
+                right: 1_928,
+                bottom: 36,
+            };
+
+            let placement = calculate_placement(
+                target_window,
+                target_frame,
+                Some(caption_buttons),
+                overlay,
+                OverlayPresentation::HoverIsland,
+            );
+            let OverlayPlacement::Visible { y, compact, .. } = placement else {
+                panic!("expected visible placement at {client_width}x{client_height}");
+            };
+            assert!(!compact);
+
+            let expanded = surface_rect(client_width, client_height, OverlayMode::Expanded);
+            let independently_scaled_drop =
+                scale_logical(ISLAND_DROP, client_height, WINDOW_HEIGHT);
+            assert!(expanded.height() > 28 + independently_scaled_drop);
+            let caption_height = nominal_caption_height(overlay);
+            let drop = nominal_island_drop(overlay);
+            assert!(y + expanded.top > target_frame.top);
+            assert_eq!(
+                y + expanded.bottom,
+                target_frame.top + caption_height + drop
+            );
+        }
     }
 
     #[test]
