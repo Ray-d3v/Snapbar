@@ -201,18 +201,16 @@ enum CaptureState {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DisclosureAnimationState {
     generation: u64,
-    start: f32,
 }
 
 impl DisclosureAnimationState {
-    fn retarget(&mut self, current_progress: f32) {
-        // A new element id keeps the current visual position but intentionally
-        // drops velocity inherited from the opposite hover direction.
+    fn reset(&mut self) {
+        // Structural attachment changes must discard stale motion, while ordinary
+        // hover target changes keep this identity and therefore keep spring velocity.
         self.generation = self.generation.wrapping_add(1);
-        self.start = current_progress.clamp(0.0, DISCLOSURE_MAX_PRESENTATION);
     }
 }
 
@@ -316,14 +314,20 @@ impl Snapbar {
         }
     }
 
-    fn retarget_disclosure(&mut self, expanded: bool, current_progress: f32) -> bool {
+    fn retarget_disclosure(&mut self, expanded: bool) -> bool {
         if self.expanded == expanded {
             return false;
         }
 
         self.expanded = expanded;
-        self.disclosure_animation.retarget(current_progress);
         true
+    }
+
+    fn reset_disclosure(&mut self) -> bool {
+        let changed = self.expanded;
+        self.expanded = false;
+        self.disclosure_animation.reset();
+        changed
     }
 
     fn start_resident_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -426,7 +430,7 @@ impl Snapbar {
         self.local_monitor_target = snapshot.local_monitor_target;
 
         if previous_id != next_id || previous_presenter_toolbar_id != self.presenter_toolbar_id {
-            self.retarget_disclosure(false, 0.0);
+            self.reset_disclosure();
             self.compact_layout = false;
             cx.notify();
         }
@@ -460,7 +464,7 @@ impl Snapbar {
         }
 
         if !self.has_capture_context() {
-            self.retarget_disclosure(false, 0.0);
+            self.reset_disclosure();
             self.compact_layout = false;
             cx.notify();
         }
@@ -503,7 +507,7 @@ impl Snapbar {
     fn sync_overlay_state(&mut self) -> bool {
         let Some(follower) = self.follower.as_ref() else {
             let changed = self.expanded || self.compact_layout;
-            self.retarget_disclosure(false, 0.0);
+            self.reset_disclosure();
             self.compact_layout = false;
             return changed;
         };
@@ -511,12 +515,11 @@ impl Snapbar {
         let compact = follower.is_compact();
         let expanded = follower.is_visible() && follower.is_expanded() && !compact;
         let titlebar_color = follower.titlebar_color();
-        let disclosure_progress = follower.disclosure_progress();
         let changed = self.compact_layout != compact
             || self.expanded != expanded
             || self.titlebar_color != titlebar_color;
         self.compact_layout = compact;
-        self.retarget_disclosure(expanded, disclosure_progress);
+        self.retarget_disclosure(expanded);
         self.titlebar_color = titlebar_color;
         changed
     }
@@ -970,7 +973,6 @@ impl Render for Snapbar {
             .child(quit);
 
         let disclosure_target = if self.expanded { 1.0 } else { 0.0 };
-        let disclosure_start = self.disclosure_animation.start;
         let disclosure_generation = self.disclosure_animation.generation;
         let progress_publisher = self
             .follower
@@ -986,7 +988,6 @@ impl Render for Snapbar {
                 ("titlebar-disclosure-spring", disclosure_generation),
                 SpringAnimation::new(disclosure_spring_config(presentation))
                     .to(disclosure_target)
-                    .from(disclosure_start)
                     .with_epsilon(0.001),
                 move |surface, spring_position| {
                     let spring_position = spring_position.max(0.0);
@@ -1177,16 +1178,30 @@ mod tests {
     }
 
     #[test]
-    fn disclosure_retarget_keeps_position_but_starts_a_fresh_spring_generation() {
+    fn structural_disclosure_reset_replaces_the_spring_identity() {
         let mut animation = DisclosureAnimationState::default();
-        animation.retarget(0.63);
-
+        animation.reset();
         assert_eq!(animation.generation, 1);
-        assert_eq!(animation.start, 0.63);
-
-        animation.retarget(0.41);
+        animation.reset();
         assert_eq!(animation.generation, 2);
-        assert_eq!(animation.start, 0.41);
+    }
+
+    #[test]
+    fn disclosure_retarget_keeps_continuous_spring_velocity() {
+        let spring = disclosure_spring_config(OverlayPresentation::HoverIsland);
+        let moving = spring.step(
+            gpui::SpringState {
+                position: 0.0,
+                velocity: 0.0,
+            },
+            1.0,
+            0.05,
+        );
+        let reversed = spring.step(moving, 0.0, 0.005);
+
+        assert!(moving.velocity > 0.0);
+        assert!(reversed.velocity > 0.0);
+        assert!(reversed.position > moving.position);
     }
 
     #[test]
