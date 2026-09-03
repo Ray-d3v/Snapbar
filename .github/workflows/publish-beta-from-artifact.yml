@@ -42,7 +42,7 @@ jobs:
           notes=$(cat <<'EOF'
           SnapbarのWindows 11向け初回ベータです。
 
-          - `Snapbar-Setup-x64.exe`: ホバー時にタイトルバー下へせり出すアイランド表示で、自動起動が既定で有効なユーザー単位インストーラー
+          - `Snapbar-Setup-x64.exe`: ホバー時に操作ボタンを展開し、自動起動が既定で有効なユーザー単位インストーラー
           - `Snapbar-portable-x64.exe`: インストール不要のポータブル版
           - `Snapbar-SHA256SUMS.txt`: SHA-256チェックサム
 

@@ -201,16 +201,40 @@ enum CaptureState {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpandedControl {
+    Status,
+    Capture,
+    Save,
+    Refresh,
+    Quit,
+}
+
+impl ExpandedControl {
+    fn hover_label(self, save_to_screenshots: bool) -> &'static str {
+        match self {
+            Self::Status => "状態更新",
+            Self::Capture => "撮影",
+            Self::Save if save_to_screenshots => "PNG保存 ON",
+            Self::Save => "PNG保存 OFF",
+            Self::Refresh => "再検出",
+            Self::Quit => "終了",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DisclosureAnimationState {
     generation: u64,
+    start: f32,
 }
 
 impl DisclosureAnimationState {
-    fn reset(&mut self) {
-        // Structural attachment changes must discard stale motion, while ordinary
-        // hover target changes keep this identity and therefore keep spring velocity.
+    fn retarget(&mut self, current_progress: f32) {
+        // A new element id keeps the current visual position but intentionally
+        // drops velocity inherited from the opposite hover direction.
         self.generation = self.generation.wrapping_add(1);
+        self.start = current_progress.clamp(0.0, DISCLOSURE_MAX_PRESENTATION);
     }
 }
 
@@ -232,6 +256,7 @@ struct Snapbar {
     titlebar_color: u32,
     settings: AppSettings,
     expanded: bool,
+    hovered_control: Option<ExpandedControl>,
     disclosure_animation: DisclosureAnimationState,
     capture_state: CaptureState,
     capture_generation: u64,
@@ -270,6 +295,7 @@ impl Snapbar {
             titlebar_color,
             settings: AppSettings::load(),
             expanded: false,
+            hovered_control: None,
             disclosure_animation: DisclosureAnimationState::default(),
             capture_state: CaptureState::NoTarget,
             capture_generation: 0,
@@ -314,20 +340,36 @@ impl Snapbar {
         }
     }
 
-    fn retarget_disclosure(&mut self, expanded: bool) -> bool {
+    fn retarget_disclosure(&mut self, expanded: bool, current_progress: f32) -> bool {
         if self.expanded == expanded {
             return false;
         }
 
         self.expanded = expanded;
+        if !expanded {
+            self.hovered_control = None;
+        }
+        self.disclosure_animation.retarget(current_progress);
         true
     }
 
-    fn reset_disclosure(&mut self) -> bool {
-        let changed = self.expanded;
-        self.expanded = false;
-        self.disclosure_animation.reset();
-        changed
+    fn update_hovered_control(
+        &mut self,
+        control: ExpandedControl,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = if hovered {
+            Some(control)
+        } else if self.hovered_control == Some(control) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_control != next {
+            self.hovered_control = next;
+            cx.notify();
+        }
     }
 
     fn start_resident_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -430,7 +472,7 @@ impl Snapbar {
         self.local_monitor_target = snapshot.local_monitor_target;
 
         if previous_id != next_id || previous_presenter_toolbar_id != self.presenter_toolbar_id {
-            self.reset_disclosure();
+            self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             cx.notify();
         }
@@ -464,7 +506,7 @@ impl Snapbar {
         }
 
         if !self.has_capture_context() {
-            self.reset_disclosure();
+            self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             cx.notify();
         }
@@ -507,7 +549,7 @@ impl Snapbar {
     fn sync_overlay_state(&mut self) -> bool {
         let Some(follower) = self.follower.as_ref() else {
             let changed = self.expanded || self.compact_layout;
-            self.reset_disclosure();
+            self.retarget_disclosure(false, 0.0);
             self.compact_layout = false;
             return changed;
         };
@@ -515,11 +557,12 @@ impl Snapbar {
         let compact = follower.is_compact();
         let expanded = follower.is_visible() && follower.is_expanded() && !compact;
         let titlebar_color = follower.titlebar_color();
+        let disclosure_progress = follower.disclosure_progress();
         let changed = self.compact_layout != compact
             || self.expanded != expanded
             || self.titlebar_color != titlebar_color;
         self.compact_layout = compact;
-        self.retarget_disclosure(expanded);
+        self.retarget_disclosure(expanded, disclosure_progress);
         self.titlebar_color = titlebar_color;
         changed
     }
@@ -720,6 +763,10 @@ impl Render for Snapbar {
             0.0
         };
         let save_to_screenshots = self.settings.save_to_screenshots;
+        let status_label = self
+            .hovered_control
+            .map(|control| control.hover_label(save_to_screenshots))
+            .unwrap_or_else(|| self.status_label());
         let palette = TitlebarPalette::for_surface(self.titlebar_color);
         let status_color = self.status_color(palette.is_light);
         let primary_text = rgb(palette.primary_text);
@@ -813,6 +860,9 @@ impl Render for Snapbar {
             .text_xs()
             .text_color(primary_text)
             .active(|button| button.opacity(0.72))
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.update_hovered_control(ExpandedControl::Status, *hovered, cx);
+            }))
             .on_click(cx.listener(Self::on_refresh_clicked))
             .child(
                 div()
@@ -825,7 +875,7 @@ impl Render for Snapbar {
                     .rounded(px(11.0))
                     .hover(move |button| button.bg(rgb(palette.status_hover)))
                     .child(div().size(px(7.0)).rounded_full().bg(status_color))
-                    .child(self.status_label()),
+                    .child(status_label),
             );
 
         let capture = div()
@@ -834,6 +884,9 @@ impl Render for Snapbar {
             .items_center()
             .justify_center()
             .size(px(ACTION_CONTROL_SIZE))
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.update_hovered_control(ExpandedControl::Capture, *hovered, cx);
+            }))
             .when(can_capture, |button| {
                 button
                     .cursor_pointer()
@@ -868,6 +921,9 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .cursor_pointer()
             .active(|button| button.opacity(0.72))
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.update_hovered_control(ExpandedControl::Save, *hovered, cx);
+            }))
             .on_click(cx.listener(Self::on_save_toggle_clicked))
             .child(
                 div()
@@ -905,6 +961,9 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .cursor_pointer()
             .active(|button| button.opacity(0.72))
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.update_hovered_control(ExpandedControl::Refresh, *hovered, cx);
+            }))
             .on_click(cx.listener(Self::on_refresh_clicked))
             .child(
                 div()
@@ -931,6 +990,9 @@ impl Render for Snapbar {
             .size(px(ACTION_CONTROL_SIZE))
             .cursor_pointer()
             .active(|button| button.opacity(0.72))
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.update_hovered_control(ExpandedControl::Quit, *hovered, cx);
+            }))
             .on_click(cx.listener(Self::on_quit_clicked))
             .child(
                 div()
@@ -973,6 +1035,7 @@ impl Render for Snapbar {
             .child(quit);
 
         let disclosure_target = if self.expanded { 1.0 } else { 0.0 };
+        let disclosure_start = self.disclosure_animation.start;
         let disclosure_generation = self.disclosure_animation.generation;
         let progress_publisher = self
             .follower
@@ -988,6 +1051,7 @@ impl Render for Snapbar {
                 ("titlebar-disclosure-spring", disclosure_generation),
                 SpringAnimation::new(disclosure_spring_config(presentation))
                     .to(disclosure_target)
+                    .from(disclosure_start)
                     .with_epsilon(0.001),
                 move |surface, spring_position| {
                     let spring_position = spring_position.max(0.0);
@@ -1111,6 +1175,16 @@ mod tests {
     }
 
     #[test]
+    fn expanded_control_hover_labels_explain_every_action() {
+        assert_eq!(ExpandedControl::Status.hover_label(false), "状態更新");
+        assert_eq!(ExpandedControl::Capture.hover_label(false), "撮影");
+        assert_eq!(ExpandedControl::Save.hover_label(false), "PNG保存 OFF");
+        assert_eq!(ExpandedControl::Save.hover_label(true), "PNG保存 ON");
+        assert_eq!(ExpandedControl::Refresh.hover_label(false), "再検出");
+        assert_eq!(ExpandedControl::Quit.hover_label(false), "終了");
+    }
+
+    #[test]
     fn idle_camera_stays_neutral_until_hover_disclosure() {
         for surface in [0x111111, 0xf3f3f3] {
             let palette = TitlebarPalette::for_surface(surface);
@@ -1178,30 +1252,16 @@ mod tests {
     }
 
     #[test]
-    fn structural_disclosure_reset_replaces_the_spring_identity() {
+    fn disclosure_retarget_keeps_position_but_starts_a_fresh_spring_generation() {
         let mut animation = DisclosureAnimationState::default();
-        animation.reset();
+        animation.retarget(0.63);
+
         assert_eq!(animation.generation, 1);
-        animation.reset();
+        assert_eq!(animation.start, 0.63);
+
+        animation.retarget(0.41);
         assert_eq!(animation.generation, 2);
-    }
-
-    #[test]
-    fn disclosure_retarget_keeps_continuous_spring_velocity() {
-        let spring = disclosure_spring_config(OverlayPresentation::HoverIsland);
-        let moving = spring.step(
-            gpui::SpringState {
-                position: 0.0,
-                velocity: 0.0,
-            },
-            1.0,
-            0.05,
-        );
-        let reversed = spring.step(moving, 0.0, 0.005);
-
-        assert!(moving.velocity > 0.0);
-        assert!(reversed.velocity > 0.0);
-        assert!(reversed.position > moving.position);
+        assert_eq!(animation.start, 0.41);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     ffi::c_void,
+    mem::size_of,
     ptr::null_mut,
     sync::{
         Arc,
@@ -20,7 +21,10 @@ use windows::Win32::{
             DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_CAPTION_COLOR,
             DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
-        Gdi::{GetDC, GetPixel, ReleaseDC},
+        Gdi::{
+            CreateRectRgn, DeleteObject, ExtCreateRegion, GetDC, GetPixel, HGDIOBJ, HRGN,
+            RDH_RECTANGLES, RGNDATA, RGNDATAHEADER, ReleaseDC, SetWindowRgn,
+        },
     },
     UI::WindowsAndMessaging::{
         GW_HWNDPREV, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
@@ -38,6 +42,7 @@ const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const PRESENTER_FOLLOW_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
+const COLOR_SAMPLE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 const EXPAND_DELAY_MS: u32 = 16;
 const COLLAPSE_DELAY_MS: u32 = 50;
 const SAFETY_INTERVAL_MS: u32 = 250;
@@ -59,7 +64,6 @@ const WM_APP_RESET_DISCLOSURE: u32 = 0x8000 + 0x351;
 const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
 const TME_LEAVE: u32 = 0x0000_0002;
 const MA_NOACTIVATE: isize = 3;
-const RGN_OR: i32 = 2;
 const WORK_FOLLOW: u32 = 1 << 0;
 const WORK_REGION: u32 = 1 << 1;
 const DISCLOSURE_PROGRESS_MAX: u32 = 1_000;
@@ -239,22 +243,9 @@ type SubclassProc = unsafe extern "system" fn(
     reference_data: usize,
 ) -> isize;
 
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn CombineRgn(
-        destination: *mut c_void,
-        source_one: *mut c_void,
-        source_two: *mut c_void,
-        combine_mode: i32,
-    ) -> i32;
-    fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
-    fn DeleteObject(object: *mut c_void) -> i32;
-}
-
 #[link(name = "user32")]
 unsafe extern "system" {
     fn ClientToScreen(hwnd: *mut c_void, point: *mut POINT) -> i32;
-    fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
     fn TrackMouseEvent(event: *mut TrackMouseEventRaw) -> i32;
     fn SetTimer(
         hwnd: *mut c_void,
@@ -717,7 +708,7 @@ enum OverlayZOrderAnchor {
     After(isize),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowMetrics {
     window_rect: RectI,
     client_screen_left: i32,
@@ -899,6 +890,60 @@ impl DisclosureProgressPublisher {
     }
 }
 
+fn follow_interval(target_id: u32, presenter_attached: bool) -> Duration {
+    if presenter_attached {
+        PRESENTER_FOLLOW_INTERVAL
+    } else if target_id == 0 {
+        IDLE_INTERVAL
+    } else {
+        FOLLOW_INTERVAL
+    }
+}
+
+fn full_follow_due(
+    last_full_follow: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+    anchor_changed: bool,
+) -> bool {
+    anchor_changed
+        || match last_full_follow {
+            Some(last) => now.saturating_duration_since(last) >= interval,
+            None => true,
+        }
+}
+
+fn remaining_follow_wait(
+    last_full_follow: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> Duration {
+    match last_full_follow {
+        Some(last) => interval.saturating_sub(now.saturating_duration_since(last)),
+        None => Duration::ZERO,
+    }
+}
+
+fn region_update_redraw(disclosure_progress: u32, structural_change: bool) -> bool {
+    // GPUI presents the intermediate pixels itself; request a full native redraw only
+    // when the clip settles or unrelated window geometry changes.
+    structural_change || matches!(disclosure_progress, 0 | DISCLOSURE_PROGRESS_MAX)
+}
+
+fn disclosure_is_settled(
+    expanded: bool,
+    disclosure_progress: u32,
+    last_progress_change: Instant,
+    now: Instant,
+) -> bool {
+    let at_target = if expanded {
+        disclosure_progress == DISCLOSURE_PROGRESS_MAX
+    } else {
+        disclosure_progress == 0
+    };
+    at_target && now.saturating_duration_since(last_progress_change) >= COLOR_SAMPLE_SETTLE_INTERVAL
+}
+
 pub struct TeamsWindowFollower {
     overlay_hwnd: isize,
     capture_mode: OverlayCaptureMode,
@@ -973,25 +1018,35 @@ impl TeamsWindowFollower {
 
                 let mut previous_placement = None;
                 let mut previous_region_state = None;
-                let mut visible_now = false;
-                let mut compact_now = false;
                 let mut previous_visible = false;
                 let mut previous_compact = false;
-                let mut presenter_attached = false;
                 let mut previous_target_id = 0;
                 let mut previous_presenter_toolbar_id = 0;
+                let mut cached_overlay_metrics = None;
+                let mut last_full_follow = None;
+                let mut previous_disclosure_progress = 0;
+                let mut last_progress_change = Instant::now() - COLOR_SAMPLE_SETTLE_INTERVAL;
                 let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
-                let mut next_follow_at = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
                     let requested_work = thread_pending_work.swap(0, Ordering::AcqRel);
-                    let (follow_requested, mut region_requested) =
-                        classify_worker_work(requested_work, Instant::now() >= next_follow_at);
+                    let target_id = thread_target_id.load(Ordering::Acquire);
+                    let presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);
+                    let presenter_attached = presenter_toolbar_id != 0;
+                    let target_changed = target_id != previous_target_id;
+                    let presenter_changed = presenter_toolbar_id != previous_presenter_toolbar_id;
+                    let anchor_changed = target_changed || presenter_changed;
+                    let interval = follow_interval(target_id, presenter_attached);
+                    let follow_started = Instant::now();
+                    // GPUI can publish at the monitor refresh rate. Keep target/DWM/z-order
+                    // queries on an absolute cadence so frame wakes only reshape the exact
+                    // native hit region between full follow passes.
+                    let follow_due =
+                        full_follow_due(last_full_follow, follow_started, interval, anchor_changed);
+                    let (run_full_follow, run_region_update) =
+                        classify_worker_work(requested_work, follow_due);
+                    let mut structural_change = false;
 
-                    if follow_requested {
-                        let target_id = thread_target_id.load(Ordering::Acquire);
-                        let presenter_toolbar_id =
-                            thread_presenter_toolbar_id.load(Ordering::Acquire);
-                        presenter_attached = presenter_toolbar_id != 0;
+                    if run_full_follow {
                         let placement = if presenter_attached {
                             let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
                             desired_presenter_placement(
@@ -1006,40 +1061,11 @@ impl TeamsWindowFollower {
                             desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
                         };
 
-                        visible_now = matches!(placement, OverlayPlacement::Visible { .. });
-                        compact_now =
+                        let visible_now = matches!(placement, OverlayPlacement::Visible { .. });
+                        let compact_now =
                             matches!(placement, OverlayPlacement::Visible { compact: true, .. });
                         thread_visible.store(visible_now, Ordering::Release);
                         thread_compact.store(compact_now, Ordering::Release);
-
-                        let target_changed = target_id != previous_target_id;
-                        let presenter_changed =
-                            presenter_toolbar_id != previous_presenter_toolbar_id;
-                        let anchor_changed = target_changed || presenter_changed;
-                        if visible_now
-                            && (anchor_changed
-                                || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
-                        {
-                            let sampled_color = if presenter_attached {
-                                Some(PRESENTER_TOOLBAR_COLOR)
-                            } else {
-                                let target_hwnd = HWND(target_id as usize as *mut c_void);
-                                let caption_height = window_metrics(overlay_hwnd)
-                                    .map(nominal_caption_height)
-                                    .unwrap_or(32);
-                                sample_titlebar_color(target_hwnd, caption_height)
-                            };
-                            if let Some(sampled_color) = sampled_color {
-                                let current_color = thread_titlebar_color.load(Ordering::Acquire);
-                                if colors_materially_differ(current_color, sampled_color) {
-                                    thread_titlebar_color.store(sampled_color, Ordering::Release);
-                                    let _ = thread_event_tx.try_send(());
-                                }
-                            }
-                            last_titlebar_sample = Instant::now();
-                        }
-                        previous_target_id = target_id;
-                        previous_presenter_toolbar_id = presenter_toolbar_id;
 
                         let visibility_changed = visible_now != previous_visible;
                         let compact_changed = compact_now != previous_compact;
@@ -1050,8 +1076,15 @@ impl TeamsWindowFollower {
                                 post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
                             }
                             let _ = thread_event_tx.try_send(());
-                            previous_visible = visible_now;
-                            previous_compact = compact_now;
+                        }
+
+                        let placement_changed = previous_placement != Some(placement);
+                        if placement_changed {
+                            apply_placement(overlay_hwnd, placement);
+                            if visible_now {
+                                post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
+                            }
+                            previous_placement = Some(placement);
                         }
 
                         if visible_now {
@@ -1063,41 +1096,47 @@ impl TeamsWindowFollower {
                             sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
                         }
 
-                        if previous_placement != Some(placement) {
-                            apply_placement(overlay_hwnd, placement);
-                            if visible_now {
-                                post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
-                            }
-                            previous_placement = Some(placement);
-                        }
-
-                        region_requested = true;
-                        let interval = if presenter_attached {
-                            PRESENTER_FOLLOW_INTERVAL
-                        } else if target_id == 0 {
-                            IDLE_INTERVAL
-                        } else {
-                            FOLLOW_INTERVAL
-                        };
-                        next_follow_at = Instant::now() + interval;
+                        let next_metrics = window_metrics(overlay_hwnd);
+                        let metrics_changed = next_metrics != cached_overlay_metrics;
+                        cached_overlay_metrics = next_metrics;
+                        structural_change = anchor_changed
+                            || visibility_changed
+                            || compact_changed
+                            || placement_changed
+                            || metrics_changed;
+                        previous_visible = visible_now;
+                        previous_compact = compact_now;
+                        previous_target_id = target_id;
+                        previous_presenter_toolbar_id = presenter_toolbar_id;
+                        last_full_follow = Some(follow_started);
                     }
 
-                    if region_requested {
-                        let disclosure_progress = if visible_now && !compact_now {
-                            thread_disclosure_progress.load(Ordering::Acquire)
-                        } else {
-                            thread_disclosure_progress.store(0, Ordering::Release);
-                            0
-                        };
-                        match desired_window_region(
-                            overlay_hwnd,
-                            thread_presentation,
-                            compact_now,
-                            presenter_attached,
-                            disclosure_progress,
-                        ) {
+                    let disclosure_progress = if previous_visible && !previous_compact {
+                        thread_disclosure_progress.load(Ordering::Acquire)
+                    } else {
+                        thread_disclosure_progress.store(0, Ordering::Release);
+                        0
+                    };
+                    let progress_observed_at = Instant::now();
+                    if disclosure_progress != previous_disclosure_progress {
+                        previous_disclosure_progress = disclosure_progress;
+                        last_progress_change = progress_observed_at;
+                    }
+
+                    if run_region_update {
+                        match cached_overlay_metrics.map(|metrics| {
+                            window_region_for_attachment(
+                                metrics,
+                                thread_presentation,
+                                previous_compact,
+                                presenter_attached,
+                                disclosure_progress,
+                            )
+                        }) {
                             Some(region) if previous_region_state != Some(region) => {
-                                if apply_window_region(overlay_hwnd, region) {
+                                let redraw =
+                                    region_update_redraw(disclosure_progress, structural_change);
+                                if apply_window_region(overlay_hwnd, region, redraw) {
                                     previous_region_state = Some(region);
                                 }
                             }
@@ -1106,7 +1145,45 @@ impl TeamsWindowFollower {
                         }
                     }
 
-                    let wait = next_follow_at.saturating_duration_since(Instant::now());
+                    if run_full_follow
+                        && previous_visible
+                        && (anchor_changed
+                            || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
+                        && (presenter_attached
+                            || disclosure_is_settled(
+                                thread_expanded.load(Ordering::Acquire),
+                                disclosure_progress,
+                                last_progress_change,
+                                progress_observed_at,
+                            ))
+                    {
+                        // GetPixel can synchronize with desktop composition. Defer it until
+                        // the integer disclosure geometry has stayed at its target long
+                        // enough that it cannot interrupt an active transition.
+                        let sampled_color = if presenter_attached {
+                            Some(PRESENTER_TOOLBAR_COLOR)
+                        } else {
+                            let target_hwnd = HWND(target_id as usize as *mut c_void);
+                            let caption_height = cached_overlay_metrics
+                                .map(nominal_caption_height)
+                                .unwrap_or(32);
+                            sample_titlebar_color(target_hwnd, caption_height)
+                        };
+                        if let Some(sampled_color) = sampled_color {
+                            let current_color = thread_titlebar_color.load(Ordering::Acquire);
+                            if colors_materially_differ(current_color, sampled_color) {
+                                thread_titlebar_color.store(sampled_color, Ordering::Release);
+                                let _ = thread_event_tx.try_send(());
+                            }
+                        }
+                        last_titlebar_sample = Instant::now();
+                    }
+
+                    let wait = remaining_follow_wait(
+                        last_full_follow,
+                        Instant::now(),
+                        follow_interval(target_id, presenter_attached),
+                    );
                     match wake_rx.recv_timeout(wait) {
                         Ok(()) | Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -1184,6 +1261,10 @@ impl TeamsWindowFollower {
             pending_work: Arc::clone(&self.pending_work),
             wake_tx: self.wake_tx.clone(),
         }
+    }
+
+    pub fn disclosure_progress(&self) -> f32 {
+        self.disclosure_progress.load(Ordering::Acquire) as f32 / DISCLOSURE_PROGRESS_MAX as f32
     }
 
     pub fn is_compact(&self) -> bool {
@@ -1554,22 +1635,6 @@ fn window_region_for_attachment(
     }
 }
 
-fn desired_window_region(
-    hwnd: HWND,
-    presentation: OverlayPresentation,
-    compact: bool,
-    presenter_attached: bool,
-    disclosure_progress: u32,
-) -> Option<WindowRegion> {
-    Some(window_region_for_attachment(
-        window_metrics(hwnd)?,
-        presentation,
-        compact,
-        presenter_attached,
-        disclosure_progress,
-    ))
-}
-
 fn island_row_inset(
     row: i32,
     width: i32,
@@ -1629,138 +1694,157 @@ fn rounded_rectangle_row_inset(row: i32, width: i32, height: i32, corner_radius:
     }
 }
 
-fn visit_row_runs(
+fn coalesced_row_rectangles(
     desired: WindowRegion,
     mut row_inset: impl FnMut(i32, i32, i32) -> i32,
-    mut visit: impl FnMut(RectI) -> bool,
-) -> Option<usize> {
+) -> Vec<RectI> {
     let width = desired.right.saturating_sub(desired.left);
     let height = desired.bottom.saturating_sub(desired.top);
     if width <= 0 || height <= 0 {
-        return None;
+        return Vec::new();
     }
 
-    let mut run_start = 0;
-    let mut run_inset = row_inset(0, width, height);
-    let mut run_count = 0;
-    for row in 1..=height {
-        let next_inset = (row < height).then(|| row_inset(row, width, height));
-        if next_inset == Some(run_inset) {
+    let mut rectangles: Vec<RectI> = Vec::with_capacity(height as usize);
+    for row in 0..height {
+        let inset = row_inset(row, width, height);
+        let strip_left = desired.left.saturating_add(inset);
+        let strip_right = desired.right.saturating_sub(inset);
+        if strip_right <= strip_left {
             continue;
         }
 
-        let strip = RectI {
-            left: desired.left.saturating_add(run_inset),
-            top: desired.top.saturating_add(run_start),
-            right: desired.right.saturating_sub(run_inset),
-            bottom: desired.top.saturating_add(row),
-        };
-        if strip.right > strip.left && strip.bottom > strip.top {
-            if !visit(strip) {
-                return None;
+        let strip_top = desired.top.saturating_add(row);
+        if let Some(previous) = rectangles.last_mut()
+            && previous.left == strip_left
+            && previous.right == strip_right
+            && previous.bottom == strip_top
+        {
+            previous.bottom = strip_top.saturating_add(1);
+        } else {
+            rectangles.push(RectI {
+                left: strip_left,
+                top: strip_top,
+                right: strip_right,
+                bottom: strip_top.saturating_add(1),
+            });
+        }
+    }
+    rectangles
+}
+
+fn create_region_from_rectangles(rectangles: &[RectI]) -> HRGN {
+    let Some(first) = rectangles.first().copied() else {
+        return HRGN(null_mut());
+    };
+    let mut bounds = first;
+    for rectangle in &rectangles[1..] {
+        bounds.left = bounds.left.min(rectangle.left);
+        bounds.top = bounds.top.min(rectangle.top);
+        bounds.right = bounds.right.max(rectangle.right);
+        bounds.bottom = bounds.bottom.max(rectangle.bottom);
+    }
+
+    let Some(rectangle_bytes) = size_of::<RECT>().checked_mul(rectangles.len()) else {
+        return HRGN(null_mut());
+    };
+    let Some(data_bytes) = size_of::<RGNDATAHEADER>().checked_add(rectangle_bytes) else {
+        return HRGN(null_mut());
+    };
+    let (Ok(data_bytes_u32), Ok(rectangle_bytes_u32), Ok(rectangle_count)) = (
+        u32::try_from(data_bytes),
+        u32::try_from(rectangle_bytes),
+        u32::try_from(rectangles.len()),
+    ) else {
+        return HRGN(null_mut());
+    };
+    let word_size = size_of::<u32>();
+    let Some(storage_bytes) = data_bytes.checked_add(word_size - 1) else {
+        return HRGN(null_mut());
+    };
+    let mut storage = vec![0_u32; storage_bytes / word_size];
+    let data_ptr = storage.as_mut_ptr().cast::<u8>();
+    unsafe {
+        // ExtCreateRegion consumes all vertically coalesced scan strips in one GDI call.
+        // This preserves the row-exact silhouette without per-row GDI object churn.
+        data_ptr.cast::<RGNDATAHEADER>().write(RGNDATAHEADER {
+            dwSize: size_of::<RGNDATAHEADER>() as u32,
+            iType: RDH_RECTANGLES,
+            nCount: rectangle_count,
+            nRgnSize: rectangle_bytes_u32,
+            rcBound: RECT {
+                left: bounds.left,
+                top: bounds.top,
+                right: bounds.right,
+                bottom: bounds.bottom,
+            },
+        });
+        let rectangle_ptr = data_ptr.add(size_of::<RGNDATAHEADER>()).cast::<RECT>();
+        for (index, rectangle) in rectangles.iter().enumerate() {
+            rectangle_ptr.add(index).write(RECT {
+                left: rectangle.left,
+                top: rectangle.top,
+                right: rectangle.right,
+                bottom: rectangle.bottom,
+            });
+        }
+        ExtCreateRegion(None, data_bytes_u32, data_ptr.cast::<RGNDATA>())
+    }
+}
+
+fn coalesced_region_rectangles(desired: WindowRegion) -> Vec<RectI> {
+    match desired.shape {
+        WindowRegionShape::Rectangle => {
+            if desired.right > desired.left && desired.bottom > desired.top {
+                vec![RectI {
+                    left: desired.left,
+                    top: desired.top,
+                    right: desired.right,
+                    bottom: desired.bottom,
+                }]
+            } else {
+                Vec::new()
             }
-            run_count += 1;
         }
-        if let Some(next_inset) = next_inset {
-            run_start = row;
-            run_inset = next_inset;
-        }
-    }
-
-    (run_count > 0).then_some(run_count)
-}
-
-fn create_row_region(
-    desired: WindowRegion,
-    row_inset: impl FnMut(i32, i32, i32) -> i32,
-) -> *mut c_void {
-    let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
-    if region.is_null() {
-        return null_mut();
-    }
-
-    let combined = visit_row_runs(desired, row_inset, |strip_bounds| {
-        let strip = unsafe {
-            CreateRectRgn(
-                strip_bounds.left,
-                strip_bounds.top,
-                strip_bounds.right,
-                strip_bounds.bottom,
-            )
-        };
-        if strip.is_null() {
-            return false;
-        }
-        let result = unsafe { CombineRgn(region, region, strip, RGN_OR) };
-        unsafe {
-            let _ = DeleteObject(strip);
-        }
-        result != 0
-    });
-
-    if combined.is_none() {
-        unsafe {
-            let _ = DeleteObject(region);
-        }
-        return null_mut();
-    }
-    region
-}
-
-fn create_island_region(
-    desired: WindowRegion,
-    shoulder_start: i32,
-    shoulder_depth: i32,
-    shoulder_inset: i32,
-    bottom_radius: i32,
-) -> *mut c_void {
-    create_row_region(desired, |row, width, height| {
-        island_row_inset(
-            row,
-            width,
-            height,
-            shoulder_start,
-            shoulder_depth,
-            shoulder_inset,
-            bottom_radius,
-        )
-    })
-}
-
-fn create_rounded_rectangle_region(desired: WindowRegion, corner_radius: i32) -> *mut c_void {
-    create_row_region(desired, |row, width, height| {
-        rounded_rectangle_row_inset(row, width, height, corner_radius)
-    })
-}
-
-fn apply_window_region(hwnd: HWND, desired: WindowRegion) -> bool {
-    let region = match desired.shape {
-        WindowRegionShape::Rectangle => unsafe {
-            CreateRectRgn(desired.left, desired.top, desired.right, desired.bottom)
-        },
         WindowRegionShape::Island {
             shoulder_start,
             shoulder_depth,
             shoulder_inset,
             bottom_radius,
-        } => create_island_region(
-            desired,
-            shoulder_start,
-            shoulder_depth,
-            shoulder_inset,
-            bottom_radius,
-        ),
+        } => coalesced_row_rectangles(desired, |row, width, height| {
+            island_row_inset(
+                row,
+                width,
+                height,
+                shoulder_start,
+                shoulder_depth,
+                shoulder_inset,
+                bottom_radius,
+            )
+        }),
         WindowRegionShape::RoundedRectangle { corner_radius } => {
-            create_rounded_rectangle_region(desired, corner_radius)
+            coalesced_row_rectangles(desired, |row, width, height| {
+                rounded_rectangle_row_inset(row, width, height, corner_radius)
+            })
+        }
+    }
+}
+
+fn apply_window_region(hwnd: HWND, desired: WindowRegion, redraw: bool) -> bool {
+    let region = match desired.shape {
+        WindowRegionShape::Rectangle => unsafe {
+            CreateRectRgn(desired.left, desired.top, desired.right, desired.bottom)
+        },
+        WindowRegionShape::Island { .. } | WindowRegionShape::RoundedRectangle { .. } => {
+            create_region_from_rectangles(&coalesced_region_rectangles(desired))
         }
     };
-    if region.is_null() {
+    if region.0.is_null() {
         return false;
     }
-    let applied = unsafe { SetWindowRgn(hwnd.0, region, 1) };
+    let applied = unsafe { SetWindowRgn(hwnd, Some(region), redraw) };
     if applied == 0 {
         unsafe {
-            let _ = DeleteObject(region);
+            let _ = DeleteObject(HGDIOBJ(region.0));
         }
         return false;
     }
@@ -2135,6 +2219,63 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
 mod tests {
     use super::*;
 
+    fn expected_row_inset(region: WindowRegion, row: i32, width: i32, height: i32) -> i32 {
+        match region.shape {
+            WindowRegionShape::Rectangle => 0,
+            WindowRegionShape::Island {
+                shoulder_start,
+                shoulder_depth,
+                shoulder_inset,
+                bottom_radius,
+            } => island_row_inset(
+                row,
+                width,
+                height,
+                shoulder_start,
+                shoulder_depth,
+                shoulder_inset,
+                bottom_radius,
+            ),
+            WindowRegionShape::RoundedRectangle { corner_radius } => {
+                rounded_rectangle_row_inset(row, width, height, corner_radius)
+            }
+        }
+    }
+
+    fn assert_coalesced_region_is_exact(region: WindowRegion) {
+        let width = region.right.saturating_sub(region.left);
+        let height = region.bottom.saturating_sub(region.top);
+        let rectangles = coalesced_region_rectangles(region);
+        assert!(width > 0 && height > 0);
+        assert!(!rectangles.is_empty());
+        assert!(rectangles.len() <= height as usize);
+
+        for rectangle in &rectangles {
+            assert!(rectangle.left >= region.left);
+            assert!(rectangle.right <= region.right);
+            assert!(rectangle.top >= region.top);
+            assert!(rectangle.bottom <= region.bottom);
+            assert!(rectangle.left < rectangle.right);
+            assert!(rectangle.top < rectangle.bottom);
+        }
+        for pair in rectangles.windows(2) {
+            assert_eq!(pair[0].bottom, pair[1].top);
+            assert_ne!((pair[0].left, pair[0].right), (pair[1].left, pair[1].right));
+        }
+
+        for y in region.top..region.bottom {
+            let mut covering = rectangles
+                .iter()
+                .filter(|rectangle| rectangle.top <= y && y < rectangle.bottom);
+            let rectangle = covering.next().expect("every visible row must be covered");
+            assert!(covering.next().is_none(), "rows must not overlap");
+            let row = y.saturating_sub(region.top);
+            let inset = expected_row_inset(region, row, width, height);
+            assert_eq!(rectangle.left, region.left.saturating_add(inset));
+            assert_eq!(rectangle.right, region.right.saturating_sub(inset));
+        }
+    }
+
     #[test]
     fn worker_wakes_coalesce_without_losing_dirty_reasons() {
         let pending_work = AtomicU32::new(0);
@@ -2259,6 +2400,79 @@ mod tests {
             WDA_EXCLUDEFROMCAPTURE
         );
         assert_eq!(OverlayCaptureMode::Recordable.display_affinity(), WDA_NONE);
+    }
+
+    #[test]
+    fn animation_wakes_do_not_postpone_the_full_follow_deadline() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(100);
+        assert!(full_follow_due(None, start, interval, false));
+        for elapsed_ms in [1, 8, 16, 33, 67, 99] {
+            let wake = start + Duration::from_millis(elapsed_ms);
+            assert!(!full_follow_due(Some(start), wake, interval, false));
+        }
+        assert_eq!(
+            remaining_follow_wait(Some(start), start + Duration::from_millis(99), interval,),
+            Duration::from_millis(1)
+        );
+        assert!(full_follow_due(
+            Some(start),
+            start + interval,
+            interval,
+            false,
+        ));
+        assert!(full_follow_due(
+            Some(start),
+            start + Duration::from_millis(1),
+            interval,
+            true,
+        ));
+    }
+
+    #[test]
+    fn follow_cadence_preserves_presenter_and_idle_behavior() {
+        assert_eq!(follow_interval(1, true), PRESENTER_FOLLOW_INTERVAL);
+        assert_eq!(follow_interval(1, false), FOLLOW_INTERVAL);
+        assert_eq!(follow_interval(0, false), IDLE_INTERVAL);
+    }
+
+    #[test]
+    fn animated_region_redraws_only_at_endpoints_or_structural_changes() {
+        assert!(region_update_redraw(0, false));
+        assert!(!region_update_redraw(1, false));
+        assert!(!region_update_redraw(500, false));
+        assert!(region_update_redraw(DISCLOSURE_PROGRESS_MAX, false));
+        assert!(!region_update_redraw(DISCLOSURE_PROGRESS_LIMIT, false));
+        assert!(region_update_redraw(500, true));
+    }
+
+    #[test]
+    fn titlebar_sampling_waits_until_disclosure_motion_settles() {
+        let changed = Instant::now();
+        assert!(!disclosure_is_settled(
+            true,
+            DISCLOSURE_PROGRESS_MAX,
+            changed,
+            changed,
+        ));
+        assert!(disclosure_is_settled(
+            true,
+            DISCLOSURE_PROGRESS_MAX,
+            changed,
+            changed + COLOR_SAMPLE_SETTLE_INTERVAL,
+        ));
+        assert!(!disclosure_is_settled(
+            true,
+            DISCLOSURE_PROGRESS_LIMIT,
+            changed,
+            changed + COLOR_SAMPLE_SETTLE_INTERVAL,
+        ));
+        assert!(disclosure_is_settled(
+            false,
+            0,
+            changed,
+            changed + COLOR_SAMPLE_SETTLE_INTERVAL,
+        ));
     }
 
     #[test]
@@ -2661,18 +2875,11 @@ mod tests {
                 bottom_radius: 8,
             },
         };
-        let mut runs = Vec::new();
-        let run_count = visit_row_runs(
-            desired,
-            |row, width, height| island_row_inset(row, width, height, 29, 10, 16, 8),
-            |run| {
-                runs.push(run);
-                true
-            },
-        )
-        .unwrap();
+        let runs = coalesced_row_rectangles(desired, |row, width, height| {
+            island_row_inset(row, width, height, 29, 10, 16, 8)
+        });
+        let run_count = runs.len();
 
-        assert_eq!(run_count, runs.len());
         assert!(run_count < desired.bottom.saturating_sub(desired.top) as usize / 2);
         for row in 0..desired.bottom.saturating_sub(desired.top) {
             let expected_inset = island_row_inset(row, 272, 45, 29, 10, 16, 8);
@@ -2697,6 +2904,74 @@ mod tests {
         assert_eq!(island_row_inset(40, 272, 45, 29, 10, 16, 8), 17);
         assert_eq!(island_row_inset(42, 272, 45, 29, 10, 16, 8), 18);
         assert_eq!(island_row_inset(44, 272, 45, 29, 10, 16, 8), 24);
+    }
+
+    #[test]
+    fn batched_regions_preserve_every_animated_row_at_common_and_fractional_dpis() {
+        for (client_width, client_height) in [
+            (280, 48),
+            (321, 55),
+            (338, 58),
+            (350, 60),
+            (420, 72),
+            (490, 84),
+            (560, 96),
+        ] {
+            let metrics = WindowMetrics {
+                window_rect: RectI {
+                    left: 0,
+                    top: 0,
+                    right: client_width,
+                    bottom: client_height,
+                },
+                client_screen_left: 0,
+                client_screen_top: 0,
+                client_width,
+                client_height,
+            };
+
+            for presenter_attached in [false, true] {
+                for progress in 0..=DISCLOSURE_PROGRESS_LIMIT {
+                    assert_coalesced_region_is_exact(window_region_for_attachment(
+                        metrics,
+                        OverlayPresentation::HoverIsland,
+                        false,
+                        presenter_attached,
+                        progress,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_rectangle_data_creates_a_native_region() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 280,
+                bottom: 48,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 280,
+            client_height: 48,
+        };
+        let region = window_region_for_attachment(
+            metrics,
+            OverlayPresentation::HoverIsland,
+            false,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        );
+        let rectangles = coalesced_region_rectangles(region);
+        assert!(rectangles.len() < region.bottom.saturating_sub(region.top) as usize);
+        let native = create_region_from_rectangles(&rectangles);
+        assert!(!native.0.is_null());
+        unsafe {
+            assert!(DeleteObject(HGDIOBJ(native.0)).as_bool());
+        }
     }
 
     #[test]
