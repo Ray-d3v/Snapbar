@@ -60,8 +60,21 @@ const WM_APP_REEVALUATE_POINTER: u32 = 0x8000 + 0x352;
 const TME_LEAVE: u32 = 0x0000_0002;
 const MA_NOACTIVATE: isize = 3;
 const RGN_OR: i32 = 2;
+const WORK_FOLLOW: u32 = 1 << 0;
+const WORK_REGION: u32 = 1 << 1;
 const DISCLOSURE_PROGRESS_MAX: u32 = 1_000;
 const DISCLOSURE_PROGRESS_LIMIT: u32 = 1_044;
+
+fn request_worker_work(pending_work: &AtomicU32, wake_tx: &SyncSender<()>, work: u32) {
+    pending_work.fetch_or(work, Ordering::Release);
+    let _ = wake_tx.try_send(());
+}
+
+fn classify_worker_work(requested_work: u32, follow_due: bool) -> (bool, bool) {
+    let follow = follow_due || requested_work & WORK_FOLLOW != 0;
+    let region = follow || requested_work & WORK_REGION != 0;
+    (follow, region)
+}
 
 pub const WINDOW_WIDTH: f32 = 280.0;
 pub const WINDOW_HEIGHT: f32 = 48.0;
@@ -423,6 +436,7 @@ struct HoverSubclassState {
     expanded: Arc<AtomicBool>,
     compact: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
+    pending_work: Arc<AtomicU32>,
     wake_tx: SyncSender<()>,
     event_tx: Sender<()>,
 }
@@ -433,7 +447,7 @@ impl HoverSubclassState {
     }
 
     fn publish(&self) {
-        let _ = self.wake_tx.try_send(());
+        request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_REGION);
         let _ = self.event_tx.try_send(());
     }
 
@@ -512,6 +526,7 @@ impl NativeHoverSubclass {
         expanded: Arc<AtomicBool>,
         compact: Arc<AtomicBool>,
         visible: Arc<AtomicBool>,
+        pending_work: Arc<AtomicU32>,
         wake_tx: SyncSender<()>,
         event_tx: Sender<()>,
     ) -> Option<Self> {
@@ -522,6 +537,7 @@ impl NativeHoverSubclass {
             expanded,
             compact,
             visible,
+            pending_work,
             wake_tx,
             event_tx,
         });
@@ -868,6 +884,7 @@ fn sample_titlebar_color(hwnd: HWND, caption_height: i32) -> Option<u32> {
 #[derive(Clone)]
 pub struct DisclosureProgressPublisher {
     progress: Arc<AtomicU32>,
+    pending_work: Arc<AtomicU32>,
     wake_tx: SyncSender<()>,
 }
 
@@ -877,7 +894,7 @@ impl DisclosureProgressPublisher {
             .round()
             .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32;
         if self.progress.swap(next, Ordering::AcqRel) != next {
-            let _ = self.wake_tx.try_send(());
+            request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_REGION);
         }
     }
 }
@@ -893,6 +910,7 @@ pub struct TeamsWindowFollower {
     compact: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     event_rx: Receiver<()>,
+    pending_work: Arc<AtomicU32>,
     wake_tx: SyncSender<()>,
     native_hover: Option<NativeHoverSubclass>,
     stop: Arc<AtomicBool>,
@@ -919,6 +937,7 @@ impl TeamsWindowFollower {
         let compact = Arc::new(AtomicBool::new(false));
         let visible = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let pending_work = Arc::new(AtomicU32::new(WORK_FOLLOW | WORK_REGION));
         let (wake_tx, wake_rx) = sync_channel(1);
         let (event_tx, event_rx) = async_channel::bounded(1);
         let native_hover = Some(NativeHoverSubclass::install(
@@ -926,6 +945,7 @@ impl TeamsWindowFollower {
             Arc::clone(&expanded),
             Arc::clone(&compact),
             Arc::clone(&visible),
+            Arc::clone(&pending_work),
             wake_tx.clone(),
             event_tx.clone(),
         )?);
@@ -938,6 +958,7 @@ impl TeamsWindowFollower {
         let thread_compact = Arc::clone(&compact);
         let thread_visible = Arc::clone(&visible);
         let thread_stop = Arc::clone(&stop);
+        let thread_pending_work = Arc::clone(&pending_work);
         let thread_event_tx = event_tx.clone();
         let thread_presentation = presentation;
         let display_affinity = capture_mode.display_affinity();
@@ -952,122 +973,140 @@ impl TeamsWindowFollower {
 
                 let mut previous_placement = None;
                 let mut previous_region_state = None;
+                let mut visible_now = false;
+                let mut compact_now = false;
                 let mut previous_visible = false;
                 let mut previous_compact = false;
+                let mut presenter_attached = false;
                 let mut previous_target_id = 0;
                 let mut previous_presenter_toolbar_id = 0;
                 let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
+                let mut next_follow_at = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
-                    let target_id = thread_target_id.load(Ordering::Acquire);
-                    let presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);
-                    let presenter_attached = presenter_toolbar_id != 0;
-                    let placement = if presenter_attached {
-                        let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
-                        desired_presenter_placement(
-                            overlay_hwnd,
-                            presenter_hwnd,
-                            thread_presentation,
-                        )
-                    } else if target_id == 0 {
-                        OverlayPlacement::Hidden
-                    } else {
-                        let target_hwnd = HWND(target_id as usize as *mut c_void);
-                        desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
-                    };
+                    let requested_work = thread_pending_work.swap(0, Ordering::AcqRel);
+                    let (follow_requested, mut region_requested) =
+                        classify_worker_work(requested_work, Instant::now() >= next_follow_at);
 
-                    let visible_now = matches!(placement, OverlayPlacement::Visible { .. });
-                    let compact_now =
-                        matches!(placement, OverlayPlacement::Visible { compact: true, .. });
-                    thread_visible.store(visible_now, Ordering::Release);
-                    thread_compact.store(compact_now, Ordering::Release);
-
-                    let target_changed = target_id != previous_target_id;
-                    let presenter_changed = presenter_toolbar_id != previous_presenter_toolbar_id;
-                    let anchor_changed = target_changed || presenter_changed;
-                    if visible_now
-                        && (anchor_changed
-                            || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
-                    {
-                        let sampled_color = if presenter_attached {
-                            Some(PRESENTER_TOOLBAR_COLOR)
+                    if follow_requested {
+                        let target_id = thread_target_id.load(Ordering::Acquire);
+                        let presenter_toolbar_id =
+                            thread_presenter_toolbar_id.load(Ordering::Acquire);
+                        presenter_attached = presenter_toolbar_id != 0;
+                        let placement = if presenter_attached {
+                            let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
+                            desired_presenter_placement(
+                                overlay_hwnd,
+                                presenter_hwnd,
+                                thread_presentation,
+                            )
+                        } else if target_id == 0 {
+                            OverlayPlacement::Hidden
                         } else {
                             let target_hwnd = HWND(target_id as usize as *mut c_void);
-                            let caption_height = window_metrics(overlay_hwnd)
-                                .map(nominal_caption_height)
-                                .unwrap_or(32);
-                            sample_titlebar_color(target_hwnd, caption_height)
+                            desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
                         };
-                        if let Some(sampled_color) = sampled_color {
-                            let current_color = thread_titlebar_color.load(Ordering::Acquire);
-                            if colors_materially_differ(current_color, sampled_color) {
-                                thread_titlebar_color.store(sampled_color, Ordering::Release);
-                                let _ = thread_event_tx.try_send(());
+
+                        visible_now = matches!(placement, OverlayPlacement::Visible { .. });
+                        compact_now =
+                            matches!(placement, OverlayPlacement::Visible { compact: true, .. });
+                        thread_visible.store(visible_now, Ordering::Release);
+                        thread_compact.store(compact_now, Ordering::Release);
+
+                        let target_changed = target_id != previous_target_id;
+                        let presenter_changed =
+                            presenter_toolbar_id != previous_presenter_toolbar_id;
+                        let anchor_changed = target_changed || presenter_changed;
+                        if visible_now
+                            && (anchor_changed
+                                || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
+                        {
+                            let sampled_color = if presenter_attached {
+                                Some(PRESENTER_TOOLBAR_COLOR)
+                            } else {
+                                let target_hwnd = HWND(target_id as usize as *mut c_void);
+                                let caption_height = window_metrics(overlay_hwnd)
+                                    .map(nominal_caption_height)
+                                    .unwrap_or(32);
+                                sample_titlebar_color(target_hwnd, caption_height)
+                            };
+                            if let Some(sampled_color) = sampled_color {
+                                let current_color = thread_titlebar_color.load(Ordering::Acquire);
+                                if colors_materially_differ(current_color, sampled_color) {
+                                    thread_titlebar_color.store(sampled_color, Ordering::Release);
+                                    let _ = thread_event_tx.try_send(());
+                                }
                             }
+                            last_titlebar_sample = Instant::now();
                         }
-                        last_titlebar_sample = Instant::now();
-                    }
-                    previous_target_id = target_id;
-                    previous_presenter_toolbar_id = presenter_toolbar_id;
+                        previous_target_id = target_id;
+                        previous_presenter_toolbar_id = presenter_toolbar_id;
 
-                    let visibility_changed = visible_now != previous_visible;
-                    let compact_changed = compact_now != previous_compact;
-                    if visibility_changed || compact_changed || anchor_changed {
-                        if !visible_now || compact_now {
-                            thread_expanded.store(false, Ordering::Release);
-                            thread_disclosure_progress.store(0, Ordering::Release);
-                            post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
-                        }
-                        let _ = thread_event_tx.try_send(());
-                        previous_visible = visible_now;
-                        previous_compact = compact_now;
-                    }
-
-                    let disclosure_progress = if visible_now && !compact_now {
-                        thread_disclosure_progress.load(Ordering::Acquire)
-                    } else {
-                        thread_disclosure_progress.store(0, Ordering::Release);
-                        0
-                    };
-                    match desired_window_region(
-                        overlay_hwnd,
-                        thread_presentation,
-                        compact_now,
-                        presenter_attached,
-                        disclosure_progress,
-                    ) {
-                        Some(region) if previous_region_state != Some(region) => {
-                            if apply_window_region(overlay_hwnd, region) {
-                                previous_region_state = Some(region);
+                        let visibility_changed = visible_now != previous_visible;
+                        let compact_changed = compact_now != previous_compact;
+                        if visibility_changed || compact_changed || anchor_changed {
+                            if !visible_now || compact_now {
+                                thread_expanded.store(false, Ordering::Release);
+                                thread_disclosure_progress.store(0, Ordering::Release);
+                                post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
                             }
+                            let _ = thread_event_tx.try_send(());
+                            previous_visible = visible_now;
+                            previous_compact = compact_now;
                         }
-                        Some(_) => {}
-                        None => previous_region_state = None,
-                    }
 
-                    if visible_now {
-                        let anchor_hwnd = if presenter_attached {
-                            HWND(presenter_toolbar_id as usize as *mut c_void)
-                        } else {
-                            HWND(target_id as usize as *mut c_void)
-                        };
-                        sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
-                    }
-
-                    if previous_placement != Some(placement) {
-                        apply_placement(overlay_hwnd, placement);
                         if visible_now {
-                            post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
+                            let anchor_hwnd = if presenter_attached {
+                                HWND(presenter_toolbar_id as usize as *mut c_void)
+                            } else {
+                                HWND(target_id as usize as *mut c_void)
+                            };
+                            sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
                         }
-                        previous_placement = Some(placement);
+
+                        if previous_placement != Some(placement) {
+                            apply_placement(overlay_hwnd, placement);
+                            if visible_now {
+                                post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
+                            }
+                            previous_placement = Some(placement);
+                        }
+
+                        region_requested = true;
+                        let interval = if presenter_attached {
+                            PRESENTER_FOLLOW_INTERVAL
+                        } else if target_id == 0 {
+                            IDLE_INTERVAL
+                        } else {
+                            FOLLOW_INTERVAL
+                        };
+                        next_follow_at = Instant::now() + interval;
                     }
 
-                    let wait = if presenter_attached {
-                        PRESENTER_FOLLOW_INTERVAL
-                    } else if target_id == 0 {
-                        IDLE_INTERVAL
-                    } else {
-                        FOLLOW_INTERVAL
-                    };
+                    if region_requested {
+                        let disclosure_progress = if visible_now && !compact_now {
+                            thread_disclosure_progress.load(Ordering::Acquire)
+                        } else {
+                            thread_disclosure_progress.store(0, Ordering::Release);
+                            0
+                        };
+                        match desired_window_region(
+                            overlay_hwnd,
+                            thread_presentation,
+                            compact_now,
+                            presenter_attached,
+                            disclosure_progress,
+                        ) {
+                            Some(region) if previous_region_state != Some(region) => {
+                                if apply_window_region(overlay_hwnd, region) {
+                                    previous_region_state = Some(region);
+                                }
+                            }
+                            Some(_) => {}
+                            None => previous_region_state = None,
+                        }
+                    }
+
+                    let wait = next_follow_at.saturating_duration_since(Instant::now());
                     match wake_rx.recv_timeout(wait) {
                         Ok(()) | Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -1091,6 +1130,7 @@ impl TeamsWindowFollower {
             compact,
             visible,
             event_rx,
+            pending_work,
             wake_tx,
             native_hover,
             stop,
@@ -1098,8 +1138,8 @@ impl TeamsWindowFollower {
         })
     }
 
-    fn wake(&self) {
-        let _ = self.wake_tx.try_send(());
+    fn wake(&self, work: u32) {
+        request_worker_work(self.pending_work.as_ref(), &self.wake_tx, work);
     }
 
     pub fn subscribe(&self) -> Receiver<()> {
@@ -1114,7 +1154,7 @@ impl TeamsWindowFollower {
             }
             self.expanded.store(false, Ordering::Release);
             self.disclosure_progress.store(0, Ordering::Release);
-            self.wake();
+            self.wake(WORK_FOLLOW | WORK_REGION);
         }
     }
 
@@ -1126,7 +1166,7 @@ impl TeamsWindowFollower {
             }
             self.expanded.store(false, Ordering::Release);
             self.disclosure_progress.store(0, Ordering::Release);
-            self.wake();
+            self.wake(WORK_FOLLOW | WORK_REGION);
         }
     }
 
@@ -1141,12 +1181,9 @@ impl TeamsWindowFollower {
     pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
         DisclosureProgressPublisher {
             progress: Arc::clone(&self.disclosure_progress),
+            pending_work: Arc::clone(&self.pending_work),
             wake_tx: self.wake_tx.clone(),
         }
-    }
-
-    pub fn disclosure_progress(&self) -> f32 {
-        self.disclosure_progress.load(Ordering::Acquire) as f32 / DISCLOSURE_PROGRESS_MAX as f32
     }
 
     pub fn is_compact(&self) -> bool {
@@ -1165,7 +1202,7 @@ impl TeamsWindowFollower {
         self.disclosure_progress.store(0, Ordering::Release);
         self.compact.store(false, Ordering::Release);
         self.visible.store(false, Ordering::Release);
-        self.wake();
+        self.wake(WORK_FOLLOW | WORK_REGION);
 
         let hwnd = HWND(self.overlay_hwnd as *mut c_void);
         post_overlay_message(hwnd, WM_APP_RESET_DISCLOSURE);
@@ -1592,58 +1629,76 @@ fn rounded_rectangle_row_inset(row: i32, width: i32, height: i32, corner_radius:
     }
 }
 
-fn create_row_region(
+fn visit_row_runs(
     desired: WindowRegion,
     mut row_inset: impl FnMut(i32, i32, i32) -> i32,
-) -> *mut c_void {
+    mut visit: impl FnMut(RectI) -> bool,
+) -> Option<usize> {
     let width = desired.right.saturating_sub(desired.left);
     let height = desired.bottom.saturating_sub(desired.top);
     if width <= 0 || height <= 0 {
-        return null_mut();
+        return None;
     }
 
+    let mut run_start = 0;
+    let mut run_inset = row_inset(0, width, height);
+    let mut run_count = 0;
+    for row in 1..=height {
+        let next_inset = (row < height).then(|| row_inset(row, width, height));
+        if next_inset == Some(run_inset) {
+            continue;
+        }
+
+        let strip = RectI {
+            left: desired.left.saturating_add(run_inset),
+            top: desired.top.saturating_add(run_start),
+            right: desired.right.saturating_sub(run_inset),
+            bottom: desired.top.saturating_add(row),
+        };
+        if strip.right > strip.left && strip.bottom > strip.top {
+            if !visit(strip) {
+                return None;
+            }
+            run_count += 1;
+        }
+        if let Some(next_inset) = next_inset {
+            run_start = row;
+            run_inset = next_inset;
+        }
+    }
+
+    (run_count > 0).then_some(run_count)
+}
+
+fn create_row_region(
+    desired: WindowRegion,
+    row_inset: impl FnMut(i32, i32, i32) -> i32,
+) -> *mut c_void {
     let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
     if region.is_null() {
         return null_mut();
     }
 
-    let mut has_rows = false;
-    for row in 0..height {
-        let inset = row_inset(row, width, height);
-        let strip_left = desired.left.saturating_add(inset);
-        let strip_right = desired.right.saturating_sub(inset);
-        if strip_right <= strip_left {
-            continue;
-        }
-
+    let combined = visit_row_runs(desired, row_inset, |strip_bounds| {
         let strip = unsafe {
             CreateRectRgn(
-                strip_left,
-                desired.top.saturating_add(row),
-                strip_right,
-                desired.top.saturating_add(row).saturating_add(1),
+                strip_bounds.left,
+                strip_bounds.top,
+                strip_bounds.right,
+                strip_bounds.bottom,
             )
         };
         if strip.is_null() {
-            unsafe {
-                let _ = DeleteObject(region);
-            }
-            return null_mut();
+            return false;
         }
-        let combined = unsafe { CombineRgn(region, region, strip, RGN_OR) };
+        let result = unsafe { CombineRgn(region, region, strip, RGN_OR) };
         unsafe {
             let _ = DeleteObject(strip);
         }
-        if combined == 0 {
-            unsafe {
-                let _ = DeleteObject(region);
-            }
-            return null_mut();
-        }
-        has_rows = true;
-    }
+        result != 0
+    });
 
-    if !has_rows {
+    if combined.is_none() {
         unsafe {
             let _ = DeleteObject(region);
         }
@@ -2079,6 +2134,50 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_wakes_coalesce_without_losing_dirty_reasons() {
+        let pending_work = AtomicU32::new(0);
+        let (wake_tx, wake_rx) = sync_channel(1);
+
+        request_worker_work(&pending_work, &wake_tx, WORK_REGION);
+        request_worker_work(&pending_work, &wake_tx, WORK_FOLLOW);
+
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        assert!(wake_rx.try_recv().is_err());
+        assert_eq!(
+            pending_work.swap(0, Ordering::AcqRel),
+            WORK_FOLLOW | WORK_REGION
+        );
+    }
+
+    #[test]
+    fn animation_work_does_not_run_follow_or_z_order_work() {
+        assert_eq!(classify_worker_work(WORK_REGION, false), (false, true));
+        assert_eq!(classify_worker_work(WORK_FOLLOW, false), (true, true));
+        assert_eq!(classify_worker_work(0, true), (true, true));
+    }
+
+    #[test]
+    fn disclosure_publisher_latches_the_latest_frame_while_wake_is_coalesced() {
+        let progress = Arc::new(AtomicU32::new(0));
+        let pending_work = Arc::new(AtomicU32::new(0));
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let publisher = DisclosureProgressPublisher {
+            progress: Arc::clone(&progress),
+            pending_work: Arc::clone(&pending_work),
+            wake_tx,
+        };
+
+        for frame in 1..=120 {
+            publisher.publish(frame as f32 / 120.0);
+        }
+
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        assert!(wake_rx.try_recv().is_err());
+        assert_eq!(progress.load(Ordering::Acquire), DISCLOSURE_PROGRESS_MAX);
+        assert_eq!(pending_work.load(Ordering::Acquire), WORK_REGION);
+    }
 
     #[test]
     fn colorref_is_converted_from_bgr_to_rgb() {
@@ -2546,6 +2645,45 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn compressed_row_runs_preserve_every_island_scanline() {
+        let desired = WindowRegion {
+            left: 4,
+            top: 1,
+            right: 276,
+            bottom: 46,
+            shape: WindowRegionShape::Island {
+                shoulder_start: 29,
+                shoulder_depth: 10,
+                shoulder_inset: 16,
+                bottom_radius: 8,
+            },
+        };
+        let mut runs = Vec::new();
+        let run_count = visit_row_runs(
+            desired,
+            |row, width, height| island_row_inset(row, width, height, 29, 10, 16, 8),
+            |run| {
+                runs.push(run);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(run_count, runs.len());
+        assert!(run_count < desired.bottom.saturating_sub(desired.top) as usize / 2);
+        for row in 0..desired.bottom.saturating_sub(desired.top) {
+            let expected_inset = island_row_inset(row, 272, 45, 29, 10, 16, 8);
+            let y = desired.top + row;
+            let run = runs
+                .iter()
+                .find(|run| run.top <= y && y < run.bottom)
+                .expect("every scanline must be represented");
+            assert_eq!(run.left, desired.left + expected_inset);
+            assert_eq!(run.right, desired.right - expected_inset);
+        }
     }
 
     #[test]
