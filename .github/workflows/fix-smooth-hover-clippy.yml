@@ -1,0 +1,50 @@
+name: Fix smooth-hover clippy
+
+on:
+  push:
+    branches:
+      - codex/smooth-hover-disclosure
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Remove redundant worker initializers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/overlay.rs")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              "                let mut target_id = 0;\n"
+              "                let mut presenter_toolbar_id = 0;\n",
+              "",
+              1,
+          )
+          text = text.replace(
+              "                        target_id = thread_target_id.load(Ordering::Acquire);\n"
+              "                        presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);\n",
+              "                        let target_id = thread_target_id.load(Ordering::Acquire);\n"
+              "                        let presenter_toolbar_id =\n"
+              "                            thread_presenter_toolbar_id.load(Ordering::Acquire);\n",
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/overlay.rs
+          git commit -m "fix: remove redundant worker initializers"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
