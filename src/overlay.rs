@@ -977,8 +977,6 @@ impl TeamsWindowFollower {
                 let mut compact_now = false;
                 let mut previous_visible = false;
                 let mut previous_compact = false;
-                let mut target_id = 0;
-                let mut presenter_toolbar_id = 0;
                 let mut presenter_attached = false;
                 let mut previous_target_id = 0;
                 let mut previous_presenter_toolbar_id = 0;
@@ -990,8 +988,9 @@ impl TeamsWindowFollower {
                         classify_worker_work(requested_work, Instant::now() >= next_follow_at);
 
                     if follow_requested {
-                        target_id = thread_target_id.load(Ordering::Acquire);
-                        presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);
+                        let target_id = thread_target_id.load(Ordering::Acquire);
+                        let presenter_toolbar_id =
+                            thread_presenter_toolbar_id.load(Ordering::Acquire);
                         presenter_attached = presenter_toolbar_id != 0;
                         let placement = if presenter_attached {
                             let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
