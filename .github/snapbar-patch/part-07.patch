@@ -1,0 +1,3 @@
++            --title "Snapbar $tag" `
+             --notes $notes `
+             --prerelease

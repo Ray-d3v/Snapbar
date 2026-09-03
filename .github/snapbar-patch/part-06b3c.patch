@@ -1,0 +1,2 @@
+             "dist/Snapbar-portable-x64.exe" `
+             --target $env:GITHUB_SHA `

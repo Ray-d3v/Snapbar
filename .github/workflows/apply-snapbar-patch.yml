@@ -1,0 +1,31 @@
+name: Apply Snapbar source patch
+
+on:
+  push:
+    branches:
+      - codex/smooth-hover-disclosure
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/snapbar-patch/part-*.patch > /tmp/snapbar.patch
+          git apply --check /tmp/snapbar.patch
+          git apply /tmp/snapbar.patch
+          rm -rf .github/snapbar-patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "perf: smooth hover disclosure updates"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

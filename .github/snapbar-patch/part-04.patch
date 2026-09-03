@@ -1,0 +1,117 @@
++                                post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
+                             }
++                            previous_placement = Some(placement);
+                         }
+-                        Some(_) => {}
+-                        None => previous_region_state = None,
+-                    }
+ 
+-                    if visible_now {
+-                        let anchor_hwnd = if presenter_attached {
+-                            HWND(presenter_toolbar_id as usize as *mut c_void)
++                        region_requested = true;
++                        let interval = if presenter_attached {
++                            PRESENTER_FOLLOW_INTERVAL
++                        } else if target_id == 0 {
++                            IDLE_INTERVAL
+                         } else {
+-                            HWND(target_id as usize as *mut c_void)
++                            FOLLOW_INTERVAL
+                         };
+-                        sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
++                        next_follow_at = Instant::now() + interval;
+                     }
+ 
+-                    if previous_placement != Some(placement) {
+-                        apply_placement(overlay_hwnd, placement);
+-                        if visible_now {
+-                            post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
++                    if region_requested {
++                        let disclosure_progress = if visible_now && !compact_now {
++                            thread_disclosure_progress.load(Ordering::Acquire)
++                        } else {
++                            thread_disclosure_progress.store(0, Ordering::Release);
++                            0
++                        };
++                        match desired_window_region(
++                            overlay_hwnd,
++                            thread_presentation,
++                            compact_now,
++                            presenter_attached,
++                            disclosure_progress,
++                        ) {
++                            Some(region) if previous_region_state != Some(region) => {
++                                if apply_window_region(overlay_hwnd, region) {
++                                    previous_region_state = Some(region);
++                                }
++                            }
++                            Some(_) => {}
++                            None => previous_region_state = None,
+                         }
+-                        previous_placement = Some(placement);
+                     }
+ 
+-                    let wait = if presenter_attached {
+-                        PRESENTER_FOLLOW_INTERVAL
+-                    } else if target_id == 0 {
+-                        IDLE_INTERVAL
+-                    } else {
+-                        FOLLOW_INTERVAL
+-                    };
++                    let wait = next_follow_at.saturating_duration_since(Instant::now());
+                     match wake_rx.recv_timeout(wait) {
+                         Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                         Err(RecvTimeoutError::Disconnected) => break,
+@@ -1091,6 +1135,7 @@
+             compact,
+             visible,
+             event_rx,
++            pending_work,
+             wake_tx,
+             native_hover,
+             stop,
+@@ -1098,8 +1143,8 @@
+         })
+     }
+ 
+-    fn wake(&self) {
+-        let _ = self.wake_tx.try_send(());
++    fn wake(&self, work: u32) {
++        request_worker_work(self.pending_work.as_ref(), &self.wake_tx, work);
+     }
+ 
+     pub fn subscribe(&self) -> Receiver<()> {
+@@ -1114,7 +1159,7 @@
+             }
+             self.expanded.store(false, Ordering::Release);
+             self.disclosure_progress.store(0, Ordering::Release);
+-            self.wake();
++            self.wake(WORK_FOLLOW | WORK_REGION);
+         }
+     }
+ 
+@@ -1126,7 +1171,7 @@
+             }
+             self.expanded.store(false, Ordering::Release);
+             self.disclosure_progress.store(0, Ordering::Release);
+-            self.wake();
++            self.wake(WORK_FOLLOW | WORK_REGION);
+         }
+     }
+ 
+@@ -1141,14 +1186,11 @@
+     pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
+         DisclosureProgressPublisher {
+             progress: Arc::clone(&self.disclosure_progress),
++            pending_work: Arc::clone(&self.pending_work),
+             wake_tx: self.wake_tx.clone(),
+         }
+     }
+ 
+-    pub fn disclosure_progress(&self) -> f32 {
+-        self.disclosure_progress.load(Ordering::Acquire) as f32 / DISCLOSURE_PROGRESS_MAX as f32
+-    }
+-
+     pub fn is_compact(&self) -> bool {
+         self.compact.load(Ordering::Acquire)
+     }

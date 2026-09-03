@@ -1,0 +1,79 @@
++                                || last_titlebar_sample.elapsed() >= TITLEBAR_SAMPLE_INTERVAL)
++                        {
++                            let sampled_color = if presenter_attached {
++                                Some(PRESENTER_TOOLBAR_COLOR)
++                            } else {
++                                let target_hwnd = HWND(target_id as usize as *mut c_void);
++                                let caption_height = window_metrics(overlay_hwnd)
++                                    .map(nominal_caption_height)
++                                    .unwrap_or(32);
++                                sample_titlebar_color(target_hwnd, caption_height)
++                            };
++                            if let Some(sampled_color) = sampled_color {
++                                let current_color = thread_titlebar_color.load(Ordering::Acquire);
++                                if colors_materially_differ(current_color, sampled_color) {
++                                    thread_titlebar_color.store(sampled_color, Ordering::Release);
++                                    let _ = thread_event_tx.try_send(());
++                                }
+                             }
++                            last_titlebar_sample = Instant::now();
+                         }
+-                        last_titlebar_sample = Instant::now();
+-                    }
+-                    previous_target_id = target_id;
+-                    previous_presenter_toolbar_id = presenter_toolbar_id;
++                        previous_target_id = target_id;
++                        previous_presenter_toolbar_id = presenter_toolbar_id;
+ 
+-                    let visibility_changed = visible_now != previous_visible;
+-                    let compact_changed = compact_now != previous_compact;
+-                    if visibility_changed || compact_changed || anchor_changed {
+-                        if !visible_now || compact_now {
+-                            thread_expanded.store(false, Ordering::Release);
+-                            thread_disclosure_progress.store(0, Ordering::Release);
+-                            post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
++                        let visibility_changed = visible_now != previous_visible;
++                        let compact_changed = compact_now != previous_compact;
++                        if visibility_changed || compact_changed || anchor_changed {
++                            if !visible_now || compact_now {
++                                thread_expanded.store(false, Ordering::Release);
++                                thread_disclosure_progress.store(0, Ordering::Release);
++                                post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
++                            }
++                            let _ = thread_event_tx.try_send(());
++                            previous_visible = visible_now;
++                            previous_compact = compact_now;
+                         }
+-                        let _ = thread_event_tx.try_send(());
+-                        previous_visible = visible_now;
+-                        previous_compact = compact_now;
+-                    }
+ 
+-                    let disclosure_progress = if visible_now && !compact_now {
+-                        thread_disclosure_progress.load(Ordering::Acquire)
+-                    } else {
+-                        thread_disclosure_progress.store(0, Ordering::Release);
+-                        0
+-                    };
+-                    match desired_window_region(
+-                        overlay_hwnd,
+-                        thread_presentation,
+-                        compact_now,
+-                        presenter_attached,
+-                        disclosure_progress,
+-                    ) {
+-                        Some(region) if previous_region_state != Some(region) => {
+-                            if apply_window_region(overlay_hwnd, region) {
+-                                previous_region_state = Some(region);
++                        if visible_now {
++                            let anchor_hwnd = if presenter_attached {
++                                HWND(presenter_toolbar_id as usize as *mut c_void)
++                            } else {
++                                HWND(target_id as usize as *mut c_void)
++                            };
++                            sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
++                        }
++
++                        if previous_placement != Some(placement) {
++                            apply_placement(overlay_hwnd, placement);
++                            if visible_now {

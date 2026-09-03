@@ -1,0 +1,137 @@
++                velocity: 0.0,
++            },
++            1.0,
++            0.05,
++        );
++        let reversed = spring.step(moving, 0.0, 0.005);
++
++        assert!(moving.velocity > 0.0);
++        assert!(reversed.velocity > 0.0);
++        assert!(reversed.position > moving.position);
+     }
+ 
+     #[test]
+--- a/src/overlay.rs
++++ b/src/overlay.rs
+@@ -60,9 +60,22 @@
+ const TME_LEAVE: u32 = 0x0000_0002;
+ const MA_NOACTIVATE: isize = 3;
+ const RGN_OR: i32 = 2;
++const WORK_FOLLOW: u32 = 1 << 0;
++const WORK_REGION: u32 = 1 << 1;
+ const DISCLOSURE_PROGRESS_MAX: u32 = 1_000;
+ const DISCLOSURE_PROGRESS_LIMIT: u32 = 1_044;
+ 
++fn request_worker_work(pending_work: &AtomicU32, wake_tx: &SyncSender<()>, work: u32) {
++    pending_work.fetch_or(work, Ordering::Release);
++    let _ = wake_tx.try_send(());
++}
++
++fn classify_worker_work(requested_work: u32, follow_due: bool) -> (bool, bool) {
++    let follow = follow_due || requested_work & WORK_FOLLOW != 0;
++    let region = follow || requested_work & WORK_REGION != 0;
++    (follow, region)
++}
++
+ pub const WINDOW_WIDTH: f32 = 280.0;
+ pub const WINDOW_HEIGHT: f32 = 48.0;
+ pub const COLLAPSED_WIDTH: f32 = 92.0;
+@@ -423,6 +436,7 @@
+     expanded: Arc<AtomicBool>,
+     compact: Arc<AtomicBool>,
+     visible: Arc<AtomicBool>,
++    pending_work: Arc<AtomicU32>,
+     wake_tx: SyncSender<()>,
+     event_tx: Sender<()>,
+ }
+@@ -433,7 +447,7 @@
+     }
+ 
+     fn publish(&self) {
+-        let _ = self.wake_tx.try_send(());
++        request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_REGION);
+         let _ = self.event_tx.try_send(());
+     }
+ 
+@@ -512,6 +526,7 @@
+         expanded: Arc<AtomicBool>,
+         compact: Arc<AtomicBool>,
+         visible: Arc<AtomicBool>,
++        pending_work: Arc<AtomicU32>,
+         wake_tx: SyncSender<()>,
+         event_tx: Sender<()>,
+     ) -> Option<Self> {
+@@ -522,6 +537,7 @@
+             expanded,
+             compact,
+             visible,
++            pending_work,
+             wake_tx,
+             event_tx,
+         });
+@@ -868,6 +884,7 @@
+ #[derive(Clone)]
+ pub struct DisclosureProgressPublisher {
+     progress: Arc<AtomicU32>,
++    pending_work: Arc<AtomicU32>,
+     wake_tx: SyncSender<()>,
+ }
+ 
+@@ -877,7 +894,7 @@
+             .round()
+             .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32;
+         if self.progress.swap(next, Ordering::AcqRel) != next {
+-            let _ = self.wake_tx.try_send(());
++            request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_REGION);
+         }
+     }
+ }
+@@ -893,6 +910,7 @@
+     compact: Arc<AtomicBool>,
+     visible: Arc<AtomicBool>,
+     event_rx: Receiver<()>,
++    pending_work: Arc<AtomicU32>,
+     wake_tx: SyncSender<()>,
+     native_hover: Option<NativeHoverSubclass>,
+     stop: Arc<AtomicBool>,
+@@ -919,6 +937,7 @@
+         let compact = Arc::new(AtomicBool::new(false));
+         let visible = Arc::new(AtomicBool::new(false));
+         let stop = Arc::new(AtomicBool::new(false));
++        let pending_work = Arc::new(AtomicU32::new(WORK_FOLLOW | WORK_REGION));
+         let (wake_tx, wake_rx) = sync_channel(1);
+         let (event_tx, event_rx) = async_channel::bounded(1);
+         let native_hover = Some(NativeHoverSubclass::install(
+@@ -926,6 +945,7 @@
+             Arc::clone(&expanded),
+             Arc::clone(&compact),
+             Arc::clone(&visible),
++            Arc::clone(&pending_work),
+             wake_tx.clone(),
+             event_tx.clone(),
+         )?);
+@@ -938,6 +958,7 @@
+         let thread_compact = Arc::clone(&compact);
+         let thread_visible = Arc::clone(&visible);
+         let thread_stop = Arc::clone(&stop);
++        let thread_pending_work = Arc::clone(&pending_work);
+         let thread_event_tx = event_tx.clone();
+         let thread_presentation = presentation;
+         let display_affinity = capture_mode.display_affinity();
+@@ -952,122 +973,145 @@
+ 
+                 let mut previous_placement = None;
+                 let mut previous_region_state = None;
++                let mut visible_now = false;
++                let mut compact_now = false;
+                 let mut previous_visible = false;
+                 let mut previous_compact = false;
++                let mut target_id = 0;
++                let mut presenter_toolbar_id = 0;
++                let mut presenter_attached = false;
+                 let mut previous_target_id = 0;
+                 let mut previous_presenter_toolbar_id = 0;
+                 let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
++                let mut next_follow_at = Instant::now();
+                 while !thread_stop.load(Ordering::Acquire) {
+-                    let target_id = thread_target_id.load(Ordering::Acquire);
