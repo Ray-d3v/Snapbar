@@ -986,19 +986,15 @@ impl TeamsWindowFollower {
                 let mut next_follow_at = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
                     let requested_work = thread_pending_work.swap(0, Ordering::AcqRel);
-                    let (follow_requested, mut region_requested) = classify_worker_work(
-                        requested_work,
-                        Instant::now() >= next_follow_at,
-                    );
+                    let (follow_requested, mut region_requested) =
+                        classify_worker_work(requested_work, Instant::now() >= next_follow_at);
 
                     if follow_requested {
                         target_id = thread_target_id.load(Ordering::Acquire);
-                        presenter_toolbar_id =
-                            thread_presenter_toolbar_id.load(Ordering::Acquire);
+                        presenter_toolbar_id = thread_presenter_toolbar_id.load(Ordering::Acquire);
                         presenter_attached = presenter_toolbar_id != 0;
                         let placement = if presenter_attached {
-                            let presenter_hwnd =
-                                HWND(presenter_toolbar_id as usize as *mut c_void);
+                            let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
                             desired_presenter_placement(
                                 overlay_hwnd,
                                 presenter_hwnd,
