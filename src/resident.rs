@@ -7,47 +7,56 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use async_channel::{Receiver, Sender};
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
+            Input::KeyboardAndMouse::{
+                MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_S,
+            },
             Shell::{
-                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HWND_MESSAGE,
-                IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-                PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-                TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
-                WNDCLASSW,
+                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+                HWND_MESSAGE, IMAGE_ICON, LR_SHARED, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
+                PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SM_CYSMICON,
+                SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+                TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
+                WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
-    core::w,
+    core::{PCWSTR, w},
 };
 
 use crate::shutdown::defer_cleanup;
 
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 41;
+const SYNC_CAPTURE_HOTKEY_MESSAGE: u32 = WM_APP + 42;
 const TRAY_ICON_ID: u32 = 1;
 const MENU_RESCAN: u32 = 1001;
 const MENU_QUIT: u32 = 1002;
+const CAPTURE_HOTKEY_ID: i32 = 1;
+const APP_ICON_RESOURCE_ID: u16 = 101;
 
 static RESIDENT_FLAGS: OnceLock<Weak<ResidentFlags>> = OnceLock::new();
 
 pub struct ResidentController {
     flags: Arc<ResidentFlags>,
     hwnd: Arc<AtomicIsize>,
+    capture_requests: Receiver<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ResidentController {
     pub fn start() -> Self {
-        let flags = Arc::new(ResidentFlags::default());
+        let (capture_sender, capture_requests) = async_channel::bounded(1);
+        let flags = Arc::new(ResidentFlags::new(capture_sender));
         let hwnd = Arc::new(AtomicIsize::new(0));
         let _ = RESIDENT_FLAGS.set(Arc::downgrade(&flags));
 
@@ -61,6 +70,7 @@ impl ResidentController {
         Self {
             flags,
             hwnd,
+            capture_requests,
             worker,
         }
     }
@@ -72,10 +82,33 @@ impl ResidentController {
     pub fn take_rescan_requested(&self) -> bool {
         self.flags.rescan.swap(false, Ordering::AcqRel)
     }
+
+    pub fn capture_requests(&self) -> Receiver<()> {
+        self.capture_requests.clone()
+    }
+
+    pub fn set_capture_hotkey_enabled(&self, enabled: bool) {
+        if self.flags.hotkey_enabled.swap(enabled, Ordering::AcqRel) == enabled {
+            return;
+        }
+
+        let hwnd = self.hwnd.load(Ordering::Acquire);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    SYNC_CAPTURE_HOTKEY_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
 impl Drop for ResidentController {
     fn drop(&mut self) {
+        self.flags.hotkey_enabled.store(false, Ordering::Release);
         self.flags.quit.store(true, Ordering::Release);
         let hwnd = self.hwnd.load(Ordering::Acquire);
         if hwnd != 0 {
@@ -96,18 +129,41 @@ impl Drop for ResidentController {
     }
 }
 
-#[derive(Default)]
 struct ResidentFlags {
     quit: AtomicBool,
     rescan: AtomicBool,
+    hotkey_enabled: AtomicBool,
+    hotkey_registered: AtomicBool,
+    capture_sender: Sender<()>,
     tray_error: Mutex<Option<String>>,
+}
+
+impl ResidentFlags {
+    fn new(capture_sender: Sender<()>) -> Self {
+        Self {
+            quit: AtomicBool::new(false),
+            rescan: AtomicBool::new(false),
+            hotkey_enabled: AtomicBool::new(false),
+            hotkey_registered: AtomicBool::new(false),
+            capture_sender,
+            tray_error: Mutex::new(None),
+        }
+    }
+
+    fn request_capture(&self) {
+        let _ = self.capture_sender.try_send(());
+    }
+
+    fn record_error(&self, error: String) {
+        if let Ok(mut tray_error) = self.tray_error.lock() {
+            *tray_error = Some(error);
+        }
+    }
 }
 
 fn run_tray(flags: Arc<ResidentFlags>, hwnd_slot: Arc<AtomicIsize>) {
     if let Err(error) = unsafe { create_and_run_tray(&flags, &hwnd_slot) } {
-        if let Ok(mut tray_error) = flags.tray_error.lock() {
-            *tray_error = Some(error);
-        }
+        flags.record_error(error);
     }
 }
 
@@ -126,6 +182,19 @@ unsafe fn create_and_run_tray(
     if unsafe { RegisterClassW(&class) } == 0 {
         return Err("通知領域ウィンドウを登録できませんでした".to_string());
     }
+
+    let icon = unsafe {
+        LoadImageW(
+            Some(instance),
+            PCWSTR(APP_ICON_RESOURCE_ID as usize as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    let icon = windows::Win32::UI::WindowsAndMessaging::HICON(icon.0);
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -146,7 +215,6 @@ unsafe fn create_and_run_tray(
     .map_err(|error| error.to_string())?;
     hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
 
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.map_err(|error| error.to_string())?;
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -161,6 +229,7 @@ unsafe fn create_and_run_tray(
         let _ = unsafe { DestroyWindow(hwnd) };
         return Err("通知領域へSnapbarを追加できませんでした".to_string());
     }
+    unsafe { sync_capture_hotkey(hwnd, flags) };
 
     let mut message = MSG::default();
     loop {
@@ -173,10 +242,11 @@ unsafe fn create_and_run_tray(
             DispatchMessageW(&message);
         }
         if flags.quit.load(Ordering::Acquire) {
-            let _ = unsafe { DestroyWindow(hwnd) };
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
     }
 
+    unsafe { unregister_capture_hotkey(hwnd, flags) };
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &data);
     }
@@ -191,6 +261,14 @@ unsafe extern "system" fn tray_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_HOTKEY if wparam.0 == CAPTURE_HOTKEY_ID as usize => {
+            with_flags(ResidentFlags::request_capture);
+            LRESULT(0)
+        }
+        SYNC_CAPTURE_HOTKEY_MESSAGE => {
+            with_flags(|flags| unsafe { sync_capture_hotkey(hwnd, flags) });
+            LRESULT(0)
+        }
         TRAY_CALLBACK_MESSAGE => {
             let mouse_message = lparam.0 as u32;
             if mouse_message == WM_RBUTTONUP || mouse_message == WM_CONTEXTMENU {
@@ -201,6 +279,7 @@ unsafe extern "system" fn tray_window_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
+            with_flags(|flags| unsafe { unregister_capture_hotkey(hwnd, flags) });
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
@@ -210,6 +289,61 @@ unsafe extern "system" fn tray_window_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
+}
+
+unsafe fn sync_capture_hotkey(hwnd: HWND, flags: &ResidentFlags) {
+    let enabled = flags.hotkey_enabled.load(Ordering::Acquire);
+    let registered = flags.hotkey_registered.load(Ordering::Acquire);
+    match (enabled, registered) {
+        (true, false) => {
+            let modifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+            match unsafe { RegisterHotKey(Some(hwnd), CAPTURE_HOTKEY_ID, modifiers, VK_S.0 as u32) }
+            {
+                Ok(()) => {
+                    flags.hotkey_registered.store(true, Ordering::Release);
+                    unsafe { update_tray_tooltip(hwnd, "Snapbar – Ctrl + Alt + S で撮影") };
+                }
+                Err(error) => {
+                    flags.record_error(format!(
+                        "Ctrl + Alt + S をグローバルショートカットとして登録できませんでした: {error}"
+                    ));
+                    unsafe {
+                        update_tray_tooltip(hwnd, "Snapbar – ショートカット登録失敗")
+                    };
+                }
+            }
+        }
+        (false, true) => unsafe { unregister_capture_hotkey(hwnd, flags) },
+        _ => {}
+    }
+}
+
+unsafe fn unregister_capture_hotkey(hwnd: HWND, flags: &ResidentFlags) {
+    if !flags.hotkey_registered.load(Ordering::Acquire) {
+        return;
+    }
+
+    match unsafe { UnregisterHotKey(Some(hwnd), CAPTURE_HOTKEY_ID) } {
+        Ok(()) => {
+            flags.hotkey_registered.store(false, Ordering::Release);
+            unsafe { update_tray_tooltip(hwnd, "Snapbar – Teams会議を監視中") };
+        }
+        Err(error) => flags.record_error(format!(
+            "Ctrl + Alt + S のグローバルショートカットを解除できませんでした: {error}"
+        )),
+    }
+}
+
+unsafe fn update_tray_tooltip(hwnd: HWND, value: &str) {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_TIP,
+        ..Default::default()
+    };
+    copy_utf16(value, &mut data.szTip);
+    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
@@ -258,4 +392,21 @@ fn copy_utf16(value: &str, destination: &mut [u16]) {
     let length = encoded.len().min(destination.len() - 1);
     destination[..length].copy_from_slice(&encoded[..length]);
     destination[length] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResidentFlags;
+
+    #[test]
+    fn capture_requests_are_coalesced_until_the_ui_receives_one() {
+        let (sender, receiver) = async_channel::bounded(1);
+        let flags = ResidentFlags::new(sender);
+
+        flags.request_capture();
+        flags.request_capture();
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
+    }
 }

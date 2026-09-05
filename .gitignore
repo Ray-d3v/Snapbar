@@ -1,5 +1,7 @@
 /target
 /dist
+/.codex-temp/
+/artifacts/
 /.idea
 /.vscode
 *.pdb

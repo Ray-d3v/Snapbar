@@ -1,6 +1,6 @@
 #define MyAppName "Snapbar"
 #ifndef AppVersion
-  #define AppVersion "0.1.0-beta"
+  #define AppVersion "0.1.0"
 #endif
 #define MyAppPublisher "Ray-d3v"
 #define MyAppExeName "snapbar.exe"
@@ -24,6 +24,7 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SetupLogging=yes
+SetupIconFile=..\assets\branding\snapbar.ico
 CloseApplications=yes
 RestartApplications=no
 

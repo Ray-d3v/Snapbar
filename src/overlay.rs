@@ -4,7 +4,7 @@ use std::{
     ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -22,21 +22,27 @@ use windows::Win32::{
             DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Gdi::{
-            CreateRectRgn, DeleteObject, ExtCreateRegion, GetDC, GetPixel, HGDIOBJ, HRGN,
-            RDH_RECTANGLES, RGNDATA, RGNDATAHEADER, ReleaseDC, SetWindowRgn,
+            CreateRectRgn, DeleteObject, ExtCreateRegion, HGDIOBJ, HRGN, RDH_RECTANGLES, RGNDATA,
+            RGNDATAHEADER, SetWindowRgn,
         },
     },
     UI::WindowsAndMessaging::{
-        GW_HWNDPREV, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
-        HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos, ShowWindow,
-        WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
+        IsWindowVisible, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongW,
+        SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_DISPLAY_AFFINITY,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
 };
 
-use crate::shutdown::defer_cleanup;
+use crate::{shutdown::defer_cleanup, window_z_order::sync_window_above_target};
+
+mod caption_readback;
+mod color_sampler;
+mod island_paint;
+use caption_readback::CaptionReadback;
+use color_sampler::{ColorRequest, ColorSampler};
+pub(crate) use island_paint::paint_island_drop;
 
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 const PRESENTER_FOLLOW_INTERVAL: Duration = Duration::from_millis(8);
@@ -48,7 +54,7 @@ const COLLAPSE_DELAY_MS: u32 = 50;
 const SAFETY_INTERVAL_MS: u32 = 250;
 const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
 const DWMWA_COLOR_DEFAULT: u32 = 0xffff_ffff;
-const CLR_INVALID: u32 = 0xffff_ffff;
+const GA_ROOT: u32 = 2;
 const SUBCLASS_ID: usize = 0x534e_4150;
 const TIMER_EXPAND: usize = 0x0053_4e01;
 const TIMER_COLLAPSE: usize = 0x0053_4e02;
@@ -80,12 +86,12 @@ fn classify_worker_work(requested_work: u32, follow_due: bool) -> (bool, bool) {
     (follow, region)
 }
 
-pub const WINDOW_WIDTH: f32 = 280.0;
-pub const WINDOW_HEIGHT: f32 = 48.0;
+pub const WINDOW_WIDTH: f32 = 304.0;
+pub const WINDOW_HEIGHT: f32 = 52.0;
 pub const COLLAPSED_WIDTH: f32 = 92.0;
 pub const COLLAPSED_HEIGHT: f32 = 30.0;
-pub const EXPANDED_WIDTH: f32 = 272.0;
-pub const EXPANDED_HEIGHT: f32 = 46.0;
+pub const EXPANDED_WIDTH: f32 = 288.0;
+pub const EXPANDED_HEIGHT: f32 = 50.0;
 pub const INLINE_WIDTH: f32 = EXPANDED_WIDTH;
 pub const TITLEBAR_FRAME_INSET: f32 = 1.0;
 pub const TITLEBAR_SURFACE_HEIGHT: f32 = COLLAPSED_HEIGHT - TITLEBAR_FRAME_INSET;
@@ -93,14 +99,35 @@ pub const HOVER_ISLAND_HEIGHT: f32 = EXPANDED_HEIGHT - TITLEBAR_FRAME_INSET;
 pub const INLINE_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const COMPACT_WIDTH: f32 = 46.0;
 pub const COMPACT_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
-pub const ISLAND_BOTTOM_RADIUS: f32 = 8.0;
-pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
-pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
-pub const ISLAND_DROP: f32 = 16.0;
+pub const ISLAND_BOTTOM_RADIUS: f32 = 12.0;
+pub const ISLAND_SHOULDER_DEPTH: f32 = 8.0;
+pub const ISLAND_SHOULDER_INSET: f32 = 24.0;
+pub const ISLAND_DROP: f32 = 20.0;
 pub const PRESENTER_COLLAPSED_HEIGHT: f32 = 39.0;
 pub const PRESENTER_CORNER_RADIUS: f32 = 16.0;
 pub const DEFAULT_TITLEBAR_COLOR: u32 = 0x111111;
 pub const PRESENTER_TOOLBAR_COLOR: u32 = 0x202020;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TitlebarMaterial {
+    pub surface: u32,
+    pub separator: u32,
+    pub separator_offset: u8,
+}
+
+fn pack_titlebar_material(material: TitlebarMaterial) -> u64 {
+    (u64::from(material.separator_offset) << 48)
+        | ((u64::from(material.surface) & 0x00ff_ffff) << 24)
+        | (u64::from(material.separator) & 0x00ff_ffff)
+}
+
+fn unpack_titlebar_material(value: u64) -> TitlebarMaterial {
+    TitlebarMaterial {
+        surface: ((value >> 24) & 0x00ff_ffff) as u32,
+        separator: (value & 0x00ff_ffff) as u32,
+        separator_offset: (value >> 48) as u8,
+    }
+}
 
 pub fn disclosure_width(progress: f32) -> f32 {
     COLLAPSED_WIDTH
@@ -111,9 +138,31 @@ pub fn disclosure_width(progress: f32) -> f32 {
             )
 }
 
+pub fn disclosure_width_for_attachment(
+    progress: f32,
+    presentation: OverlayPresentation,
+    presenter_attached: bool,
+) -> f32 {
+    if presentation.is_inline() || presenter_attached {
+        return disclosure_width(progress);
+    }
+
+    let progress = if progress > 1.0 {
+        progress
+    } else {
+        let progress = progress.clamp(0.0, 1.0);
+        1.0 - (1.0 - progress).powi(3)
+    };
+    disclosure_width(progress)
+}
+
+pub fn island_drop_progress(progress: f32) -> f32 {
+    let t = ((progress.clamp(0.0, 1.0) - 0.12) / 0.88).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub fn disclosure_height(progress: f32) -> f32 {
-    TITLEBAR_SURFACE_HEIGHT
-        + (HOVER_ISLAND_HEIGHT - TITLEBAR_SURFACE_HEIGHT) * progress.clamp(0.0, 1.0)
+    TITLEBAR_SURFACE_HEIGHT + ISLAND_DROP * island_drop_progress(progress)
 }
 
 pub fn presenter_disclosure_height(progress: f32) -> f32 {
@@ -257,6 +306,7 @@ unsafe extern "system" {
     fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
     fn GetCursorPos(point: *mut POINT) -> i32;
     fn WindowFromPoint(point: POINT) -> *mut c_void;
+    fn GetAncestor(hwnd: *mut c_void, flags: u32) -> *mut c_void;
 }
 
 #[link(name = "comctl32")]
@@ -702,13 +752,6 @@ enum OverlayPlacement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OverlayZOrderAnchor {
-    Topmost,
-    NotTopmost,
-    After(isize),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowMetrics {
     window_rect: RectI,
     client_screen_left: i32,
@@ -831,23 +874,51 @@ fn titlebar_sample_points(caption: CaptionGeometry) -> Vec<(i32, i32)> {
     points
 }
 
-fn sample_screen_colors(points: &[(i32, i32)]) -> Vec<u32> {
-    let screen_dc = unsafe { GetDC(None) };
-    if screen_dc.0.is_null() {
-        return Vec::new();
+fn separator_sample_points(caption: CaptionGeometry, surface: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut x_positions = Vec::with_capacity(surface.len());
+    for &(x, _) in surface {
+        if !x_positions.contains(&x) {
+            x_positions.push(x);
+        }
     }
-
-    let samples = points
-        .iter()
-        .filter_map(|(x, y)| {
-            let color = unsafe { GetPixel(screen_dc, *x, *y) };
-            (color.0 != CLR_INVALID).then(|| colorref_to_rgb(color))
+    let scale = (caption.band.height() as f32 / COLLAPSED_HEIGHT).clamp(0.75, 4.0);
+    let row_count = (2.0 * scale).ceil() as i32 + 1;
+    x_positions
+        .into_iter()
+        .flat_map(|x| {
+            (0..row_count.min(9)).map(move |row| (x, caption.band.bottom.saturating_add(row)))
         })
-        .collect();
-    unsafe {
-        let _ = ReleaseDC(None, screen_dc);
+        .collect()
+}
+
+fn point_belongs_to_window(hwnd: HWND, point: POINT) -> bool {
+    let hit = unsafe { WindowFromPoint(point) };
+    if hit.is_null() {
+        return false;
     }
-    samples
+    unsafe { GetAncestor(hit, GA_ROOT) == hwnd.0 }
+}
+
+fn sample_screen_colors(
+    hwnd: HWND,
+    points: &[(i32, i32)],
+    readback: &mut CaptionReadback,
+) -> Vec<((i32, i32), u32)> {
+    let visible_points: Vec<_> = points
+        .iter()
+        .copied()
+        .filter(|&(x, y)| point_belongs_to_window(hwnd, POINT { x, y }))
+        .collect();
+    let Some(colors) = readback.read(&visible_points) else {
+        return Vec::new();
+    };
+    visible_points
+        .into_iter()
+        .zip(colors)
+        .filter_map(|((x, y), color)| {
+            point_belongs_to_window(hwnd, POINT { x, y }).then_some(((x, y), color))
+        })
+        .collect()
 }
 
 fn dwm_caption_color(hwnd: HWND) -> Option<u32> {
@@ -864,12 +935,99 @@ fn dwm_caption_color(hwnd: HWND) -> Option<u32> {
     (!matches!(color.0, DWMWA_COLOR_DEFAULT | DWMWA_COLOR_NONE)).then(|| colorref_to_rgb(color))
 }
 
-fn sample_titlebar_color(hwnd: HWND, caption_height: i32) -> Option<u32> {
+fn sample_titlebar_color(
+    hwnd: HWND,
+    caption_height: i32,
+    readback: &mut CaptionReadback,
+) -> Option<TitlebarMaterial> {
+    let caption = current_caption_geometry(hwnd, caption_height)?;
+    let surface_points = titlebar_sample_points(caption);
+    let separator_points = separator_sample_points(caption, &surface_points);
+    let mut points = surface_points.clone();
+    points.extend(separator_points.iter().copied());
+    let samples = sample_screen_colors(hwnd, &points, readback);
+    if current_caption_geometry(hwnd, caption_height) != Some(caption) {
+        return None;
+    }
+    let (surface_samples, _) = split_sample_colors(&surface_points, &separator_points, &samples);
+    let Some(surface) = representative_color(&surface_samples) else {
+        return dwm_caption_color(hwnd).map(|surface| TitlebarMaterial {
+            surface,
+            separator: surface,
+            separator_offset: 0,
+        });
+    };
+    let (separator, separator_offset) =
+        separator_material(surface, caption.band.bottom, &samples).unwrap_or((surface, 0));
+    Some(TitlebarMaterial {
+        surface,
+        separator,
+        separator_offset,
+    })
+}
+
+fn split_sample_colors(
+    surface_points: &[(i32, i32)],
+    separator_points: &[(i32, i32)],
+    samples: &[((i32, i32), u32)],
+) -> (Vec<u32>, Vec<u32>) {
+    let mut surface = Vec::new();
+    let mut separator = Vec::new();
+    for &(point, color) in samples {
+        if surface_points.contains(&point) {
+            surface.push(color);
+        } else if separator_points.contains(&point) {
+            separator.push(color);
+        }
+    }
+    (surface, separator)
+}
+
+fn stable_separator_color(samples: &[u32]) -> Option<u32> {
+    samples.iter().copied().find(|candidate| {
+        samples
+            .iter()
+            .filter(|sample| {
+                [16_u32, 8, 0].into_iter().all(|shift| {
+                    ((candidate >> shift) & 0xff).abs_diff((**sample >> shift) & 0xff) <= 2
+                })
+            })
+            .count()
+            >= 3.max(samples.len() / 2 + 1)
+    })
+}
+
+fn separator_material(
+    surface: u32,
+    band_bottom: i32,
+    samples: &[((i32, i32), u32)],
+) -> Option<(u32, u8)> {
+    for offset in 0_u8..=8 {
+        let y = band_bottom.saturating_add(i32::from(offset));
+        let mut row = [0_u32; 8];
+        let mut count = 0;
+        for &((_, sample_y), color) in samples {
+            if sample_y == y && count < row.len() {
+                row[count] = color;
+                count += 1;
+            }
+        }
+        if count < 3 {
+            continue;
+        }
+        if let Some(color) = stable_separator_color(&row[..count])
+            .filter(|&color| colors_materially_differ(surface, color))
+        {
+            return Some((color, offset));
+        }
+    }
+    None
+}
+
+fn current_caption_geometry(hwnd: HWND, caption_height: i32) -> Option<CaptionGeometry> {
     let window = get_window_rect(hwnd)?;
     let frame = extended_frame_bounds(hwnd).unwrap_or(window);
-    let caption = caption_geometry(window, frame, caption_button_bounds(hwnd), caption_height)?;
-    representative_color(&sample_screen_colors(&titlebar_sample_points(caption)))
-        .or_else(|| dwm_caption_color(hwnd))
+    caption_geometry(window, frame, caption_button_bounds(hwnd), caption_height)
 }
 
 #[derive(Clone)]
@@ -879,11 +1037,15 @@ pub struct DisclosureProgressPublisher {
     wake_tx: SyncSender<()>,
 }
 
+fn encode_disclosure_progress(progress: f32) -> u32 {
+    (progress.max(0.0) * DISCLOSURE_PROGRESS_MAX as f32)
+        .round()
+        .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32
+}
+
 impl DisclosureProgressPublisher {
     pub fn publish(&self, progress: f32) {
-        let next = (progress.max(0.0) * DISCLOSURE_PROGRESS_MAX as f32)
-            .round()
-            .clamp(0.0, DISCLOSURE_PROGRESS_LIMIT as f32) as u32;
+        let next = encode_disclosure_progress(progress);
         if self.progress.swap(next, Ordering::AcqRel) != next {
             request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_REGION);
         }
@@ -930,6 +1092,16 @@ fn region_update_redraw(disclosure_progress: u32, structural_change: bool) -> bo
     structural_change || matches!(disclosure_progress, 0 | DISCLOSURE_PROGRESS_MAX)
 }
 
+fn region_needs_update(
+    previous: Option<WindowRegion>,
+    next: WindowRegion,
+    previous_progress: u32,
+    progress: u32,
+) -> bool {
+    previous != Some(next)
+        || (previous_progress != progress && matches!(progress, 0 | DISCLOSURE_PROGRESS_MAX))
+}
+
 fn disclosure_is_settled(
     expanded: bool,
     disclosure_progress: u32,
@@ -949,7 +1121,7 @@ pub struct TeamsWindowFollower {
     capture_mode: OverlayCaptureMode,
     target_id: Arc<AtomicU32>,
     presenter_toolbar_id: Arc<AtomicU32>,
-    titlebar_color: Arc<AtomicU32>,
+    titlebar_material: Arc<AtomicU64>,
     expanded: Arc<AtomicBool>,
     disclosure_progress: Arc<AtomicU32>,
     compact: Arc<AtomicBool>,
@@ -960,6 +1132,33 @@ pub struct TeamsWindowFollower {
     native_hover: Option<NativeHoverSubclass>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct WindowGeometryNotifier {
+    target_id: Arc<AtomicU32>,
+    presenter_toolbar_id: Arc<AtomicU32>,
+    pending_work: Arc<AtomicU32>,
+    wake_tx: SyncSender<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl WindowGeometryNotifier {
+    pub fn window_changed(&self, window_id: u32) -> bool {
+        let presenter = self.presenter_toolbar_id.load(Ordering::Acquire);
+        let anchor = if presenter != 0 {
+            presenter
+        } else {
+            self.target_id.load(Ordering::Acquire)
+        };
+        if window_id == 0 || window_id != anchor || self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        // The existing WinEvent message thread only signals work. Native moves
+        // stay on the single follower worker and bypass the watchdog deadline.
+        request_worker_work(self.pending_work.as_ref(), &self.wake_tx, WORK_FOLLOW);
+        true
+    }
 }
 
 impl TeamsWindowFollower {
@@ -976,7 +1175,12 @@ impl TeamsWindowFollower {
 
         let target_id = Arc::new(AtomicU32::new(0));
         let presenter_toolbar_id = Arc::new(AtomicU32::new(0));
-        let titlebar_color = Arc::new(AtomicU32::new(DEFAULT_TITLEBAR_COLOR));
+        let titlebar_material =
+            Arc::new(AtomicU64::new(pack_titlebar_material(TitlebarMaterial {
+                surface: DEFAULT_TITLEBAR_COLOR,
+                separator: DEFAULT_TITLEBAR_COLOR,
+                separator_offset: 0,
+            })));
         let expanded = Arc::new(AtomicBool::new(false));
         let disclosure_progress = Arc::new(AtomicU32::new(0));
         let compact = Arc::new(AtomicBool::new(false));
@@ -997,7 +1201,7 @@ impl TeamsWindowFollower {
 
         let thread_target_id = Arc::clone(&target_id);
         let thread_presenter_toolbar_id = Arc::clone(&presenter_toolbar_id);
-        let thread_titlebar_color = Arc::clone(&titlebar_color);
+        let thread_titlebar_material = Arc::clone(&titlebar_material);
         let thread_expanded = Arc::clone(&expanded);
         let thread_disclosure_progress = Arc::clone(&disclosure_progress);
         let thread_compact = Arc::clone(&compact);
@@ -1005,6 +1209,7 @@ impl TeamsWindowFollower {
         let thread_stop = Arc::clone(&stop);
         let thread_pending_work = Arc::clone(&pending_work);
         let thread_event_tx = event_tx.clone();
+        let color_wake_tx = wake_tx.clone();
         let thread_presentation = presentation;
         let display_affinity = capture_mode.display_affinity();
         let overlay_value = overlay_hwnd.0 as isize;
@@ -1027,6 +1232,7 @@ impl TeamsWindowFollower {
                 let mut previous_disclosure_progress = 0;
                 let mut last_progress_change = Instant::now() - COLOR_SAMPLE_SETTLE_INTERVAL;
                 let mut last_titlebar_sample = Instant::now() - TITLEBAR_SAMPLE_INTERVAL;
+                let mut color_sampler = ColorSampler::start(color_wake_tx);
                 while !thread_stop.load(Ordering::Acquire) {
                     let requested_work = thread_pending_work.swap(0, Ordering::AcqRel);
                     let target_id = thread_target_id.load(Ordering::Acquire);
@@ -1037,9 +1243,9 @@ impl TeamsWindowFollower {
                     let anchor_changed = target_changed || presenter_changed;
                     let interval = follow_interval(target_id, presenter_attached);
                     let follow_started = Instant::now();
-                    // GPUI can publish at the monitor refresh rate. Keep target/DWM/z-order
-                    // queries on an absolute cadence so frame wakes only reshape the exact
-                    // native hit region between full follow passes.
+                    // Animation wakes only reshape the region. Target WinEvents
+                    // request a full follow immediately; the absolute cadence is
+                    // retained as a fallback for missing native notifications.
                     let follow_due =
                         full_follow_due(last_full_follow, follow_started, interval, anchor_changed);
                     let (run_full_follow, run_region_update) =
@@ -1093,7 +1299,7 @@ impl TeamsWindowFollower {
                             } else {
                                 HWND(target_id as usize as *mut c_void)
                             };
-                            sync_overlay_z_order(overlay_hwnd, anchor_hwnd);
+                            let _ = sync_window_above_target(overlay_hwnd, anchor_hwnd);
                         }
 
                         let next_metrics = window_metrics(overlay_hwnd);
@@ -1118,6 +1324,7 @@ impl TeamsWindowFollower {
                         0
                     };
                     let progress_observed_at = Instant::now();
+                    let previous_progress = previous_disclosure_progress;
                     if disclosure_progress != previous_disclosure_progress {
                         previous_disclosure_progress = disclosure_progress;
                         last_progress_change = progress_observed_at;
@@ -1133,7 +1340,18 @@ impl TeamsWindowFollower {
                                 disclosure_progress,
                             )
                         }) {
-                            Some(region) if previous_region_state != Some(region) => {
+                            Some(region)
+                                if region_needs_update(
+                                    previous_region_state,
+                                    region,
+                                    previous_progress,
+                                    disclosure_progress,
+                                ) =>
+                            {
+                                // Integer-rounded geometry can reach its final shape
+                                // before GPUI's final frame. Still repaint once when
+                                // progress settles so pixels exposed by the native
+                                // region cannot remain transparent until another hover.
                                 let redraw =
                                     region_update_redraw(disclosure_progress, structural_change);
                                 if apply_window_region(overlay_hwnd, region, redraw) {
@@ -1142,6 +1360,44 @@ impl TeamsWindowFollower {
                             }
                             Some(_) => {}
                             None => previous_region_state = None,
+                        }
+                    }
+
+                    if let Some(sample) = color_sampler
+                        .as_mut()
+                        .and_then(ColorSampler::try_take_result)
+                    {
+                        last_titlebar_sample = Instant::now();
+                        let current_caption_height = cached_overlay_metrics
+                            .map(nominal_caption_height)
+                            .unwrap_or(32);
+                        // A slow read can finish after a meeting, attachment, or DPI
+                        // change. Never apply that result to a different surface.
+                        if previous_visible
+                            && !presenter_attached
+                            && sample.request
+                                == (ColorRequest {
+                                    target_id,
+                                    caption_height: current_caption_height,
+                                })
+                            && let Some(sampled_material) = sample.material
+                        {
+                            let current = unpack_titlebar_material(
+                                thread_titlebar_material.load(Ordering::Acquire),
+                            );
+                            if colors_materially_differ(current.surface, sampled_material.surface)
+                                || colors_materially_differ(
+                                    current.separator,
+                                    sampled_material.separator,
+                                )
+                                || current.separator_offset != sampled_material.separator_offset
+                            {
+                                thread_titlebar_material.store(
+                                    pack_titlebar_material(sampled_material),
+                                    Ordering::Release,
+                                );
+                                let _ = thread_event_tx.try_send(());
+                            }
                         }
                     }
 
@@ -1157,26 +1413,40 @@ impl TeamsWindowFollower {
                                 progress_observed_at,
                             ))
                     {
-                        // GetPixel can synchronize with desktop composition. Defer it until
-                        // the integer disclosure geometry has stayed at its target long
-                        // enough that it cannot interrupt an active transition.
-                        let sampled_color = if presenter_attached {
-                            Some(PRESENTER_TOOLBAR_COLOR)
-                        } else {
-                            let target_hwnd = HWND(target_id as usize as *mut c_void);
-                            let caption_height = cached_overlay_metrics
-                                .map(nominal_caption_height)
-                                .unwrap_or(32);
-                            sample_titlebar_color(target_hwnd, caption_height)
-                        };
-                        if let Some(sampled_color) = sampled_color {
-                            let current_color = thread_titlebar_color.load(Ordering::Acquire);
-                            if colors_materially_differ(current_color, sampled_color) {
-                                thread_titlebar_color.store(sampled_color, Ordering::Release);
+                        if presenter_attached {
+                            let sampled_material = TitlebarMaterial {
+                                surface: PRESENTER_TOOLBAR_COLOR,
+                                separator: PRESENTER_TOOLBAR_COLOR,
+                                separator_offset: 0,
+                            };
+                            let current = unpack_titlebar_material(
+                                thread_titlebar_material.load(Ordering::Acquire),
+                            );
+                            if colors_materially_differ(current.surface, sampled_material.surface)
+                                || colors_materially_differ(
+                                    current.separator,
+                                    sampled_material.separator,
+                                )
+                                || current.separator_offset != sampled_material.separator_offset
+                            {
+                                thread_titlebar_material.store(
+                                    pack_titlebar_material(sampled_material),
+                                    Ordering::Release,
+                                );
                                 let _ = thread_event_tx.try_send(());
                             }
+                            last_titlebar_sample = Instant::now();
+                        } else if let Some(sampler) = color_sampler.as_mut() {
+                            // A new hover can arrive while screen readback is blocked in DWM.
+                            // Only queue the read here: the native region writer must
+                            // continue receiving every published animation frame.
+                            sampler.request(ColorRequest {
+                                target_id,
+                                caption_height: cached_overlay_metrics
+                                    .map(nominal_caption_height)
+                                    .unwrap_or(32),
+                            });
                         }
-                        last_titlebar_sample = Instant::now();
                     }
 
                     let wait = remaining_follow_wait(
@@ -1201,7 +1471,7 @@ impl TeamsWindowFollower {
             capture_mode,
             target_id,
             presenter_toolbar_id,
-            titlebar_color,
+            titlebar_material,
             expanded,
             disclosure_progress,
             compact,
@@ -1221,6 +1491,16 @@ impl TeamsWindowFollower {
 
     pub fn subscribe(&self) -> Receiver<()> {
         self.event_rx.clone()
+    }
+
+    pub fn geometry_notifier(&self) -> WindowGeometryNotifier {
+        WindowGeometryNotifier {
+            target_id: Arc::clone(&self.target_id),
+            presenter_toolbar_id: Arc::clone(&self.presenter_toolbar_id),
+            pending_work: Arc::clone(&self.pending_work),
+            wake_tx: self.wake_tx.clone(),
+            stop: Arc::clone(&self.stop),
+        }
     }
 
     pub fn set_target(&self, target_id: Option<u32>) {
@@ -1251,8 +1531,8 @@ impl TeamsWindowFollower {
         self.expanded.load(Ordering::Acquire)
     }
 
-    pub fn titlebar_color(&self) -> u32 {
-        self.titlebar_color.load(Ordering::Acquire)
+    pub fn titlebar_material(&self) -> TitlebarMaterial {
+        unpack_titlebar_material(self.titlebar_material.load(Ordering::Acquire))
     }
 
     pub fn disclosure_progress_publisher(&self) -> DisclosureProgressPublisher {
@@ -1387,10 +1667,11 @@ fn window_metrics(hwnd: HWND) -> Option<WindowMetrics> {
     }
 
     let client_width = client_rect.right.saturating_sub(client_rect.left);
-    let client_height = client_rect.bottom.saturating_sub(client_rect.top);
-    if client_width <= 0 || client_height <= 0 {
+    let actual_height = client_rect.bottom.saturating_sub(client_rect.top);
+    if client_width <= 0 || actual_height <= 0 {
         return None;
     }
+    let client_height = actual_height;
 
     Some(WindowMetrics {
         window_rect: window_rect.into(),
@@ -1499,7 +1780,12 @@ fn disclosure_surface_rect_for_attachment(
     } else {
         disclosure_height(progress)
     };
-    surface_rect_for_size(width, height, disclosure_width(progress), logical_height)
+    surface_rect_for_size(
+        width,
+        height,
+        disclosure_width_for_attachment(progress, presentation, presenter_attached),
+        logical_height,
+    )
 }
 
 #[cfg(test)]
@@ -1598,23 +1884,22 @@ fn window_region_for_attachment(
         )
         .clamp(1, hover.height());
         let animated_drop = hover.height().saturating_sub(caption_height);
-        let bottom_radius = scale_logical(
-            ISLAND_BOTTOM_RADIUS * normalized,
-            metrics.client_height,
-            WINDOW_HEIGHT,
-        )
-        .clamp(0, animated_drop);
+        let shape_progress = island_drop_progress(normalized);
         let shoulder_depth = scale_logical(
-            ISLAND_SHOULDER_DEPTH * normalized,
+            ISLAND_SHOULDER_DEPTH * shape_progress,
             metrics.client_height,
             WINDOW_HEIGHT,
         )
-        // Keep the concave root independent from the bottom corner radius. The
-        // two curves can overlap near their tangents without shortening the
-        // shoulder when the lower corners are made rounder.
         .clamp(0, animated_drop);
+        let bottom_radius = scale_logical(
+            ISLAND_BOTTOM_RADIUS * shape_progress,
+            metrics.client_height,
+            WINDOW_HEIGHT,
+        )
+        .clamp(0, animated_drop.saturating_sub(shoulder_depth));
+        let shoulder_inset_progress = 1.0 - (1.0 - normalized.min(1.0)).powi(3);
         let shoulder_inset = scale_logical(
-            ISLAND_SHOULDER_INSET * normalized,
+            ISLAND_SHOULDER_INSET * shoulder_inset_progress,
             metrics.client_width,
             WINDOW_WIDTH,
         )
@@ -2116,69 +2401,6 @@ fn apply_placement(overlay_hwnd: HWND, placement: OverlayPlacement) {
     }
 }
 
-fn choose_overlay_z_order_anchor(
-    target_topmost: bool,
-    overlay_topmost: bool,
-    overlay: isize,
-    window_above_target: Option<(isize, bool)>,
-) -> Option<OverlayZOrderAnchor> {
-    match window_above_target {
-        Some((above, _)) if above == overlay && target_topmost == overlay_topmost => None,
-        Some((above, _)) if above == overlay => Some(if target_topmost {
-            OverlayZOrderAnchor::Topmost
-        } else {
-            OverlayZOrderAnchor::NotTopmost
-        }),
-        Some((_, above_topmost)) if above_topmost != target_topmost => Some(if target_topmost {
-            OverlayZOrderAnchor::Topmost
-        } else {
-            OverlayZOrderAnchor::NotTopmost
-        }),
-        Some((above, _)) => Some(OverlayZOrderAnchor::After(above)),
-        None => Some(if target_topmost {
-            OverlayZOrderAnchor::Topmost
-        } else {
-            OverlayZOrderAnchor::NotTopmost
-        }),
-    }
-}
-
-fn window_is_topmost(hwnd: HWND) -> bool {
-    unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
-}
-
-fn sync_overlay_z_order(overlay_hwnd: HWND, target_hwnd: HWND) {
-    let target_topmost = window_is_topmost(target_hwnd);
-    let overlay_topmost = window_is_topmost(overlay_hwnd);
-    let window_above_target = unsafe { GetWindow(target_hwnd, GW_HWNDPREV).ok() }
-        .map(|above| (above.0 as isize, window_is_topmost(above)));
-    let Some(anchor) = choose_overlay_z_order_anchor(
-        target_topmost,
-        overlay_topmost,
-        overlay_hwnd.0 as isize,
-        window_above_target,
-    ) else {
-        return;
-    };
-    let insert_after = match anchor {
-        OverlayZOrderAnchor::Topmost => HWND_TOPMOST,
-        OverlayZOrderAnchor::NotTopmost => HWND_NOTOPMOST,
-        OverlayZOrderAnchor::After(window) => HWND(window as *mut c_void),
-    };
-
-    unsafe {
-        let _ = SetWindowPos(
-            overlay_hwnd,
-            Some(insert_after),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-        );
-    }
-}
-
 fn get_window_rect(hwnd: HWND) -> Option<RectI> {
     let mut rect = RECT::default();
     unsafe {
@@ -2218,6 +2440,91 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titlebar_material_pack_roundtrips_both_colors() {
+        let material = TitlebarMaterial {
+            surface: 0x112233,
+            separator: 0xaabbcc,
+            separator_offset: 5,
+        };
+        assert_eq!(
+            unpack_titlebar_material(pack_titlebar_material(material)),
+            material
+        );
+    }
+
+    #[test]
+    fn separator_samples_are_coordinate_partitioned_and_need_consensus() {
+        let surface_points = [(10, 20), (20, 20)];
+        let separator_points = [(10, 21), (20, 21)];
+        let samples = [
+            ((20, 21), 0x111111),
+            ((10, 20), 0xaaaaaa),
+            ((10, 21), 0x101111),
+            ((20, 20), 0xbbbbbb),
+        ];
+        let (surface, separator) =
+            split_sample_colors(&surface_points, &separator_points, &samples);
+        assert_eq!(surface, vec![0xaaaaaa, 0xbbbbbb]);
+        assert_eq!(separator, vec![0x111111, 0x101111]);
+        assert_eq!(
+            stable_separator_color(&[0x101111, 0x111111, 0x101010]),
+            Some(0x101111)
+        );
+        assert_eq!(stable_separator_color(&[0x101010, 0x202020]), None);
+        assert_eq!(
+            separator_material(
+                0xebebeb,
+                85,
+                &[
+                    ((10, 85), 0xebebeb),
+                    ((20, 85), 0xebebeb),
+                    ((30, 85), 0xebebeb),
+                    ((10, 86), 0xdfdfdf),
+                    ((20, 86), 0xdfdfdf),
+                    ((30, 86), 0xdfdfdf),
+                    ((40, 86), 0xffffff),
+                ],
+            ),
+            Some((0xdfdfdf, 1))
+        );
+        assert_eq!(
+            separator_material(
+                0x202020,
+                85,
+                &[
+                    ((10, 85), 0x202020),
+                    ((20, 85), 0x202020),
+                    ((30, 85), 0x202020),
+                    ((10, 86), 0x242424),
+                    ((20, 86), 0x242424),
+                    ((30, 86), 0x242424),
+                    ((10, 87), 0x1d1d1d),
+                    ((20, 87), 0x1d1d1d),
+                    ((30, 87), 0x1d1d1d),
+                ],
+            ),
+            Some((0x242424, 1))
+        );
+        assert_eq!(separator_material(0x202020, 85, &[]), None);
+        assert_eq!(
+            separator_material(0x202020, 85, &[((10, 85), 0x202020)]),
+            None
+        );
+        // A consistent minority (for example covered caption text) must not
+        // override the actual separator shared by the remaining sample points.
+        assert_eq!(
+            stable_separator_color(&[
+                0x101010, 0x101010, 0x101010, 0xdfdfdf, 0xdfdfdf, 0xdfdfdf, 0xdfdfdf, 0xdfdfdf
+            ]),
+            Some(0xdfdfdf)
+        );
+        assert_eq!(
+            stable_separator_color(&[0xdfdfdf, 0xdfdfdf, 0xdfdfdf, 0x242424, 0x242424, 0x242424]),
+            None
+        );
+    }
 
     fn expected_row_inset(region: WindowRegion, row: i32, width: i32, height: i32) -> i32 {
         match region.shape {
@@ -2437,6 +2744,46 @@ mod tests {
     }
 
     #[test]
+    fn native_target_moves_bypass_the_follow_deadline_and_coalesce() {
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let notifier = WindowGeometryNotifier {
+            target_id: Arc::new(AtomicU32::new(7)),
+            presenter_toolbar_id: Arc::new(AtomicU32::new(0)),
+            pending_work: Arc::new(AtomicU32::new(0)),
+            wake_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let last_follow = Instant::now();
+        assert!(!notifier.window_changed(0));
+        assert!(!notifier.window_changed(19));
+        assert!(wake_rx.try_recv().is_err());
+        for _ in 0..1_000 {
+            assert!(notifier.window_changed(7));
+        }
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        assert!(wake_rx.try_recv().is_err());
+        let timer_due = full_follow_due(
+            Some(last_follow),
+            last_follow + Duration::from_millis(1),
+            FOLLOW_INTERVAL,
+            false,
+        );
+        assert!(!timer_due);
+        assert_eq!(
+            classify_worker_work(notifier.pending_work.swap(0, Ordering::AcqRel), timer_due),
+            (true, true)
+        );
+
+        notifier.presenter_toolbar_id.store(19, Ordering::Release);
+        assert!(!notifier.window_changed(7));
+        assert!(notifier.window_changed(19));
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        notifier.stop.store(true, Ordering::Release);
+        assert!(!notifier.window_changed(19));
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn animated_region_redraws_only_at_endpoints_or_structural_changes() {
         assert!(region_update_redraw(0, false));
         assert!(!region_update_redraw(1, false));
@@ -2444,6 +2791,49 @@ mod tests {
         assert!(region_update_redraw(DISCLOSURE_PROGRESS_MAX, false));
         assert!(!region_update_redraw(DISCLOSURE_PROGRESS_LIMIT, false));
         assert!(region_update_redraw(500, true));
+    }
+
+    #[test]
+    fn settled_frame_repaints_even_when_native_geometry_was_already_rounded_to_full_size() {
+        let metrics = WindowMetrics {
+            window_rect: RectI {
+                left: 0,
+                top: 0,
+                right: 304,
+                bottom: 52,
+            },
+            client_screen_left: 0,
+            client_screen_top: 0,
+            client_width: 304,
+            client_height: 52,
+        };
+        let near = window_region_for_attachment(
+            metrics,
+            OverlayPresentation::HoverIsland,
+            false,
+            false,
+            DISCLOSURE_PROGRESS_MAX - 1,
+        );
+        let settled = window_region_for_attachment(
+            metrics,
+            OverlayPresentation::HoverIsland,
+            false,
+            false,
+            DISCLOSURE_PROGRESS_MAX,
+        );
+        assert_eq!(near, settled);
+        assert!(region_needs_update(
+            Some(near),
+            settled,
+            DISCLOSURE_PROGRESS_MAX - 1,
+            DISCLOSURE_PROGRESS_MAX
+        ));
+        assert!(!region_needs_update(
+            Some(settled),
+            settled,
+            DISCLOSURE_PROGRESS_MAX,
+            DISCLOSURE_PROGRESS_MAX
+        ));
     }
 
     #[test]
@@ -2473,50 +2863,6 @@ mod tests {
             changed,
             changed + COLOR_SAMPLE_SETTLE_INTERVAL,
         ));
-    }
-
-    #[test]
-    fn z_order_is_unchanged_when_overlay_is_already_directly_above_teams() {
-        assert_eq!(
-            choose_overlay_z_order_anchor(false, false, 20, Some((20, false))),
-            None
-        );
-        assert_eq!(
-            choose_overlay_z_order_anchor(true, true, 20, Some((20, true))),
-            None
-        );
-    }
-
-    #[test]
-    fn z_order_drops_a_topmost_overlay_into_the_normal_teams_band() {
-        assert_eq!(
-            choose_overlay_z_order_anchor(false, true, 20, Some((20, true))),
-            Some(OverlayZOrderAnchor::NotTopmost)
-        );
-        assert_eq!(
-            choose_overlay_z_order_anchor(false, true, 20, Some((10, true))),
-            Some(OverlayZOrderAnchor::NotTopmost)
-        );
-    }
-
-    #[test]
-    fn z_order_places_overlay_after_an_unrelated_window_above_teams() {
-        assert_eq!(
-            choose_overlay_z_order_anchor(false, false, 20, Some((10, false))),
-            Some(OverlayZOrderAnchor::After(10))
-        );
-    }
-
-    #[test]
-    fn z_order_can_follow_a_topmost_teams_window_without_becoming_globally_frontmost() {
-        assert_eq!(
-            choose_overlay_z_order_anchor(true, false, 20, None),
-            Some(OverlayZOrderAnchor::Topmost)
-        );
-        assert_eq!(
-            choose_overlay_z_order_anchor(true, true, 20, Some((10, true))),
-            Some(OverlayZOrderAnchor::After(10))
-        );
     }
 
     #[test]
@@ -2587,38 +2933,38 @@ mod tests {
     #[test]
     fn regions_match_visible_surfaces() {
         assert_eq!(
-            surface_rect(280, 48, OverlayMode::Collapsed),
+            surface_rect(304, 52, OverlayMode::Collapsed),
             RectI {
-                left: 94,
+                left: 106,
                 top: 1,
-                right: 186,
+                right: 198,
                 bottom: 30,
             }
         );
         assert_eq!(
-            surface_rect(280, 48, OverlayMode::Expanded),
+            surface_rect(304, 52, OverlayMode::Expanded),
             RectI {
-                left: 4,
+                left: 8,
                 top: 1,
-                right: 276,
-                bottom: 46,
+                right: 296,
+                bottom: 50,
             }
         );
         assert_eq!(
-            surface_rect(280, 48, OverlayMode::Inline),
+            surface_rect(304, 52, OverlayMode::Inline),
             RectI {
-                left: 4,
+                left: 8,
                 top: 1,
-                right: 276,
+                right: 296,
                 bottom: 30,
             }
         );
         assert_eq!(
-            surface_rect(280, 48, OverlayMode::Compact),
+            surface_rect(304, 52, OverlayMode::Compact),
             RectI {
-                left: 117,
+                left: 129,
                 top: 1,
-                right: 163,
+                right: 175,
                 bottom: 30,
             }
         );
@@ -2627,30 +2973,56 @@ mod tests {
     #[test]
     fn hover_regions_follow_the_full_island_silhouette() {
         assert_eq!(
-            hover_rect(280, 48, OverlayMode::Collapsed),
-            surface_rect(280, 48, OverlayMode::Collapsed)
+            hover_rect(304, 52, OverlayMode::Collapsed),
+            surface_rect(304, 52, OverlayMode::Collapsed)
         );
         assert_eq!(
-            hover_rect(280, 48, OverlayMode::Expanded),
-            surface_rect(280, 48, OverlayMode::Expanded)
+            hover_rect(304, 52, OverlayMode::Expanded),
+            surface_rect(304, 52, OverlayMode::Expanded)
         );
         assert_eq!(
-            hover_rect(280, 48, OverlayMode::Compact),
-            surface_rect(280, 48, OverlayMode::Compact)
+            hover_rect(304, 52, OverlayMode::Compact),
+            surface_rect(304, 52, OverlayMode::Compact)
         );
     }
 
     #[test]
     fn hover_region_scales_with_dpi() {
         assert_eq!(
-            hover_rect(420, 72, OverlayMode::Collapsed),
+            hover_rect(456, 78, OverlayMode::Collapsed),
             RectI {
-                left: 141,
+                left: 159,
                 top: 1,
-                right: 279,
+                right: 297,
                 bottom: 45,
             }
         );
+    }
+
+    #[test]
+    fn expanded_island_scales_with_per_monitor_dpi() {
+        for (client_width, client_height, envelope_width, envelope_height) in [
+            (304, 52, 288, 50),
+            (380, 65, 360, 63),
+            (456, 78, 432, 75),
+            (608, 104, 576, 100),
+        ] {
+            assert_eq!(
+                scale_logical(EXPANDED_WIDTH, client_width, WINDOW_WIDTH),
+                envelope_width
+            );
+            assert_eq!(
+                scale_logical(EXPANDED_HEIGHT, client_height, WINDOW_HEIGHT),
+                envelope_height
+            );
+
+            let visible = surface_rect(client_width, client_height, OverlayMode::Expanded);
+            assert_eq!(visible.width(), envelope_width);
+            assert_eq!(
+                visible.height(),
+                scale_logical(HOVER_ISLAND_HEIGHT, client_height, WINDOW_HEIGHT)
+            );
+        }
     }
 
     #[test]
@@ -2659,21 +3031,21 @@ mod tests {
             window_rect: RectI {
                 left: -7,
                 top: -7,
-                right: 287,
-                bottom: 55,
+                right: 311,
+                bottom: 59,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         assert_eq!(
             window_region(metrics, OverlayMode::Collapsed),
             WindowRegion {
-                left: 101,
+                left: 113,
                 top: 8,
-                right: 193,
+                right: 205,
                 bottom: 37,
                 shape: WindowRegionShape::Rectangle,
             }
@@ -2686,13 +3058,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         for mode in [OverlayMode::Collapsed, OverlayMode::Compact] {
@@ -2704,9 +3076,9 @@ mod tests {
             expanded.shape,
             WindowRegionShape::Island {
                 shoulder_start: 29,
-                shoulder_depth: 10,
-                shoulder_inset: 16,
-                bottom_radius: 8,
+                shoulder_depth: 8,
+                shoulder_inset: 24,
+                bottom_radius: 12,
             }
         );
     }
@@ -2718,42 +3090,57 @@ mod tests {
         assert_eq!(disclosure_width(1.0), EXPANDED_WIDTH);
         assert_eq!(disclosure_height(1.0), HOVER_ISLAND_HEIGHT);
 
-        let halfway = disclosure_surface_rect(280, 48, 500);
+        let halfway = disclosure_surface_rect(304, 52, 500);
         assert_eq!(
             halfway,
             RectI {
-                left: 49,
+                left: 20,
                 top: 1,
-                right: 231,
+                right: 284,
                 bottom: 38,
             }
         );
-        assert_eq!(halfway.center_x(), 140);
+        assert_eq!(halfway.center_x(), 152);
         for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
-            assert_eq!(disclosure_surface_rect(280, 48, progress).top, 1);
-            assert_eq!(disclosure_surface_rect(280, 48, progress).center_x(), 140);
+            assert_eq!(disclosure_surface_rect(304, 52, progress).top, 1);
+            assert_eq!(disclosure_surface_rect(304, 52, progress).center_x(), 152);
         }
+    }
+
+    #[test]
+    fn island_drop_waits_until_the_caption_edge_while_width_reveals_early() {
+        assert_eq!(island_drop_progress(0.0), 0.0);
+        assert_eq!(island_drop_progress(0.12), 0.0);
+        assert!(island_drop_progress(0.13) > 0.0);
+        assert!(
+            disclosure_width_for_attachment(0.12, OverlayPresentation::HoverIsland, false,)
+                > disclosure_width(0.12)
+        );
+        assert_eq!(
+            disclosure_width_for_attachment(1.04, OverlayPresentation::HoverIsland, false),
+            disclosure_width(1.04)
+        );
     }
 
     #[test]
     fn inline_disclosure_only_grows_horizontally_inside_the_caption_band() {
         for progress in [0, 250, 500, 750, DISCLOSURE_PROGRESS_MAX] {
             let surface = disclosure_surface_rect_for_presentation(
-                280,
-                48,
+                304,
+                52,
                 progress,
                 OverlayPresentation::InlineTitlebar,
             );
             assert_eq!(surface.top, 1);
             assert_eq!(surface.bottom, 30);
             assert_eq!(surface.height(), 29);
-            assert_eq!(surface.center_x(), 140);
+            assert_eq!(surface.center_x(), 152);
         }
 
         assert_eq!(
             disclosure_surface_rect_for_presentation(
-                280,
-                48,
+                304,
+                52,
                 DISCLOSURE_PROGRESS_MAX,
                 OverlayPresentation::InlineTitlebar,
             )
@@ -2768,21 +3155,21 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         assert_eq!(
             window_region(metrics, OverlayMode::Inline),
             WindowRegion {
-                left: 4,
+                left: 8,
                 top: 1,
-                right: 276,
+                right: 296,
                 bottom: 30,
                 shape: WindowRegionShape::Rectangle,
             }
@@ -2795,21 +3182,21 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         assert_eq!(
             window_region_for_progress(metrics, OverlayPresentation::InlineTitlebar, true, 0),
             WindowRegion {
-                left: 117,
+                left: 129,
                 top: 1,
-                right: 163,
+                right: 175,
                 bottom: 30,
                 shape: WindowRegionShape::Rectangle,
             }
@@ -2819,12 +3206,12 @@ mod tests {
     #[test]
     fn spring_overshoot_bulges_inside_the_fixed_overlay_envelope() {
         assert_eq!(
-            disclosure_surface_rect(280, 48, DISCLOSURE_PROGRESS_LIMIT),
+            disclosure_surface_rect(304, 52, DISCLOSURE_PROGRESS_LIMIT),
             RectI {
-                left: 0,
+                left: 4,
                 top: 1,
-                right: 280,
-                bottom: 46,
+                right: 301,
+                bottom: 50,
             }
         );
     }
@@ -2835,27 +3222,27 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 420,
-                bottom: 72,
+                right: 456,
+                bottom: 78,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 420,
-            client_height: 72,
+            client_width: 456,
+            client_height: 78,
         };
 
         assert_eq!(
             window_region(metrics, OverlayMode::Expanded),
             WindowRegion {
-                left: 6,
+                left: 12,
                 top: 1,
-                right: 414,
-                bottom: 69,
+                right: 444,
+                bottom: 75,
                 shape: WindowRegionShape::Island {
                     shoulder_start: 44,
-                    shoulder_depth: 15,
-                    shoulder_inset: 24,
-                    bottom_radius: 12,
+                    shoulder_depth: 12,
+                    shoulder_inset: 36,
+                    bottom_radius: 18,
                 },
             }
         );
@@ -2864,10 +3251,10 @@ mod tests {
     #[test]
     fn compressed_row_runs_preserve_every_island_scanline() {
         let desired = WindowRegion {
-            left: 4,
+            left: 8,
             top: 1,
-            right: 276,
-            bottom: 46,
+            right: 296,
+            bottom: 50,
             shape: WindowRegionShape::Island {
                 shoulder_start: 29,
                 shoulder_depth: 10,
@@ -2882,7 +3269,7 @@ mod tests {
 
         assert!(run_count < desired.bottom.saturating_sub(desired.top) as usize / 2);
         for row in 0..desired.bottom.saturating_sub(desired.top) {
-            let expected_inset = island_row_inset(row, 272, 45, 29, 10, 16, 8);
+            let expected_inset = island_row_inset(row, 288, 49, 29, 10, 16, 8);
             let y = desired.top + row;
             let run = runs
                 .iter()
@@ -2895,27 +3282,29 @@ mod tests {
 
     #[test]
     fn island_rows_curve_in_at_the_root_and_round_out_at_the_bottom() {
-        assert_eq!(island_row_inset(0, 272, 45, 29, 10, 16, 8), 0);
-        assert_eq!(island_row_inset(28, 272, 45, 29, 10, 16, 8), 0);
-        assert_eq!(island_row_inset(29, 272, 45, 29, 10, 16, 8), 0);
-        assert_eq!(island_row_inset(30, 272, 45, 29, 10, 16, 8), 7);
-        assert_eq!(island_row_inset(34, 272, 45, 29, 10, 16, 8), 14);
-        assert_eq!(island_row_inset(38, 272, 45, 29, 10, 16, 8), 16);
-        assert_eq!(island_row_inset(40, 272, 45, 29, 10, 16, 8), 17);
-        assert_eq!(island_row_inset(42, 272, 45, 29, 10, 16, 8), 18);
-        assert_eq!(island_row_inset(44, 272, 45, 29, 10, 16, 8), 24);
+        assert_eq!(island_row_inset(0, 288, 49, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(28, 288, 49, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(29, 288, 49, 29, 10, 16, 8), 0);
+        assert_eq!(island_row_inset(30, 288, 49, 29, 10, 16, 8), 7);
+        assert_eq!(island_row_inset(34, 288, 49, 29, 10, 16, 8), 14);
+        assert_eq!(island_row_inset(38, 288, 49, 29, 10, 16, 8), 16);
+        assert_eq!(island_row_inset(40, 288, 49, 29, 10, 16, 8), 16);
+        assert_eq!(island_row_inset(42, 288, 49, 29, 10, 16, 8), 16);
+        assert_eq!(island_row_inset(44, 288, 49, 29, 10, 16, 8), 17);
+        assert_eq!(island_row_inset(46, 288, 49, 29, 10, 16, 8), 18);
+        assert_eq!(island_row_inset(48, 288, 49, 29, 10, 16, 8), 24);
     }
 
     #[test]
     fn batched_regions_preserve_every_animated_row_at_common_and_fractional_dpis() {
         for (client_width, client_height) in [
-            (280, 48),
-            (321, 55),
-            (338, 58),
-            (350, 60),
-            (420, 72),
-            (490, 84),
-            (560, 96),
+            (304, 52),
+            (348, 60),
+            (367, 63),
+            (380, 65),
+            (456, 78),
+            (532, 91),
+            (608, 104),
         ] {
             let metrics = WindowMetrics {
                 window_rect: RectI {
@@ -2932,13 +3321,28 @@ mod tests {
 
             for presenter_attached in [false, true] {
                 for progress in 0..=DISCLOSURE_PROGRESS_LIMIT {
-                    assert_coalesced_region_is_exact(window_region_for_attachment(
+                    let region = window_region_for_attachment(
                         metrics,
                         OverlayPresentation::HoverIsland,
                         false,
                         presenter_attached,
                         progress,
-                    ));
+                    );
+                    if let WindowRegionShape::Island {
+                        shoulder_start,
+                        shoulder_depth,
+                        bottom_radius,
+                        ..
+                    } = region.shape
+                    {
+                        // Rounding and overshoot cannot replace part of the concave
+                        // root with a convex corner, which would notch the hit region.
+                        assert!(
+                            shoulder_start + shoulder_depth + bottom_radius
+                                <= region.bottom - region.top
+                        );
+                    }
+                    assert_coalesced_region_is_exact(region);
                 }
             }
         }
@@ -2950,13 +3354,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let region = window_region_for_attachment(
             metrics,
@@ -2980,21 +3384,21 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         assert_eq!(
             window_region_for_attachment(metrics, OverlayPresentation::HoverIsland, false, true, 0,),
             WindowRegion {
-                left: 94,
+                left: 106,
                 top: 1,
-                right: 186,
+                right: 198,
                 bottom: 40,
                 shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
             }
@@ -3008,10 +3412,10 @@ mod tests {
                 DISCLOSURE_PROGRESS_MAX,
             ),
             WindowRegion {
-                left: 4,
+                left: 8,
                 top: 1,
-                right: 276,
-                bottom: 46,
+                right: 296,
+                bottom: 50,
                 shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
             }
         );
@@ -3023,13 +3427,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
 
         assert_eq!(
@@ -3041,9 +3445,9 @@ mod tests {
                 0,
             ),
             WindowRegion {
-                left: 117,
+                left: 129,
                 top: 1,
-                right: 163,
+                right: 175,
                 bottom: 40,
                 shape: WindowRegionShape::RoundedRectangle { corner_radius: 16 },
             }
@@ -3052,17 +3456,18 @@ mod tests {
 
     #[test]
     fn presenter_rounded_rectangle_rows_round_all_four_corners_evenly() {
-        assert_eq!(rounded_rectangle_row_inset(0, 272, 45, 16), 16);
-        assert_eq!(rounded_rectangle_row_inset(1, 272, 45, 16), 10);
-        assert_eq!(rounded_rectangle_row_inset(2, 272, 45, 16), 8);
-        assert_eq!(rounded_rectangle_row_inset(3, 272, 45, 16), 6);
-        assert_eq!(rounded_rectangle_row_inset(5, 272, 45, 16), 4);
-        assert_eq!(rounded_rectangle_row_inset(15, 272, 45, 16), 0);
-        assert_eq!(rounded_rectangle_row_inset(22, 272, 45, 16), 0);
-        assert_eq!(rounded_rectangle_row_inset(41, 272, 45, 16), 6);
-        assert_eq!(rounded_rectangle_row_inset(42, 272, 45, 16), 8);
-        assert_eq!(rounded_rectangle_row_inset(43, 272, 45, 16), 10);
-        assert_eq!(rounded_rectangle_row_inset(44, 272, 45, 16), 16);
+        assert_eq!(rounded_rectangle_row_inset(0, 288, 49, 16), 16);
+        assert_eq!(rounded_rectangle_row_inset(1, 288, 49, 16), 10);
+        assert_eq!(rounded_rectangle_row_inset(2, 288, 49, 16), 8);
+        assert_eq!(rounded_rectangle_row_inset(3, 288, 49, 16), 6);
+        assert_eq!(rounded_rectangle_row_inset(5, 288, 49, 16), 4);
+        assert_eq!(rounded_rectangle_row_inset(15, 288, 49, 16), 0);
+        assert_eq!(rounded_rectangle_row_inset(24, 288, 49, 16), 0);
+        assert_eq!(rounded_rectangle_row_inset(43, 288, 49, 16), 4);
+        assert_eq!(rounded_rectangle_row_inset(45, 288, 49, 16), 6);
+        assert_eq!(rounded_rectangle_row_inset(46, 288, 49, 16), 8);
+        assert_eq!(rounded_rectangle_row_inset(47, 288, 49, 16), 10);
+        assert_eq!(rounded_rectangle_row_inset(48, 288, 49, 16), 16);
     }
 
     #[test]
@@ -3071,13 +3476,13 @@ mod tests {
             window_rect: RectI {
                 left: -7,
                 top: -7,
-                right: 287,
-                bottom: 55,
+                right: 311,
+                bottom: 59,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let shifted = WindowMetrics {
             client_screen_left: 1,
@@ -3194,7 +3599,7 @@ mod tests {
         let expanded = surface_rect(350, 50, OverlayMode::Expanded);
         assert!(y + expanded.top >= 0);
         // Preserve the healthy observed caption bottom (46) and add the scaled drop.
-        assert_eq!(y + expanded.bottom, 63);
+        assert_eq!(y + expanded.bottom, 65);
     }
 
     #[test]
@@ -3203,13 +3608,13 @@ mod tests {
             window_rect: RectI {
                 left: 812,
                 top: 516,
-                right: 1108,
-                bottom: 572,
+                right: 1132,
+                bottom: 576,
             },
             client_screen_left: 820,
             client_screen_top: 516,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3238,7 +3643,7 @@ mod tests {
             panic!("expected visible placement");
         };
         assert!(!compact);
-        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        let inline = surface_rect(304, 52, OverlayMode::Inline);
         // Preserve the one-logical-pixel DWM outline at the top of the 30px caption.
         assert_eq!(y + inline.top, 21);
         assert_eq!(y + inline.bottom, 50);
@@ -3250,13 +3655,13 @@ mod tests {
             window_rect: RectI {
                 left: 812,
                 top: 516,
-                right: 1108,
-                bottom: 572,
+                right: 1132,
+                bottom: 576,
             },
             client_screen_left: 820,
             client_screen_top: 516,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3280,7 +3685,7 @@ mod tests {
             panic!("expected visible placement");
         };
         assert!(!compact);
-        let inline = surface_rect(280, 48, OverlayMode::Inline);
+        let inline = surface_rect(304, 52, OverlayMode::Inline);
         assert_eq!(y + inline.top, 21);
         assert_eq!(y + inline.bottom, 50);
     }
@@ -3291,13 +3696,13 @@ mod tests {
             window_rect: RectI {
                 left: 812,
                 top: 516,
-                right: 1108,
-                bottom: 572,
+                right: 1132,
+                bottom: 576,
             },
             client_screen_left: 820,
             client_screen_top: 516,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3321,12 +3726,12 @@ mod tests {
             panic!("expected visible placement");
         };
         assert!(!compact);
-        let collapsed = surface_rect(280, 48, OverlayMode::Collapsed);
-        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        let collapsed = surface_rect(304, 52, OverlayMode::Collapsed);
+        let expanded = surface_rect(304, 52, OverlayMode::Expanded);
         assert_eq!(y + collapsed.top, 21);
         assert_eq!(y + collapsed.bottom, 50);
         assert_eq!(y + expanded.top, 21);
-        assert_eq!(y + expanded.bottom, 66);
+        assert_eq!(y + expanded.bottom, 70);
     }
 
     #[test]
@@ -3335,13 +3740,13 @@ mod tests {
             window_rect: RectI {
                 left: 812,
                 top: 516,
-                right: 1108,
-                bottom: 572,
+                right: 1132,
+                bottom: 576,
             },
             client_screen_left: 820,
             client_screen_top: 516,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3369,7 +3774,7 @@ mod tests {
         assert_eq!(
             placement,
             OverlayPlacement::Visible {
-                x: 811,
+                x: 799,
                 y: 20,
                 compact: false,
             }
@@ -3378,12 +3783,12 @@ mod tests {
         let OverlayPlacement::Visible { y, .. } = placement else {
             unreachable!();
         };
-        let collapsed = surface_rect(280, 48, OverlayMode::Collapsed);
-        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        let collapsed = surface_rect(304, 52, OverlayMode::Collapsed);
+        let expanded = surface_rect(304, 52, OverlayMode::Expanded);
         assert_eq!(y + collapsed.top, 21);
         assert_eq!(y + collapsed.bottom, 50);
         assert_eq!(y + expanded.top, 21);
-        assert_eq!(y + expanded.bottom, 66);
+        assert_eq!(y + expanded.bottom, 70);
     }
 
     #[test]
@@ -3392,13 +3797,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3426,7 +3831,7 @@ mod tests {
         assert_eq!(
             placement,
             OverlayPlacement::Visible {
-                x: 89,
+                x: 77,
                 y: 16,
                 compact: true,
             }
@@ -3436,13 +3841,13 @@ mod tests {
     #[test]
     fn short_maximized_caption_buttons_do_not_hide_at_common_or_custom_dpis() {
         for (client_width, client_height) in [
-            (280, 48),
-            (321, 55),
-            (338, 58),
-            (350, 60),
-            (420, 72),
-            (490, 84),
-            (560, 96),
+            (304, 52),
+            (348, 60),
+            (367, 63),
+            (380, 65),
+            (456, 78),
+            (532, 91),
+            (608, 104),
         ] {
             let overlay = WindowMetrics {
                 window_rect: RectI {
@@ -3507,13 +3912,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {
@@ -3547,13 +3952,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_presenter_placement(
             RectI {
@@ -3569,7 +3974,7 @@ mod tests {
         assert_eq!(
             placement,
             OverlayPlacement::Visible {
-                x: 820,
+                x: 808,
                 y: 42,
                 compact: false,
             }
@@ -3577,7 +3982,7 @@ mod tests {
         let OverlayPlacement::Visible { x, y, .. } = placement else {
             unreachable!();
         };
-        let expanded = surface_rect(280, 48, OverlayMode::Expanded);
+        let expanded = surface_rect(304, 52, OverlayMode::Expanded);
         assert_eq!(x + expanded.left + expanded.width() / 2, 960);
         assert_eq!(y + expanded.top, 43);
     }
@@ -3588,13 +3993,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_presenter_placement(
             RectI {
@@ -3610,7 +4015,7 @@ mod tests {
         assert_eq!(
             placement,
             OverlayPlacement::Visible {
-                x: 821,
+                x: 809,
                 y: 62,
                 compact: false,
             }
@@ -3623,13 +4028,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_presenter_placement(
             RectI {
@@ -3656,13 +4061,13 @@ mod tests {
             window_rect: RectI {
                 left: 0,
                 top: 0,
-                right: 280,
-                bottom: 48,
+                right: 304,
+                bottom: 52,
             },
             client_screen_left: 0,
             client_screen_top: 0,
-            client_width: 280,
-            client_height: 48,
+            client_width: 304,
+            client_height: 52,
         };
         let placement = calculate_placement(
             RectI {

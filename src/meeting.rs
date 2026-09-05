@@ -9,8 +9,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use uiautomation::UIAutomation;
-use uiautomation::types::{ControlType, Handle, Point, TreeScope};
+use uiautomation::types::{ControlType, ElementMode, Handle, Point, TreeScope, UIProperty};
+use uiautomation::{UIAutomation, UIElement};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM},
@@ -18,12 +18,14 @@ use windows::{
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::{
-                EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumChildWindows,
-                GWL_EXSTYLE, GetClassNameW, GetMessageW, GetWindowDisplayAffinity, GetWindowLongW,
-                IsIconic, IsWindow, IsWindowVisible, MSG, PostThreadMessageW,
-                WDA_EXCLUDEFROMCAPTURE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
-                WS_EX_TOPMOST,
+                EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+                EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_STATECHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+                EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+                EnumChildWindows, GWL_EXSTYLE, GetClassNameW, GetMessageW,
+                GetWindowDisplayAffinity, GetWindowLongW, IsIconic, IsWindow, IsWindowVisible, MSG,
+                PostThreadMessageW, WDA_EXCLUDEFROMCAPTURE, WINEVENT_OUTOFCONTEXT,
+                WINEVENT_SKIPOWNPROCESS, WM_QUIT, WS_EX_TOPMOST,
             },
         },
     },
@@ -34,9 +36,16 @@ use xcap::Window;
 use crate::capture::{CaptureTarget, LocalMonitorCaptureTarget, detect_local_monitor_target};
 use crate::shutdown::defer_cleanup;
 
+mod process_names;
+use process_names::ProcessNameCache;
+
+#[cfg(test)]
+mod scheduling_tests;
+
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(700);
+const MIN_SCAN_INTERVAL: Duration = Duration::from_millis(100);
 const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(40);
-const ENTRY_STABLE_FOR: Duration = Duration::from_millis(600);
+const ENTRY_STABLE_FOR: Duration = Duration::from_millis(250);
 const ENTRY_FALLBACK_STABLE_FOR: Duration = Duration::from_millis(1_100);
 const EXIT_STABLE_FOR: Duration = Duration::from_millis(1_400);
 const PRESENTER_TOOLBAR_EXIT_STABLE_FOR: Duration = Duration::from_millis(450);
@@ -59,6 +68,7 @@ pub struct MeetingSnapshot {
 
 pub struct MeetingMonitor {
     snapshot: Arc<Mutex<MeetingSnapshot>>,
+    changes: async_channel::Receiver<()>,
     signal: Arc<ScanSignal>,
     stop: Arc<AtomicBool>,
     hook_thread_id: Arc<AtomicU32>,
@@ -66,9 +76,10 @@ pub struct MeetingMonitor {
 }
 
 impl MeetingMonitor {
-    pub fn start() -> Self {
+    pub fn start(on_window_geometry_changed: impl Fn(u32) -> bool + Send + Sync + 'static) -> Self {
         let snapshot = Arc::new(Mutex::new(MeetingSnapshot::default()));
-        let signal = Arc::new(ScanSignal::default());
+        let (changes_tx, changes) = async_channel::bounded(1);
+        let signal = Arc::new(ScanSignal::new(Some(Arc::new(on_window_geometry_changed))));
         let stop = Arc::new(AtomicBool::new(false));
         let hook_thread_id = Arc::new(AtomicU32::new(0));
         let mut workers = Vec::new();
@@ -93,7 +104,7 @@ impl MeetingMonitor {
             let stop = Arc::clone(&stop);
             if let Ok(worker) = thread::Builder::new()
                 .name("snapbar-meeting-monitor".to_string())
-                .spawn(move || run_monitor(snapshot, signal, stop))
+                .spawn(move || run_monitor(snapshot, signal, stop, changes_tx))
             {
                 workers.push(worker);
             }
@@ -102,6 +113,7 @@ impl MeetingMonitor {
         signal.request();
         Self {
             snapshot,
+            changes,
             signal,
             stop,
             hook_thread_id,
@@ -118,6 +130,10 @@ impl MeetingMonitor {
 
     pub fn request_scan(&self) {
         self.signal.request();
+    }
+
+    pub fn subscribe(&self) -> async_channel::Receiver<()> {
+        self.changes.clone()
     }
 }
 
@@ -143,13 +159,21 @@ impl Drop for MeetingMonitor {
     }
 }
 
-#[derive(Default)]
 struct ScanSignal {
     pending: Mutex<bool>,
     wake: Condvar,
+    geometry_follow: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
 }
 
 impl ScanSignal {
+    fn new(geometry_follow: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>) -> Self {
+        Self {
+            pending: Mutex::new(false),
+            wake: Condvar::new(),
+            geometry_follow,
+        }
+    }
+
     fn request(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             *pending = true;
@@ -157,19 +181,42 @@ impl ScanSignal {
         }
     }
 
-    fn wait(&self, stop: &AtomicBool) {
+    fn notify_geometry_follow(&self, hwnd: HWND) -> bool {
+        self.geometry_follow
+            .as_ref()
+            .is_some_and(|callback| callback(hwnd.0 as usize as u32))
+    }
+
+    fn wait(&self, stop: &AtomicBool, not_before: Instant, scheduled: Instant) {
         let Ok(mut pending) = self.pending.lock() else {
             thread::sleep(WATCHDOG_INTERVAL);
             return;
         };
-        if !*pending && !stop.load(Ordering::Acquire) {
-            if let Ok((next, _)) = self.wake.wait_timeout(pending, WATCHDOG_INTERVAL) {
-                pending = next;
-            } else {
+        loop {
+            if stop.load(Ordering::Acquire) {
                 return;
             }
+            let now = Instant::now();
+            let deadline = scan_wake_deadline(*pending, not_before, scheduled);
+            if now >= deadline {
+                *pending = false;
+                return;
+            }
+            // Preserve requests during the minimum gap. Spurious wakes and
+            // event bursts cannot turn into a tight loop of UIA scans.
+            match self.wake.wait_timeout(pending, deadline - now) {
+                Ok((next, _)) => pending = next,
+                Err(_) => return,
+            }
         }
-        *pending = false;
+    }
+}
+
+fn scan_wake_deadline(pending: bool, not_before: Instant, scheduled: Instant) -> Instant {
+    if pending {
+        not_before
+    } else {
+        scheduled.max(not_before)
     }
 }
 
@@ -208,6 +255,11 @@ struct PresenterToolbarState {
 }
 
 impl PresenterToolbarState {
+    fn confirmation_deadline(&self) -> Option<Instant> {
+        self.missing_since
+            .map(|since| since + PRESENTER_TOOLBAR_EXIT_STABLE_FOR)
+    }
+
     fn update(&mut self, now: Instant, evidence: Vec<PresenterToolbarEvidence>) -> Option<u32> {
         if let Some(active) = self.active {
             if evidence.iter().any(|candidate| candidate.id == active) {
@@ -271,6 +323,7 @@ struct EntryCandidate {
     target_id: u32,
     since: Instant,
     scans: u8,
+    required_delay: Duration,
 }
 
 #[derive(Default)]
@@ -282,6 +335,16 @@ struct DebouncedMeetingState {
 }
 
 impl DebouncedMeetingState {
+    fn confirmation_deadline(&self) -> Option<Instant> {
+        self.missing_since
+            .map(|since| since + EXIT_STABLE_FOR)
+            .or_else(|| {
+                self.entry
+                    .as_ref()
+                    .map(|entry| entry.since + entry.required_delay)
+            })
+    }
+
     fn update(&mut self, now: Instant, evidence: Vec<MeetingEvidence>) -> Option<MeetingEvidence> {
         if let Some(active) = self.active.clone() {
             if let Some(current) = evidence
@@ -332,6 +395,7 @@ impl DebouncedMeetingState {
         match self.entry.as_mut() {
             Some(entry) if entry.target_id == best.target.id => {
                 entry.scans = entry.scans.saturating_add(1);
+                entry.required_delay = required_delay;
                 if entry.scans >= REQUIRED_ENTRY_SCANS
                     && now.duration_since(entry.since) >= required_delay
                 {
@@ -345,6 +409,7 @@ impl DebouncedMeetingState {
                     target_id: best.target.id,
                     since: now,
                     scans: 1,
+                    required_delay,
                 });
             }
         }
@@ -357,17 +422,31 @@ fn run_monitor(
     snapshot: Arc<Mutex<MeetingSnapshot>>,
     signal: Arc<ScanSignal>,
     stop: Arc<AtomicBool>,
+    changes: async_channel::Sender<()>,
 ) {
     let mut state = DebouncedMeetingState::default();
     let mut presenter_toolbar = PresenterToolbarState::default();
+    let mut automation = None;
+    let mut process_names = ProcessNameCache::default();
+    let mut not_before = Instant::now();
+    let mut scheduled = not_before;
     while !stop.load(Ordering::Acquire) {
-        signal.wait(&stop);
+        signal.wait(&stop, not_before, scheduled);
         if stop.load(Ordering::Acquire) {
             break;
         }
 
+        // Keep the UIA client on its owning thread. Window evidence itself is
+        // still read afresh on every scan; only the client and process metadata
+        // are reused.
+        if automation.is_none() {
+            automation = UIAutomation::new()
+                .or_else(|_| UIAutomation::new_direct())
+                .ok();
+        }
+        let scan =
+            scan_meeting_windows(automation.as_ref(), &mut process_names).unwrap_or_default();
         let now = Instant::now();
-        let scan = scan_meeting_windows().unwrap_or_default();
         let active = state.update(now, scan.meetings);
         let presenter_evidence = scan.presenter_toolbars;
         let next_presenter_toolbar = presenter_toolbar.update(now, presenter_evidence.clone());
@@ -402,16 +481,30 @@ fn run_monitor(
                 current.presenter_toolbar_id = next_presenter_toolbar;
                 current.local_share_active = next_local_share_active;
                 current.local_monitor_target = next_local_monitor_target;
+                // The snapshot is the sole stored value; queued notifications
+                // only request a read of its latest generation.
+                let _ = changes.try_send(());
             }
         }
+
+        let finished = Instant::now();
+        not_before = finished + MIN_SCAN_INTERVAL;
+        scheduled = state
+            .confirmation_deadline()
+            .into_iter()
+            .chain(presenter_toolbar.confirmation_deadline())
+            .min()
+            .unwrap_or(finished + WATCHDOG_INTERVAL)
+            .min(finished + WATCHDOG_INTERVAL);
     }
 }
 
-fn scan_meeting_windows() -> Result<TeamsScan> {
+fn scan_meeting_windows(
+    automation: Option<&UIAutomation>,
+    process_names: &mut ProcessNameCache,
+) -> Result<TeamsScan> {
     let windows = Window::all().context("Teamsウィンドウ一覧を取得できませんでした")?;
-    let automation = UIAutomation::new()
-        .or_else(|_| UIAutomation::new_direct())
-        .ok();
+    process_names.retain_windows(&windows);
     let mut scan = TeamsScan::default();
 
     for (z_index, window) in windows.into_iter().enumerate() {
@@ -419,7 +512,7 @@ fn scan_meeting_windows() -> Result<TeamsScan> {
             Ok(id) => id,
             Err(_) => continue,
         };
-        let app_name = window.app_name().unwrap_or_default();
+        let app_name = process_names.app_name(&window);
         let title = window.title().unwrap_or_default();
         if !is_teams_window(&app_name, &title) {
             continue;
@@ -439,7 +532,7 @@ fn scan_meeting_windows() -> Result<TeamsScan> {
         if let Some(mut score) =
             presenter_toolbar_score(&title, width, height, visible, topmost, display_affinity)
         {
-            let local_share_active = automation.as_ref().is_some_and(|automation| {
+            let local_share_active = automation.is_some_and(|automation| {
                 inspect_presenter_toolbar_uia(automation, id).unwrap_or(false)
             });
             if local_share_active {
@@ -455,7 +548,6 @@ fn scan_meeting_windows() -> Result<TeamsScan> {
 
         let classes = inspect_child_classes(hwnd);
         let uia = automation
-            .as_ref()
             .map(|automation| inspect_meeting_uia(automation, id, &window))
             .transpose()
             .unwrap_or_default()
@@ -597,28 +689,84 @@ fn is_teams_window(app_name: &str, title: &str) -> bool {
 }
 
 fn inspect_presenter_toolbar_uia(automation: &UIAutomation, target_id: u32) -> Result<bool> {
-    let root = automation
-        .element_from_handle(Handle::from(target_id as isize))
-        .context("Teams発表者ツールバーのUIAルートを取得できませんでした")?;
-    let condition = automation
-        .create_true_condition()
-        .context("Teams発表者ツールバーのUIA検索条件を作成できませんでした")?;
-    let elements = root
-        .find_all(TreeScope::Subtree, &condition)
-        .context("Teams発表者ツールバーのUIAを走査できませんでした")?;
+    let elements = snapshot_meeting_elements(automation, target_id)?;
 
     Ok(elements.into_iter().any(|element| {
-        if element.is_offscreen().unwrap_or(true) {
+        if element
+            .is_cached_offscreen()
+            .or_else(|_| element.is_offscreen())
+            .unwrap_or(true)
+        {
             return false;
         }
-        let name = normalize_name(&element.get_name().unwrap_or_default());
-        let automation_id = element.get_automation_id().unwrap_or_default();
+        let name = normalize_name(
+            &element
+                .get_cached_name()
+                .or_else(|_| element.get_name())
+                .unwrap_or_default(),
+        );
+        let automation_id = element
+            .get_cached_automation_id()
+            .or_else(|_| element.get_automation_id())
+            .unwrap_or_default();
         presenter_element_confirms_local_share(
             &name,
             &automation_id,
-            element.get_control_type().ok(),
+            element
+                .get_cached_control_type()
+                .or_else(|_| element.get_control_type())
+                .ok(),
         )
     }))
+}
+
+fn snapshot_meeting_elements(automation: &UIAutomation, target_id: u32) -> Result<Vec<UIElement>> {
+    let root = automation
+        .element_from_handle(Handle::from(target_id as isize))
+        .context("Teams UIのルートを取得できませんでした")?;
+    let condition = automation
+        .create_true_condition()
+        .context("Teams UIの検索条件を作成できませんでした")?;
+    let snapshot = || -> uiautomation::Result<Vec<UIElement>> {
+        // The classifiers below already discard offscreen elements and cannot
+        // match an element with both an empty Name and empty AutomationId.
+        // Apply those exact exclusions before constructing result objects.
+        let visible =
+            automation.create_property_condition(UIProperty::IsOffscreen, false.into(), None)?;
+        let named = automation.create_not_condition(automation.create_property_condition(
+            UIProperty::Name,
+            "".into(),
+            None,
+        )?)?;
+        let identified = automation.create_not_condition(automation.create_property_condition(
+            UIProperty::AutomationId,
+            "".into(),
+            None,
+        )?)?;
+        let relevant = automation
+            .create_and_condition(visible, automation.create_or_condition(named, identified)?)?;
+        let request = automation.create_cache_request()?;
+        // Cache each result's four properties once, not a subtree for every
+        // result. A fresh bulk read replaces hundreds of cross-process calls.
+        request.set_tree_scope(TreeScope::Element)?;
+        request.set_tree_filter(automation.create_true_condition()?)?;
+        // Preserve live references for providers that cannot cache a property.
+        request.set_element_mode(ElementMode::Full)?;
+        for property in [
+            UIProperty::Name,
+            UIProperty::AutomationId,
+            UIProperty::ControlType,
+            UIProperty::IsOffscreen,
+        ] {
+            request.add_property(property)?;
+        }
+        root.find_all_build_cache(TreeScope::Subtree, &relevant, &request)
+    };
+    // No evidence survives this scan. Keep the existing query as a compatibility
+    // fallback when a UIA provider does not support the bulk request.
+    snapshot()
+        .or_else(|_| root.find_all(TreeScope::Subtree, &condition))
+        .context("Teams UIを走査できませんでした")
 }
 
 fn presenter_element_confirms_local_share(
@@ -655,7 +803,7 @@ fn inspect_meeting_uia(
     window: &Window,
 ) -> Result<MeetingUiaEvidence> {
     let first = scan_meeting_uia(automation, target_id)?;
-    if first.has_signal() {
+    if !first.needs_provider_warmup() {
         return Ok(first);
     }
 
@@ -678,33 +826,58 @@ struct MeetingUiaEvidence {
     has_leave_control: bool,
     has_call_control: bool,
     has_shared_content: bool,
+    provider_has_controls: bool,
 }
 
 impl MeetingUiaEvidence {
     fn has_signal(self) -> bool {
         self.has_leave_control || self.has_call_control || self.has_shared_content
     }
+
+    fn needs_provider_warmup(self) -> bool {
+        // A populated calendar or chat already has a responsive provider.
+        // Warm up only a bare/empty tree; ordinary controls are not meeting
+        // evidence, and the next watchdog scan still queries the tree afresh.
+        !self.has_signal() && !self.provider_has_controls
+    }
 }
 
 fn scan_meeting_uia(automation: &UIAutomation, target_id: u32) -> Result<MeetingUiaEvidence> {
-    let root = automation
-        .element_from_handle(Handle::from(target_id as isize))
-        .context("Teams会議UIのルートを取得できませんでした")?;
-    let condition = automation
-        .create_true_condition()
-        .context("Teams会議UIの検索条件を作成できませんでした")?;
-    let elements = root
-        .find_all(TreeScope::Subtree, &condition)
-        .context("Teams会議UIを走査できませんでした")?;
+    let elements = snapshot_meeting_elements(automation, target_id)?;
 
     let mut evidence = MeetingUiaEvidence::default();
     for element in elements {
-        if element.is_offscreen().unwrap_or(true) {
+        if element
+            .is_cached_offscreen()
+            .or_else(|_| element.is_offscreen())
+            .unwrap_or(true)
+        {
             continue;
         }
-        let name = normalize_name(&element.get_name().unwrap_or_default());
-        let automation_id = element.get_automation_id().unwrap_or_default();
-        let control_type = element.get_control_type().ok();
+        let name = normalize_name(
+            &element
+                .get_cached_name()
+                .or_else(|_| element.get_name())
+                .unwrap_or_default(),
+        );
+        let automation_id = element
+            .get_cached_automation_id()
+            .or_else(|_| element.get_automation_id())
+            .unwrap_or_default();
+        let control_type = element
+            .get_cached_control_type()
+            .or_else(|_| element.get_control_type())
+            .ok();
+        evidence.provider_has_controls |= (!name.is_empty() || !automation_id.is_empty())
+            && matches!(
+                control_type,
+                Some(
+                    ControlType::Button
+                        | ControlType::SplitButton
+                        | ControlType::MenuItem
+                        | ControlType::Text
+                )
+            );
         if is_leave_control(&name, control_type) {
             evidence.has_leave_control = true;
         }
@@ -854,6 +1027,15 @@ fn run_win_event_hook(signal: Arc<ScanSignal>, stop: Arc<AtomicBool>, thread_id:
                 0,
                 flags,
             ),
+            SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZESTART,
+                EVENT_SYSTEM_MOVESIZEEND,
+                None,
+                Some(win_event_callback),
+                0,
+                0,
+                flags,
+            ),
         ]
     };
     signal.request();
@@ -875,16 +1057,66 @@ fn run_win_event_hook(signal: Arc<ScanSignal>, stop: Arc<AtomicBool>, thread_id:
     }
 }
 
+fn win_event_requires_scan(event: u32, object_id: i32, child_id: i32) -> bool {
+    match event {
+        EVENT_SYSTEM_FOREGROUND
+        | EVENT_SYSTEM_MINIMIZESTART
+        | EVENT_SYSTEM_MINIMIZEEND
+        | EVENT_SYSTEM_MOVESIZEEND => true,
+        EVENT_OBJECT_CREATE
+        | EVENT_OBJECT_DESTROY
+        | EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_HIDE
+        | EVENT_OBJECT_REORDER
+        | EVENT_OBJECT_STATECHANGE
+        | EVENT_OBJECT_LOCATIONCHANGE => object_id == 0 && child_id == 0,
+        _ => false,
+    }
+}
+
+fn win_event_is_window_geometry_follow(event: u32, object_id: i32, child_id: i32) -> bool {
+    match event {
+        EVENT_SYSTEM_MOVESIZESTART
+        | EVENT_SYSTEM_MOVESIZEEND
+        | EVENT_SYSTEM_MINIMIZESTART
+        | EVENT_SYSTEM_MINIMIZEEND => true,
+        EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_HIDE
+        | EVENT_OBJECT_DESTROY
+        | EVENT_OBJECT_LOCATIONCHANGE => object_id == 0 && child_id == 0,
+        _ => false,
+    }
+}
+
+fn win_event_requires_scan_after_follow(
+    event: u32,
+    object_id: i32,
+    child_id: i32,
+    followed: bool,
+) -> bool {
+    win_event_requires_scan(event, object_id, child_id)
+        && !(event == EVENT_OBJECT_LOCATIONCHANGE && followed)
+}
+
 unsafe extern "system" fn win_event_callback(
     _: HWINEVENTHOOK,
-    _: u32,
-    _: HWND,
-    _: i32,
-    _: i32,
+    event: u32,
+    hwnd: HWND,
+    object_id: i32,
+    child_id: i32,
     _: u32,
     _: u32,
 ) {
-    if let Some(signal) = WIN_EVENT_SIGNAL.get().and_then(Weak::upgrade) {
+    let Some(signal) = WIN_EVENT_SIGNAL.get().and_then(Weak::upgrade) else {
+        return;
+    };
+    let followed = win_event_is_window_geometry_follow(event, object_id, child_id)
+        && signal.notify_geometry_follow(hwnd);
+    // OBJID_WINDOW / CHILDID_SELF changes are useful meeting-window signals.
+    // Caret, selection, focus and client-control animations in unrelated apps
+    // must not restart a full UIA scan. The watchdog still reads all meeting
+    // and sharing evidence even when a provider only sends client events.
+    if win_event_requires_scan_after_follow(event, object_id, child_id, followed) {
         signal.request();
     }
 }
@@ -892,14 +1124,168 @@ unsafe extern "system" fn win_event_callback(
 #[cfg(test)]
 mod tests {
     use super::{
-        DebouncedMeetingState, MeetingEvidence, PresenterToolbarEvidence, PresenterToolbarState,
-        REQUIRED_ENTRY_SCANS, is_call_control, is_leave_control, is_shared_content_name,
-        normalize_name, presenter_element_confirms_local_share, presenter_toolbar_score,
+        DebouncedMeetingState, MeetingEvidence, MeetingUiaEvidence, PresenterToolbarEvidence,
+        PresenterToolbarState, REQUIRED_ENTRY_SCANS, is_call_control, is_leave_control,
+        is_shared_content_name, normalize_name, presenter_element_confirms_local_share,
+        presenter_toolbar_score, win_event_is_window_geometry_follow, win_event_requires_scan,
+        win_event_requires_scan_after_follow,
     };
     use crate::capture::CaptureTarget;
     use std::time::{Duration, Instant};
     use uiautomation::types::ControlType;
-    use windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+        EVENT_SYSTEM_MOVESIZESTART, WDA_EXCLUDEFROMCAPTURE,
+    };
+
+    #[test]
+    fn a_populated_nonmeeting_tree_does_not_need_a_second_scan_or_prove_a_meeting() {
+        let calendar = MeetingUiaEvidence {
+            provider_has_controls: true,
+            ..Default::default()
+        };
+        assert!(!calendar.has_signal());
+        assert!(!calendar.needs_provider_warmup());
+    }
+
+    #[test]
+    fn an_empty_provider_still_gets_the_warmup_retry() {
+        assert!(MeetingUiaEvidence::default().needs_provider_warmup());
+        assert!(
+            !MeetingUiaEvidence {
+                has_shared_content: true,
+                ..Default::default()
+            }
+            .needs_provider_warmup()
+        );
+    }
+
+    #[test]
+    fn elements_without_names_and_ids_cannot_contribute_detection_evidence() {
+        assert!(!is_shared_content_name(""));
+        for control_type in [
+            None,
+            Some(ControlType::Button),
+            Some(ControlType::SplitButton),
+            Some(ControlType::MenuItem),
+            Some(ControlType::Text),
+            Some(ControlType::Pane),
+        ] {
+            assert!(!is_leave_control("", control_type));
+            assert!(!is_call_control("", control_type));
+            assert!(!presenter_element_confirms_local_share(
+                "",
+                "",
+                control_type
+            ));
+        }
+    }
+
+    #[test]
+    fn client_animation_and_caret_events_do_not_trigger_meeting_scans() {
+        // OBJID_CLIENT = -4 and OBJID_CARET = -8 are not window geometry.
+        for object_id in [-4, -8] {
+            assert!(!win_event_requires_scan(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                object_id,
+                0
+            ));
+            assert!(!win_event_requires_scan(EVENT_OBJECT_SHOW, object_id, 0));
+        }
+        assert!(!win_event_requires_scan(EVENT_OBJECT_FOCUS, 0, 0));
+        assert!(!win_event_requires_scan(EVENT_OBJECT_LOCATIONCHANGE, 0, 1));
+    }
+
+    #[test]
+    fn native_window_lifecycle_and_geometry_still_wake_meeting_detection() {
+        for event in [
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_SYSTEM_MOVESIZEEND,
+        ] {
+            assert!(win_event_requires_scan(event, 0, 0));
+        }
+        assert!(!win_event_requires_scan(EVENT_SYSTEM_MOVESIZESTART, 0, 0));
+    }
+
+    #[test]
+    fn followed_moves_skip_uia_but_lifecycle_and_move_end_still_scan() {
+        assert!(!win_event_requires_scan_after_follow(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            0,
+            0,
+            true
+        ));
+        assert!(win_event_requires_scan_after_follow(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            0,
+            0,
+            false
+        ));
+        for event in [
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_DESTROY,
+            EVENT_SYSTEM_MINIMIZESTART,
+            EVENT_SYSTEM_MOVESIZEEND,
+        ] {
+            assert!(win_event_requires_scan_after_follow(event, 0, 0, true));
+        }
+        for event in [
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_LOCATIONCHANGE,
+        ] {
+            assert!(!win_event_is_window_geometry_follow(event, -4, 0));
+            assert!(!win_event_requires_scan_after_follow(event, -4, 0, false));
+        }
+    }
+
+    #[test]
+    fn geometry_follow_filter_only_accepts_window_location_changes() {
+        assert!(win_event_is_window_geometry_follow(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            0,
+            0
+        ));
+        assert!(!win_event_is_window_geometry_follow(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            -4,
+            0
+        ));
+        assert!(!win_event_is_window_geometry_follow(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            0,
+            1
+        ));
+        assert!(win_event_is_window_geometry_follow(
+            EVENT_SYSTEM_MOVESIZESTART,
+            -4,
+            1
+        ));
+        assert!(win_event_is_window_geometry_follow(
+            EVENT_SYSTEM_MOVESIZEEND,
+            -4,
+            1
+        ));
+    }
+
+    #[test]
+    fn foreground_and_minimize_events_do_not_depend_on_accessibility_object_ids() {
+        for event in [
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_MINIMIZESTART,
+            EVENT_SYSTEM_MINIMIZEEND,
+        ] {
+            assert!(win_event_requires_scan(event, -4, 1));
+        }
+    }
 
     fn evidence(
         id: u32,

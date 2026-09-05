@@ -19,6 +19,8 @@ mod resident;
 mod settings;
 #[cfg(target_os = "windows")]
 mod shutdown;
+#[cfg(target_os = "windows")]
+mod window_z_order;
 
 #[cfg(target_os = "windows")]
 fn main() {

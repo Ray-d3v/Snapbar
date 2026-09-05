@@ -5051,6 +5051,8 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-channel",
+ "clipboard-win",
+ "embed-resource",
  "gpui",
  "gpui_platform",
  "image",

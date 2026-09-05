@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -24,6 +25,23 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Validate stable release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tags must use vMAJOR.MINOR.PATCH."
+          }
+          $package = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'snapbar'
+          if ($LASTEXITCODE -ne 0 -or $package.version -ne $tag.Substring(1)) {
+            throw "Release tag must match the Snapbar package version."
+          }
+          if (-not (Test-Path "docs/releases/$tag.md")) {
+            throw "Reviewed release notes are required for $tag."
+          }
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -61,7 +79,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $version = "0.1.0-beta.$env:GITHUB_RUN_NUMBER"
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $env:GITHUB_REF_NAME.Substring(1)
+          } else {
+            "0.1.0-beta.$env:GITHUB_RUN_NUMBER"
+          }
           & $env:ISCC "/DAppVersion=$version" "installer\Snapbar.iss"
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
@@ -70,6 +92,9 @@ jobs:
             throw "Installer was not generated."
           }
           Copy-Item "target\release\snapbar.exe" "dist\Snapbar-portable-x64.exe" -Force
+          Get-FileHash "dist/Snapbar-Setup-x64.exe", "dist/Snapbar-portable-x64.exe" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content "dist/Snapbar-SHA256SUMS.txt" -Encoding utf8
 
       - name: Upload portable executable
         uses: actions/upload-artifact@v4
@@ -115,3 +140,22 @@ jobs:
             --title "Snapbar $tag" `
             --notes $notes `
             --prerelease
+
+      - name: Publish stable release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            "dist/Snapbar-Setup-x64.exe" `
+            "dist/Snapbar-portable-x64.exe" `
+            "dist/Snapbar-SHA256SUMS.txt" `
+            --verify-tag `
+            --title "Snapbar $tag" `
+            --notes-file "docs/releases/$tag.md" `
+            --latest
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
