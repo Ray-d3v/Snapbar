@@ -5046,12 +5046,11 @@ dependencies = [
 
 [[package]]
 name = "snapbar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",
  "async-channel",
- "clipboard-win",
  "embed-resource",
  "gpui",
  "gpui_platform",

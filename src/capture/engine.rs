@@ -1,6 +1,7 @@
 use std::fmt;
 use std::{
     ffi::c_void,
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,11 +12,12 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use windows::Win32::{
     Foundation::HWND,
+    System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     UI::WindowsAndMessaging::{IsIconic, IsWindow},
 };
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
-    frame::{DirtyRegion, Frame},
+    frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor as CaptureMonitor,
     settings::{
@@ -27,11 +29,11 @@ use windows_capture::{
 use xcap::Window;
 
 use super::{
-    CaptureReceipt, LocalMonitorCaptureTarget, ScreenRect,
+    CaptureAuthorization, CaptureReceipt, LocalMonitorCaptureTarget, ScreenRect,
     content_detector::PixelRect,
-    copy_rgba_to_clipboard,
     flash::current_screen_rect,
     local_share::validate_local_monitor_target,
+    output_capture,
     uia::{WindowGeometry, detect_content_rect},
 };
 use crate::shutdown::defer_cleanup;
@@ -40,7 +42,6 @@ const BACKUP_CACHE_INTERVAL: Duration = Duration::from_millis(750);
 const FRESH_FRAME_WAIT: Duration = Duration::from_millis(200);
 const LOCAL_FRESH_FRAME_WAIT: Duration = Duration::from_millis(200);
 const DETECTION_RETRY_INTERVAL: Duration = Duration::from_millis(750);
-const FULL_REDETECTION_INTERVAL: Duration = Duration::from_secs(8);
 const READY_TIMEOUT: Duration = Duration::from_millis(1_200);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +91,12 @@ struct EngineInner {
 
 impl Drop for EngineInner {
     fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl EngineInner {
+    fn stop(&self) {
         let control = self
             .control
             .lock()
@@ -127,6 +134,7 @@ impl std::error::Error for FrameUnavailable {}
 pub struct CaptureOutcome {
     pub result: Result<CaptureReceipt>,
     pub replacement: Option<CaptureEngine>,
+    pub save_result: Option<Result<PathBuf>>,
 }
 
 #[derive(Default)]
@@ -147,6 +155,14 @@ struct CachedFrame {
     source_width: u32,
     source_height: u32,
     sequence: u64,
+    remote_layout: Option<RemoteLayout>,
+    rendered_at_100ns: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteLayout {
+    geometry: WindowGeometry,
+    content_rect: PixelRect,
 }
 
 struct CaptureRequestGuard {
@@ -242,16 +258,91 @@ impl CaptureEngine {
         self.inner.shared.source.is_local_monitor()
     }
 
-    pub fn copy_latest_to_clipboard(&self) -> CaptureOutcome {
-        self.copy_with_recovery(copy_rgba_to_clipboard, Self::start_source)
+    pub fn stop(&self) {
+        self.inner.stop();
     }
 
-    fn copy_with_recovery(
+    pub fn copy_latest_to_clipboard(
+        &self,
+        authorization: &CaptureAuthorization,
+        save_to_screenshots: bool,
+    ) -> CaptureOutcome {
+        // Bracket the requested frame with matching UIA observations. A UIA
+        // read only after FrameArrived could describe a newer layout than the
+        // pixels in that frame, even with identical window dimensions.
+        let request_evidence = match authorization.with_current(|| Ok(())).and_then(|()| {
+            let layout = self.confirm_request_layout()?;
+            Ok((layout, performance_time_100ns()?))
+        }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return CaptureOutcome {
+                    result: Err(error),
+                    replacement: None,
+                    save_result: None,
+                };
+            }
+        };
+        let (request_layout, requested_at_100ns) = request_evidence;
+        let mut save_result = None;
+        let mut outcome = self.copy_with_recovery_checked(
+            |width, height, bytes| {
+                save_result =
+                    output_capture(authorization, width, height, bytes, save_to_screenshots)?;
+                Ok(())
+            },
+            |source| authorization.with_current(|| Self::start_source(source)),
+            |cached| {
+                authorization.with_current(|| Ok(()))?;
+                require_frame_after_request(cached.rendered_at_100ns, requested_at_100ns)?;
+                self.validate_cached_layout(cached, request_layout)
+            },
+        );
+        outcome.save_result = save_result;
+        outcome
+    }
+
+    fn confirm_request_layout(&self) -> Result<Option<RemoteLayout>> {
+        self.inner.shared.source.validate_remote_target()?;
+        let Some(target_id) = self.inner.shared.source.remote_target_id() else {
+            return Ok(None);
+        };
+        let (width, height) = {
+            let state = self
+                .inner
+                .shared
+                .state
+                .lock()
+                .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
+            let cached = state
+                .latest
+                .as_ref()
+                .ok_or_else(|| anyhow!("共有コンテンツを準備中です"))?;
+            (cached.source_width, cached.source_height)
+        };
+        detect_remote_layout(target_id, width, height).map(Some)
+    }
+
+    fn validate_cached_layout(
+        &self,
+        cached: &CachedFrame,
+        request_layout: Option<RemoteLayout>,
+    ) -> Result<()> {
+        let Some(target_id) = self.inner.shared.source.remote_target_id() else {
+            return Ok(());
+        };
+        let current = detect_remote_layout(target_id, cached.source_width, cached.source_height)?;
+        require_matching_layout(request_layout, current)?;
+        require_matching_layout(cached.remote_layout, current)
+    }
+
+    fn copy_with_recovery_checked(
         &self,
         mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
         restart: impl FnOnce(CaptureSource) -> Result<CaptureEngine>,
+        mut validate: impl FnMut(&CachedFrame) -> Result<()>,
     ) -> CaptureOutcome {
-        let first = self.copy_latest_with(&mut copy);
+        let first = self.copy_latest_since_checked(&mut copy, None, &mut validate);
         if first
             .as_ref()
             .err()
@@ -261,6 +352,7 @@ impl CaptureEngine {
             return CaptureOutcome {
                 result: first,
                 replacement: None,
+                save_result: None,
             };
         }
 
@@ -269,6 +361,7 @@ impl CaptureEngine {
             return CaptureOutcome {
                 result: Err(error),
                 replacement: None,
+                save_result: None,
             };
         }
         let new_engine = match restart(source) {
@@ -277,27 +370,23 @@ impl CaptureEngine {
                 return CaptureOutcome {
                     result: Err(error),
                     replacement: None,
+                    save_result: None,
                 };
             }
         };
-        let result = new_engine.copy_latest_since(copy, Some(0));
+        let result = new_engine.copy_latest_since_checked(copy, Some(0), validate);
         CaptureOutcome {
             result,
             replacement: Some(new_engine),
+            save_result: None,
         }
     }
 
-    fn copy_latest_with(
-        &self,
-        mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
-    ) -> Result<CaptureReceipt> {
-        self.copy_latest_since(&mut copy, None)
-    }
-
-    fn copy_latest_since(
+    fn copy_latest_since_checked(
         &self,
         mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
         baseline_override: Option<u64>,
+        mut validate: impl FnMut(&CachedFrame) -> Result<()>,
     ) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
         self.inner.shared.source.validate_remote_target()?;
@@ -372,16 +461,13 @@ impl CaptureEngine {
             }
         }
 
-        let observed_sequence = self.inner.shared.observed_sequence.load(Ordering::Acquire);
         let cached_sequence = state.latest.as_ref().map_or(0, |frame| frame.sequence);
         if local_monitor && cached_sequence <= baseline_sequence {
             return Err(anyhow::Error::new(FrameUnavailable(
                 "自分の共有画面の新しいフレームを取得できませんでした",
             )));
         }
-        if !local_monitor
-            && !remote_cache_is_usable(baseline_sequence, observed_sequence, cached_sequence)
-        {
+        if !local_monitor && cached_sequence <= baseline_sequence {
             return Err(anyhow::Error::new(FrameUnavailable(
                 "新しい共有画面フレームをキャッシュできませんでした",
             )));
@@ -401,6 +487,11 @@ impl CaptureEngine {
                 |message| anyhow!(message),
             )
         })?;
+        // Dirty regions are rendering hints, not evidence that Teams kept the
+        // sharing layout. Reconfirm UIA and the exact capture geometry for every
+        // output. A static source recovers through a new WGC session, whose
+        // initial frame is acquired after the request's UIA preflight.
+        validate(cached)?;
         // The window can be minimized or closed while waiting for a new frame.
         // Validate at the write boundary instead of relying on meeting snapshots.
         self.inner.shared.source.validate_remote_target()?;
@@ -460,74 +551,35 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         if let CaptureSource::LocalMonitor(target) = self.shared.source.clone() {
             return self.on_local_monitor_frame(frame, now, observed_sequence, requested, target);
         }
-        let (current_rect, has_latest) = self
+        let has_latest = self
             .shared
             .state
             .lock()
-            .map(|state| (state.content_rect, state.latest.is_some()))
-            .unwrap_or((None, false));
+            .map(|state| state.latest.is_some())
+            .unwrap_or(false);
         let size_changed = self.last_source_size != Some(source_size);
         if size_changed {
             self.last_source_size = Some(source_size);
         }
-        let periodic_redetect = current_rect.is_some()
-            && self
-                .last_detection
-                .is_none_or(|last| now.duration_since(last) >= FULL_REDETECTION_INTERVAL);
-        let missing_rect_retry = current_rect.is_none()
-            && (requested
-                || self
-                    .last_detection
-                    .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL));
-        let dirty_layout_change = current_rect.is_some_and(|rect| {
-            self.last_detection
-                .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL)
-                && dirty_regions_suggest_layout_change(frame, rect)
-        });
-        let needs_detection =
-            size_changed || periodic_redetect || missing_rect_retry || dirty_layout_change;
         let needs_cache = requested
-            || !has_latest
+            || size_changed
             || self
                 .last_cache_update
                 .is_none_or(|last| now.duration_since(last) >= BACKUP_CACHE_INTERVAL);
-
-        if current_rect.is_none() && !needs_detection {
+        let detection_due = requested
+            || size_changed
+            || has_latest
+            || self
+                .last_detection
+                .is_none_or(|last| now.duration_since(last) >= DETECTION_RETRY_INTERVAL);
+        if !needs_cache || !detection_due {
             return Ok(());
         }
-        if !needs_detection && !needs_cache {
-            return Ok(());
-        }
 
-        let result = if needs_detection {
-            self.last_detection = Some(now);
-            match self.detect_and_cache(frame, now, observed_sequence) {
-                Ok(()) => Ok(()),
-                Err(error)
-                    if can_reuse_confirmed_rect(
-                        current_rect,
-                        size_changed,
-                        dirty_layout_change,
-                    ) =>
-                {
-                    self.cache_crop(
-                        frame,
-                        current_rect.expect("checked above"),
-                        now,
-                        None,
-                        observed_sequence,
-                    )
-                    .with_context(|| {
-                        format!("UIA再検出後に確認済み範囲を再利用できませんでした: {error}")
-                    })
-                }
-                Err(error) => Err(error),
-            }
-        } else if let Some(rect) = current_rect {
-            self.cache_crop(frame, rect, now, None, observed_sequence)
-        } else {
-            Err(anyhow!("共有コンテンツ領域がまだ特定されていません"))
-        };
+        // Every CPU crop requires current authoritative UIA evidence. Absence
+        // of dirty-region hints cannot prove that a side panel did not open.
+        self.last_detection = Some(now);
+        let result = self.detect_and_cache(frame, now, observed_sequence);
 
         match result {
             Ok(()) => {
@@ -536,11 +588,9 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             Err(error) => {
                 let message = error.to_string();
                 if let Ok(mut state) = self.shared.state.lock() {
-                    if needs_detection {
-                        state.latest = None;
-                        state.content_rect = None;
-                        self.shared.has_cached_frame.store(false, Ordering::Release);
-                    }
+                    state.latest = None;
+                    state.content_rect = None;
+                    self.shared.has_cached_frame.store(false, Ordering::Release);
                     state.last_error = Some(message);
                 }
                 self.shared.ready.notify_all();
@@ -601,8 +651,9 @@ impl FrameHandler {
                 frame,
                 PixelRect::new(0, 0, source_size.0, source_size.1),
                 captured_at,
-                Some(target.screen_rect),
+                target.screen_rect,
                 observed_sequence,
+                None,
             )
         })();
 
@@ -637,23 +688,18 @@ impl FrameHandler {
             .source
             .remote_target_id()
             .ok_or_else(|| anyhow!("Teams会議ウィンドウの対象がありません"))?;
-        let target = find_target_window(target_id)?;
-        let geometry =
-            WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
-        let content_rect = detect_content_rect(target_id, geometry)?.ok_or_else(|| {
-            anyhow!(
-                "Teamsの確定UIA共有要素を取得できませんでした。精度優先のため画像推定は自動採用しません。メニューから会議・共有を再検出してください"
-            )
-        })?;
-        let fallback_screen_rect = geometry
-            .map_pixel_rect_to_screen(content_rect)
+        let layout = detect_remote_layout(target_id, source_width, source_height)?;
+        let screen_rect = layout
+            .geometry
+            .map_pixel_rect_to_screen(layout.content_rect)
             .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
         self.cache_crop(
             frame,
-            content_rect,
+            layout.content_rect,
             captured_at,
-            Some(fallback_screen_rect),
+            screen_rect,
             observed_sequence,
+            Some(layout),
         )
     }
 
@@ -662,32 +708,21 @@ impl FrameHandler {
         frame: &mut Frame,
         content_rect: PixelRect,
         captured_at: Instant,
-        known_screen_rect: Option<ScreenRect>,
+        fallback_screen_rect: ScreenRect,
         sequence: u64,
+        remote_layout: Option<RemoteLayout>,
     ) -> Result<()> {
         let source_width = frame.width();
         let source_height = frame.height();
+        let rendered_at_100ns = frame
+            .timestamp()
+            .context("フレームの描画時刻を取得できませんでした")?
+            .Duration;
         if content_rect.x.saturating_add(content_rect.width) > source_width
             || content_rect.y.saturating_add(content_rect.height) > source_height
         {
             return Err(anyhow!("Teamsのレイアウト変更を検出しました"));
         }
-
-        let fallback_screen_rect = known_screen_rect
-            .or_else(|| {
-                self.shared.source.remote_target_id().and_then(|target_id| {
-                    current_screen_rect(target_id, content_rect, source_width, source_height)
-                })
-            })
-            .or_else(|| {
-                self.shared.state.lock().ok().and_then(|state| {
-                    state
-                        .latest
-                        .as_ref()
-                        .map(|frame| frame.fallback_screen_rect)
-                })
-            })
-            .ok_or_else(|| anyhow!("共有コンテンツの画面座標を計算できませんでした"))?;
 
         let mut buffer = frame
             .buffer_crop(
@@ -743,6 +778,8 @@ impl FrameHandler {
             source_width,
             source_height,
             sequence,
+            remote_layout,
+            rendered_at_100ns,
         });
         state.content_rect = Some(content_rect);
         state.last_error = None;
@@ -760,20 +797,59 @@ impl FrameHandler {
     }
 }
 
-fn can_reuse_confirmed_rect(
-    current_rect: Option<PixelRect>,
-    size_changed: bool,
-    dirty_layout_change: bool,
-) -> bool {
-    current_rect.is_some() && !size_changed && !dirty_layout_change
+// WGC SystemRelativeTime is QPC time expressed in 100 ns units. Comparing
+// compositor timestamps also rejects old frames delivered after the request.
+fn performance_time_100ns() -> Result<i64> {
+    let mut counter = 0;
+    let mut frequency = 0;
+    unsafe {
+        QueryPerformanceCounter(&mut counter)?;
+        QueryPerformanceFrequency(&mut frequency)?;
+    }
+    if counter < 0 || frequency <= 0 {
+        return Err(anyhow!("キャプチャの時刻を確認できませんでした"));
+    }
+    i64::try_from(i128::from(counter) * 10_000_000 / i128::from(frequency))
+        .context("キャプチャの時刻を変換できませんでした")
 }
 
-fn remote_cache_is_usable(
-    baseline_sequence: u64,
-    observed_sequence: u64,
-    cached_sequence: u64,
-) -> bool {
-    cached_sequence > baseline_sequence || cached_sequence == observed_sequence
+fn require_frame_after_request(rendered_at_100ns: i64, requested_at_100ns: i64) -> Result<()> {
+    if rendered_at_100ns <= requested_at_100ns {
+        return Err(anyhow::Error::new(FrameUnavailable(
+            "UIA確認後に描画されたフレームが必要です",
+        )));
+    }
+    Ok(())
+}
+
+fn detect_remote_layout(
+    target_id: u32,
+    source_width: u32,
+    source_height: u32,
+) -> Result<RemoteLayout> {
+    let target = find_target_window(target_id)?;
+    let geometry = WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
+    let content_rect = detect_content_rect(target_id, geometry)?.ok_or_else(|| anyhow!(
+        "Teamsの確定UIA共有要素を取得できませんでした。メニューから会議・共有を再検出してください"
+    ))?;
+    let current_geometry =
+        WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
+    if current_geometry != geometry {
+        return Err(anyhow!("UIA確認中にTeamsの位置またはサイズが変わりました"));
+    }
+    Ok(RemoteLayout {
+        geometry,
+        content_rect,
+    })
+}
+
+fn require_matching_layout(cached: Option<RemoteLayout>, current: RemoteLayout) -> Result<()> {
+    if cached != Some(current) {
+        return Err(anyhow!(
+            "Teamsの共有範囲または配置が変わったため、もう一度撮影してください"
+        ));
+    }
+    Ok(())
 }
 
 fn find_target_window(target_id: u32) -> Result<Window> {
@@ -782,87 +858,6 @@ fn find_target_window(target_id: u32) -> Result<Window> {
         .into_iter()
         .find(|window| window.id().ok() == Some(target_id))
         .ok_or_else(|| anyhow!("選択中のTeamsウィンドウが見つかりません"))
-}
-
-fn dirty_regions_suggest_layout_change(frame: &Frame, content_rect: PixelRect) -> bool {
-    let Ok(regions) = frame.dirty_regions() else {
-        return false;
-    };
-    let frame_width = frame.width();
-    let frame_height = frame.height();
-    let frame_area = u64::from(frame_width) * u64::from(frame_height);
-    if frame_area == 0 {
-        return false;
-    }
-
-    regions.iter().any(|region| {
-        let Some(region_rect) = dirty_region_to_rect(region, frame_width, frame_height) else {
-            return false;
-        };
-        let region_area = u64::from(region_rect.width) * u64::from(region_rect.height);
-        let area_ratio = region_area as f64 / frame_area as f64;
-        if !(0.01..=0.45).contains(&area_ratio) {
-            return false;
-        }
-        if overlap_ratio(region_rect, content_rect) >= 0.35 {
-            return false;
-        }
-
-        let region_right = region_rect.x.saturating_add(region_rect.width);
-        let region_bottom = region_rect.y.saturating_add(region_rect.height);
-        let content_right = content_rect.x.saturating_add(content_rect.width);
-        let content_bottom = content_rect.y.saturating_add(content_rect.height);
-        let boundary_tolerance = 32;
-        let near_vertical_boundary = region_rect.x.abs_diff(content_right) <= boundary_tolerance
-            || region_right.abs_diff(content_rect.x) <= boundary_tolerance;
-        let near_horizontal_boundary = region_rect.y.abs_diff(content_bottom) <= boundary_tolerance
-            || region_bottom.abs_diff(content_rect.y) <= boundary_tolerance;
-        let tall_band = region_rect.height.saturating_mul(100) >= frame_height.saturating_mul(55);
-        let wide_band = region_rect.width.saturating_mul(100) >= frame_width.saturating_mul(55);
-
-        (near_vertical_boundary && tall_band) || (near_horizontal_boundary && wide_band)
-    })
-}
-
-fn dirty_region_to_rect(
-    region: &DirtyRegion,
-    frame_width: u32,
-    frame_height: u32,
-) -> Option<PixelRect> {
-    if region.width <= 0 || region.height <= 0 {
-        return None;
-    }
-    let x = region.x.max(0) as u32;
-    let y = region.y.max(0) as u32;
-    let right =
-        (i64::from(region.x) + i64::from(region.width)).clamp(0, i64::from(frame_width)) as u32;
-    let bottom =
-        (i64::from(region.y) + i64::from(region.height)).clamp(0, i64::from(frame_height)) as u32;
-    (right > x && bottom > y).then_some(PixelRect::new(x, y, right - x, bottom - y))
-}
-
-fn overlap_ratio(left: PixelRect, right: PixelRect) -> f64 {
-    let intersection_left = left.x.max(right.x);
-    let intersection_top = left.y.max(right.y);
-    let intersection_right = left
-        .x
-        .saturating_add(left.width)
-        .min(right.x.saturating_add(right.width));
-    let intersection_bottom = left
-        .y
-        .saturating_add(left.height)
-        .min(right.y.saturating_add(right.height));
-    if intersection_right <= intersection_left || intersection_bottom <= intersection_top {
-        return 0.0;
-    }
-    let intersection_area = u64::from(intersection_right - intersection_left)
-        * u64::from(intersection_bottom - intersection_top);
-    let left_area = u64::from(left.width) * u64::from(left.height);
-    if left_area == 0 {
-        0.0
-    } else {
-        intersection_area as f64 / left_area as f64
-    }
 }
 
 #[cfg(test)]
@@ -875,6 +870,31 @@ mod tests {
         },
         core::w,
     };
+
+    impl CaptureEngine {
+        fn copy_latest_with(
+            &self,
+            copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+        ) -> Result<CaptureReceipt> {
+            self.copy_latest_since_checked(copy, None, |_| Ok(()))
+        }
+
+        fn copy_latest_since(
+            &self,
+            copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+            baseline: Option<u64>,
+        ) -> Result<CaptureReceipt> {
+            self.copy_latest_since_checked(copy, baseline, |_| Ok(()))
+        }
+
+        fn copy_with_recovery(
+            &self,
+            copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+            restart: impl FnOnce(CaptureSource) -> Result<CaptureEngine>,
+        ) -> CaptureOutcome {
+            self.copy_with_recovery_checked(copy, restart, |_| Ok(()))
+        }
+    }
 
     struct TestWindow(HWND);
 
@@ -943,6 +963,8 @@ mod tests {
                             source_width: 1,
                             source_height: 1,
                             sequence: 1,
+                            remote_layout: None,
+                            rendered_at_100ns: 0,
                         }),
                         content_rect: Some(rect),
                         last_error: None,
@@ -999,6 +1021,11 @@ mod tests {
         let window = TestWindow::new(false);
         assert!(!unsafe { IsIconic(window.0).as_bool() });
         let engine = cached_remote_engine(window.target_id());
+        engine
+            .inner
+            .shared
+            .observed_sequence
+            .store(0, Ordering::Release);
         let mut clipboard = vec![99];
         engine
             .copy_latest_with(|width, height, bytes| {
@@ -1020,32 +1047,162 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_rect_is_reused_only_for_transient_periodic_failures() {
-        let rect = Some(PixelRect::new(12, 143, 2231, 1254));
-
-        assert!(can_reuse_confirmed_rect(rect, false, false));
-        assert!(!can_reuse_confirmed_rect(rect, true, false));
-        assert!(!can_reuse_confirmed_rect(rect, false, true));
-        assert!(!can_reuse_confirmed_rect(None, false, false));
+    fn shrinking_share_at_unchanged_frame_size_preserves_clipboard() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let geometry = WindowGeometry::from_screen_rect(
+            ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1600,
+                height: 900,
+            },
+            1600,
+            900,
+        );
+        let previous = RemoteLayout {
+            geometry,
+            content_rect: PixelRect::new(100, 100, 1400, 750),
+        };
+        let current = RemoteLayout {
+            geometry,
+            content_rect: PixelRect::new(100, 100, 1100, 750),
+        };
+        engine
+            .inner
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .latest
+            .as_mut()
+            .unwrap()
+            .remote_layout = Some(previous);
+        let mut clipboard = vec![99];
+        let result = engine.copy_latest_since_checked(
+            |_, _, bytes| {
+                clipboard = bytes.to_vec();
+                Ok(())
+            },
+            Some(0),
+            |cached| require_matching_layout(cached.remote_layout, current),
+        );
+        assert!(result.unwrap_err().to_string().contains("共有範囲"));
+        assert_eq!(clipboard, [99]);
     }
 
     #[test]
-    fn remote_stale_cache_is_allowed_when_no_frame_was_observed() {
-        assert!(remote_cache_is_usable(10, 10, 10));
-        assert!(!remote_cache_is_usable(10, 10, 7));
+    fn unavailable_uia_never_falls_back_to_a_confirmed_crop() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        engine
+            .inner
+            .shared
+            .observed_sequence
+            .store(0, Ordering::Release);
+        let outcome = engine.copy_with_recovery_checked(
+            |_, _, _| panic!("unconfirmed layout must not reach output"),
+            |_| panic!("UIA failure must not restart and reuse the crop"),
+            |_| Err(anyhow!("UIA unavailable")),
+        );
+        assert_eq!(outcome.result.unwrap_err().to_string(), "UIA unavailable");
+        assert!(outcome.replacement.is_none());
     }
 
     #[test]
-    fn remote_cache_must_match_the_latest_observed_frame() {
-        assert!(remote_cache_is_usable(10, 12, 12));
-        assert!(!remote_cache_is_usable(10, 12, 10));
-        assert!(!remote_cache_is_usable(10, 12, 0));
+    fn same_crop_with_changed_window_geometry_is_rejected() {
+        let rect = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+        };
+        let previous = RemoteLayout {
+            geometry: WindowGeometry::from_screen_rect(rect, 1600, 900),
+            content_rect: PixelRect::new(100, 100, 1400, 750),
+        };
+        for rect in [
+            ScreenRect { x: 20, ..rect },
+            ScreenRect {
+                width: 1800,
+                ..rect
+            },
+        ] {
+            let current = RemoteLayout {
+                geometry: WindowGeometry::from_screen_rect(rect, 1600, 900),
+                ..previous
+            };
+            assert!(require_matching_layout(Some(previous), current).is_err());
+        }
+        assert!(require_matching_layout(Some(previous), previous).is_ok());
+        assert!(require_matching_layout(None, previous).is_err());
     }
 
     #[test]
-    fn remote_cache_accepts_a_new_cache_even_if_a_later_frame_was_not_cached() {
-        assert!(!remote_cache_is_usable(10, 10, 1));
-        assert!(remote_cache_is_usable(10, 12, 11));
+    fn share_ending_while_waiting_for_a_frame_prevents_output() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let authorization = CaptureAuthorization::default();
+        let worker_auth = authorization.clone();
+        let shared = Arc::clone(&engine.inner.shared);
+        let producer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !shared.capture_requested.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            // Simulate the UI receiving sharing-end while this worker retains
+            // the old engine, then an already queued WGC frame arriving.
+            worker_auth.invalidate();
+            let mut state = shared.state.lock().unwrap();
+            state.latest.as_mut().unwrap().sequence = 2;
+            shared.observed_sequence.store(2, Ordering::Release);
+            drop(state);
+            shared.ready.notify_all();
+        });
+        let mut output_calls = 0;
+        let result = engine.copy_latest_since_checked(
+            |_, _, _| {
+                authorization.with_current(|| {
+                    output_calls += 1;
+                    Ok(())
+                })
+            },
+            None,
+            |_| Ok(()),
+        );
+        producer.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(output_calls, 0);
+    }
+
+    #[test]
+    fn late_delivery_of_preflight_pixels_never_reaches_output() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let result = engine.copy_latest_since_checked(
+            |_, _, _| panic!("a later sequence does not prove when the pixels were drawn"),
+            Some(0),
+            |cached| require_frame_after_request(cached.rendered_at_100ns, 10),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<FrameUnavailable>()
+                .is_some()
+        );
+        assert!(require_frame_after_request(10, 10).is_err());
+        assert!(require_frame_after_request(11, 10).is_ok());
+    }
+
+    #[test]
+    fn remote_static_cache_requires_a_frame_after_the_request() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let error = engine
+            .copy_latest_with(|_, _, _| panic!("pre-request pixels must not be copied"))
+            .unwrap_err();
+        assert!(error.downcast_ref::<FrameUnavailable>().is_some());
     }
 
     #[test]
@@ -1169,6 +1326,11 @@ mod tests {
     fn clipboard_error_does_not_restart_capture() {
         let window = TestWindow::new(false);
         let engine = cached_remote_engine(window.target_id());
+        engine
+            .inner
+            .shared
+            .observed_sequence
+            .store(0, Ordering::Release);
         let mut restarts = 0;
         let outcome = engine.copy_with_recovery(
             |_, _, _| Err(anyhow!("clipboard failed")),

@@ -23,11 +23,11 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
                 DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-                HWND_MESSAGE, IMAGE_ICON, LR_SHARED, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
-                PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SM_CYSMICON,
+                IMAGE_ICON, LR_SHARED, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+                PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
                 SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-                TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-                WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
+                TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
+                WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -45,6 +45,7 @@ const CAPTURE_HOTKEY_ID: i32 = 1;
 const APP_ICON_RESOURCE_ID: u16 = 101;
 
 static RESIDENT_FLAGS: OnceLock<Weak<ResidentFlags>> = OnceLock::new();
+static TASKBAR_CREATED_MESSAGE: OnceLock<u32> = OnceLock::new();
 
 pub struct ResidentController {
     flags: Arc<ResidentFlags>,
@@ -182,6 +183,11 @@ unsafe fn create_and_run_tray(
     if unsafe { RegisterClassW(&class) } == 0 {
         return Err("通知領域ウィンドウを登録できませんでした".to_string());
     }
+    let taskbar_created_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if taskbar_created_message == 0 {
+        return Err("タスクバー再作成通知を登録できませんでした".to_string());
+    }
+    let _ = TASKBAR_CREATED_MESSAGE.set(taskbar_created_message);
 
     let icon = unsafe {
         LoadImageW(
@@ -198,15 +204,15 @@ unsafe fn create_and_run_tray(
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW,
             w!("SnapbarResidentWindow"),
             w!("Snapbar"),
-            WINDOW_STYLE(0),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(instance),
             None,
@@ -261,6 +267,14 @@ unsafe extern "system" fn tray_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        message if TASKBAR_CREATED_MESSAGE.get().copied() == Some(message) => {
+            with_flags(|flags| unsafe {
+                if !restore_tray_icon(hwnd, flags) {
+                    flags.record_error("通知領域アイコンを復元できませんでした".to_string());
+                }
+            });
+            LRESULT(0)
+        }
         WM_HOTKEY if wparam.0 == CAPTURE_HOTKEY_ID as usize => {
             with_flags(ResidentFlags::request_capture);
             LRESULT(0)
@@ -289,6 +303,41 @@ unsafe extern "system" fn tray_window_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
+}
+
+unsafe fn restore_tray_icon(hwnd: HWND, flags: &ResidentFlags) -> bool {
+    let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
+        return false;
+    };
+    let instance = HINSTANCE(module.0);
+    let Ok(icon) = (unsafe {
+        LoadImageW(
+            Some(instance),
+            PCWSTR(APP_ICON_RESOURCE_ID as usize as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        )
+    }) else {
+        return false;
+    };
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        uCallbackMessage: TRAY_CALLBACK_MESSAGE,
+        hIcon: windows::Win32::UI::WindowsAndMessaging::HICON(icon.0),
+        ..Default::default()
+    };
+    let tooltip = if flags.hotkey_enabled.load(Ordering::Acquire) {
+        "Snapbar – Ctrl + Alt + S で撮影"
+    } else {
+        "Snapbar – Teams会議を監視中"
+    };
+    copy_utf16(tooltip, &mut data.szTip);
+    unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool()
 }
 
 unsafe fn sync_capture_hotkey(hwnd: HWND, flags: &ResidentFlags) {

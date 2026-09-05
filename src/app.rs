@@ -6,8 +6,8 @@ use std::{
 use crate::{
     assets::Assets,
     capture::{
-        CaptureEngine, CaptureSource, CaptureTarget, LocalMonitorCaptureTarget,
-        save_clipboard_image_to_screenshots, show_capture_flash, suspend_capture_flash,
+        CaptureAuthorization, CaptureEngine, CaptureSource, CaptureTarget,
+        LocalMonitorCaptureTarget, show_capture_flash, suspend_capture_flash,
         windows_screenshots_folder,
     },
     meeting::{MeetingMonitor, MeetingSnapshot},
@@ -533,6 +533,7 @@ struct Snapbar {
     targets: Vec<CaptureTarget>,
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
+    capture_authorization: CaptureAuthorization,
     follower: Option<TeamsWindowFollower>,
     meeting_monitor: MeetingMonitor,
     resident: ResidentController,
@@ -591,6 +592,7 @@ impl Snapbar {
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
+            capture_authorization: CaptureAuthorization::default(),
             follower,
             meeting_monitor,
             resident: ResidentController::start(),
@@ -948,7 +950,7 @@ impl Snapbar {
         } else if next_source.is_none() {
             self.capture_generation = self.capture_generation.wrapping_add(1);
             self.capture_requests.clear_pending();
-            self.capture_engine = None;
+            self.invalidate_capture();
             self.capture_state = if self.has_capture_context() {
                 CaptureState::WaitingForShare
             } else {
@@ -964,10 +966,20 @@ impl Snapbar {
         }
     }
 
+    fn invalidate_capture(&mut self) {
+        // Serialize revocation with the actual clipboard/file write boundary.
+        // A worker retaining an Arc must neither publish nor keep WGC alive.
+        self.capture_authorization.invalidate();
+        if let Some(engine) = self.capture_engine.take() {
+            engine.stop();
+        }
+        self.capture_authorization = CaptureAuthorization::default();
+    }
+
     fn restart_capture_engine(&mut self) {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.capture_requests.clear_pending();
-        self.capture_engine = None;
+        self.invalidate_capture();
         self.sync_follower();
         let Some(source) = self.current_capture_source() else {
             self.capture_state = if self.has_capture_context() {
@@ -1063,7 +1075,7 @@ impl Snapbar {
             drop(follower);
         }
         self.resident.set_capture_hotkey_enabled(false);
-        self.capture_engine = None;
+        self.invalidate_capture();
         cx.quit();
     }
 
@@ -1142,6 +1154,7 @@ impl Snapbar {
         let generation = self.capture_generation;
         self.capture_requests.start(generation);
         let save_to_screenshots = self.settings.save_to_screenshots;
+        let authorization = self.capture_authorization.clone();
         self.capture_state = CaptureState::Capturing;
         self.last_error = None;
         cx.notify();
@@ -1157,12 +1170,12 @@ impl Snapbar {
                 if wait_for_composition {
                     thread::sleep(RECORDABLE_OVERLAY_EXCLUSION_SETTLE);
                 }
-                let outcome = engine.copy_latest_to_clipboard();
+                let outcome = engine.copy_latest_to_clipboard(&authorization, save_to_screenshots);
                 replacement = outcome.replacement;
                 let receipt = outcome.result?;
                 drop(overlay_exclusion);
                 drop(flash_suspension);
-                let save_result = save_to_screenshots.then(save_clipboard_image_to_screenshots);
+                let save_result = outcome.save_result;
                 Ok::<_, anyhow::Error>((receipt, save_result))
             })();
             (replacement, result)

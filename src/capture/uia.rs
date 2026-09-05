@@ -11,7 +11,7 @@ const PROVIDER_WARMUP_DELAY: Duration = Duration::from_millis(50);
 const STABILITY_DELAY: Duration = Duration::from_millis(35);
 const RECT_STABILITY_TOLERANCE: u32 = 3;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WindowGeometry {
     screen_left: i32,
     screen_top: i32,
@@ -37,18 +37,31 @@ impl WindowGeometry {
             return Err(anyhow!("Teamsウィンドウのサイズが不正です"));
         }
 
-        Ok(Self {
-            screen_left: window
-                .x()
-                .context("TeamsウィンドウのX座標を取得できませんでした")?,
-            screen_top: window
-                .y()
-                .context("TeamsウィンドウのY座標を取得できませんでした")?,
-            screen_width,
-            screen_height,
+        Ok(Self::from_screen_rect(
+            ScreenRect {
+                x: window
+                    .x()
+                    .context("TeamsウィンドウのX座標を取得できませんでした")?,
+                y: window
+                    .y()
+                    .context("TeamsウィンドウのY座標を取得できませんでした")?,
+                width: screen_width,
+                height: screen_height,
+            },
             image_width,
             image_height,
-        })
+        ))
+    }
+
+    pub(super) fn from_screen_rect(rect: ScreenRect, image_width: u32, image_height: u32) -> Self {
+        Self {
+            screen_left: rect.x,
+            screen_top: rect.y,
+            screen_width: rect.width,
+            screen_height: rect.height,
+            image_width,
+            image_height,
+        }
     }
 
     pub(super) fn map_pixel_rect_to_screen(self, rect: PixelRect) -> Option<ScreenRect> {
