@@ -4,6 +4,8 @@
 
 Microsoft Teamsで他の参加者が共有している**共有コンテンツ部分だけ**、または自分が共有中の**確定済みモニターだけ**を、1クリックまたは会議中の`Ctrl + Alt + S`でWindowsクリップボードへコピーする軽量Windowsアプリです。
 
+![Snapbarの操作デモ](assets/demo/snapbar-demo.gif)
+
 ## ダウンロード
 
 Windows向けのインストーラーとポータブル版は、[GitHub Releases](https://github.com/Ray-d3v/Snapbar/releases)で配布します。
