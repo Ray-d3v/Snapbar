@@ -464,7 +464,10 @@ impl CaptureEngine {
                 .latest
                 .as_ref()
                 .is_some_and(|frame| frame.sequence > baseline_sequence);
-            if state.latest.is_some() && (has_fresh_frame || !had_frame) {
+            // An empty cache can receive an older crop that was already in
+            // flight at request time. Keep waiting, rather than prematurely
+            // entering recovery when that pre-request crop completes.
+            if has_fresh_frame {
                 break;
             }
 
@@ -614,7 +617,6 @@ impl GraphicsCaptureApiHandler for FrameHandler {
 
         // Every CPU crop requires current authoritative UIA evidence. Absence
         // of dirty-region hints cannot prove that a side panel did not open.
-        self.last_detection = Some(now);
         let result = self.detect_and_cache(frame, now, observed_sequence);
         // Measure the watchdog interval from completion, not from the beginning
         // of a potentially slow provider call; otherwise it can run continuously.
@@ -1634,6 +1636,57 @@ mod tests {
                     .capture_requested
                     .load(Ordering::Acquire)
             );
+        });
+    }
+
+    #[test]
+    fn empty_cache_waits_past_an_old_in_flight_crop_for_the_requested_frame() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let old = engine
+            .inner
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .latest
+            .take()
+            .unwrap();
+        engine
+            .inner
+            .shared
+            .has_cached_frame
+            .store(false, Ordering::Release);
+        let shared = Arc::clone(&engine.inner.shared);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !shared.capture_requested.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "request never arrived");
+                    std::thread::yield_now();
+                }
+                shared.state.lock().unwrap().latest = Some(old);
+                shared.ready.notify_all();
+                std::thread::sleep(Duration::from_millis(80));
+                shared.observed_sequence.store(2, Ordering::Release);
+                let mut state = shared.state.lock().unwrap();
+                let frame = state.latest.as_mut().unwrap();
+                frame.sequence = 2;
+                frame.bytes[0] = 88;
+                drop(state);
+                shared.ready.notify_all();
+            });
+            let mut copied = 0;
+            let outcome = engine.copy_with_recovery(
+                |_, _, bytes| {
+                    copied = bytes[0];
+                    Ok(())
+                },
+                |_| panic!("a pre-request crop must not end a fresh-frame wait"),
+            );
+            outcome.result.unwrap();
+            assert!(outcome.replacement.is_none());
+            assert_eq!(copied, 88);
         });
     }
 }
