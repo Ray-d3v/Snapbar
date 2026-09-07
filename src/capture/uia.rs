@@ -1,7 +1,9 @@
 use std::{thread, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
-use uiautomation::types::{ControlType, Handle, Point, Rect as UiRect, TreeScope};
+use uiautomation::types::{
+    ControlType, ElementMode, Handle, Point, Rect as UiRect, TreeScope, UIProperty,
+};
 use uiautomation::{UIAutomation, UIElement};
 use xcap::Window;
 
@@ -225,8 +227,34 @@ fn scan_authoritative_rect(
     let condition = automation
         .create_true_condition()
         .context("UI Automationの検索条件を作成できませんでした")?;
-    let elements = root
-        .find_all(TreeScope::Subtree, &condition)
+    let snapshot = || -> uiautomation::Result<Vec<UIElement>> {
+        // Match the existing exclusions before marshaling result objects. Each
+        // scan gets new values; no rectangle or element survives this scan.
+        let visible =
+            automation.create_property_condition(UIProperty::IsOffscreen, false.into(), None)?;
+        let named = automation.create_not_condition(automation.create_property_condition(
+            UIProperty::Name,
+            "".into(),
+            None,
+        )?)?;
+        let relevant = automation.create_and_condition(visible, named)?;
+        let request = automation.create_cache_request()?;
+        request.set_tree_scope(TreeScope::Element)?;
+        request.set_tree_filter(automation.create_true_condition()?)?;
+        request.set_element_mode(ElementMode::Full)?;
+        for property in [
+            UIProperty::Name,
+            UIProperty::ControlType,
+            UIProperty::IsOffscreen,
+            UIProperty::BoundingRectangle,
+        ] {
+            request.add_property(property)?;
+        }
+        root.find_all_build_cache(TreeScope::Subtree, &relevant, &request)
+    };
+    // Retain compatibility with providers that cannot perform a bulk request.
+    let elements = snapshot()
+        .or_else(|_| root.find_all(TreeScope::Subtree, &condition))
         .context("TeamsのUI Automationツリーを走査できませんでした")?;
 
     let mut candidates = Vec::new();
@@ -244,13 +272,32 @@ fn authoritative_candidate_from_element(
     element: &UIElement,
     geometry: WindowGeometry,
 ) -> Option<AuthoritativeCandidate> {
-    if element.is_offscreen().unwrap_or(true) {
+    if element
+        .is_cached_offscreen()
+        .or_else(|_| element.is_offscreen())
+        .unwrap_or(true)
+    {
         return None;
     }
 
-    let name_rank = authoritative_name_rank(&element.get_name().ok()?)?;
-    let control_rank = authoritative_control_rank(element.get_control_type().ok()?)?;
-    let rect = geometry.map_ui_rect_strict(element.get_bounding_rectangle().ok()?)?;
+    let name_rank = authoritative_name_rank(
+        &element
+            .get_cached_name()
+            .or_else(|_| element.get_name())
+            .ok()?,
+    )?;
+    let control_rank = authoritative_control_rank(
+        element
+            .get_cached_control_type()
+            .or_else(|_| element.get_control_type())
+            .ok()?,
+    )?;
+    let rect = geometry.map_ui_rect_strict(
+        element
+            .get_cached_bounding_rectangle()
+            .or_else(|_| element.get_bounding_rectangle())
+            .ok()?,
+    )?;
     if !is_authoritative_content_rect(rect, geometry) {
         return None;
     }
