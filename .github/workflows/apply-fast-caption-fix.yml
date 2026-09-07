@@ -20,7 +20,7 @@ jobs:
       - name: Decode and apply prepared patch
         shell: pwsh
         run: |
-          python -c "import base64,gzip,pathlib; p=pathlib.Path('.github/snapbar-fast-caption.patch.gz.b64').read_text().strip(); pathlib.Path('snapbar-fast-caption.patch').write_bytes(gzip.decompress(base64.b64decode(p)))"
+          python -c "import base64,gzip,pathlib; p=''.join(pathlib.Path(f'.github/patch-chunk-{i}.txt').read_text().strip() for i in range(1,5)); pathlib.Path('snapbar-fast-caption.patch').write_bytes(gzip.decompress(base64.b64decode(p)))"
           git apply --index snapbar-fast-caption.patch
           Remove-Item snapbar-fast-caption.patch
 
@@ -44,7 +44,8 @@ jobs:
       - name: Commit validated changes
         shell: pwsh
         run: |
-          Remove-Item .github/snapbar-fast-caption.patch.gz.b64
+          Remove-Item .github/snapbar-fast-caption.patch.gz.b64 -ErrorAction SilentlyContinue
+          Remove-Item .github/patch-chunk-*.txt
           Remove-Item .github/workflows/apply-fast-caption-fix.yml
           git add -A
           git config user.name "github-actions[bot]"
