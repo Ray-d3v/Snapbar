@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   apply-and-validate:
-    if: ${{ github.actor != 'github-actions[bot]' }}
+    if: ${{ github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, '[apply-fast-caption]') }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -28,14 +28,18 @@ jobs:
         run: |
           @'
           import base64, gzip, pathlib
-          src = pathlib.Path('.github/tmp/fast-caption.patch.gz.b64')
-          data = gzip.decompress(base64.b64decode(src.read_text(encoding='utf-8').strip()))
+          parts = sorted(pathlib.Path('.github/tmp').glob('fast-caption.patch.part*'))
+          if not parts:
+              raise SystemExit('staged patch parts are missing')
+          encoded = ''.join(p.read_text(encoding='utf-8') for p in parts)
+          data = gzip.decompress(base64.b64decode(encoded))
           pathlib.Path('fast-caption.patch').write_bytes(data)
           '@ | python -
           git apply --check fast-caption.patch
           git apply fast-caption.patch
           Remove-Item fast-caption.patch -Force
-          Remove-Item .github/tmp/fast-caption.patch.gz.b64 -Force
+          Remove-Item .github/tmp/fast-caption.patch.part* -Force
+          if (Test-Path .github/tmp/fast-caption.patch.gz.b64) { Remove-Item .github/tmp/fast-caption.patch.gz.b64 -Force }
           Remove-Item .github/workflows/apply-fast-caption-fix.yml -Force
 
       - name: Format
