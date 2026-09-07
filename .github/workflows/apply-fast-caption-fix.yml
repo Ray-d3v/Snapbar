@@ -37,6 +37,9 @@ jobs:
           '@ | python -
           git apply --check fast-caption.patch
           git apply fast-caption.patch
+          $uia = Get-Content src/capture/uia.rs -Raw
+          $uia = $uia.Replace('use uiautomation::{UICacheRequest,', 'use uiautomation::{core::UICacheRequest,')
+          Set-Content src/capture/uia.rs -Value $uia -Encoding utf8 -NoNewline
           Remove-Item fast-caption.patch -Force
           Remove-Item .github/tmp/fast-caption.patch.part* -Force
           if (Test-Path .github/tmp/fast-caption.patch.gz.b64) { Remove-Item .github/tmp/fast-caption.patch.gz.b64 -Force }
