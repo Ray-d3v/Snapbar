@@ -18,6 +18,7 @@ pub(super) struct ColorRequest {
 pub(super) struct ColorSample {
     pub(super) request: ColorRequest,
     pub(super) material: Option<super::TitlebarMaterial>,
+    pub(super) caption: Option<super::caption_anchor::CaptionObservation>,
 }
 
 pub(super) struct ColorSampler {
@@ -31,12 +32,17 @@ impl ColorSampler {
     pub(super) fn start(wake_tx: SyncSender<()>) -> Option<Self> {
         Self::start_with_factory(wake_tx, || {
             let mut readback = super::caption_readback::CaptionReadback::default();
+            let mut probe = super::caption_anchor::CaptionProbe::new();
             move |request: ColorRequest| {
-                super::sample_titlebar_color(
-                    HWND(request.target_id as usize as *mut c_void),
+                let hwnd = HWND(request.target_id as usize as *mut c_void);
+                let caption = probe.measure(hwnd);
+                let material = super::sample_titlebar_color(
+                    hwnd,
                     request.caption_height,
                     &mut readback,
-                )
+                    caption,
+                );
+                (material, caption)
             }
         })
     }
@@ -44,26 +50,36 @@ impl ColorSampler {
     #[cfg(test)]
     fn start_with_sample(
         wake_tx: SyncSender<()>,
-        sample: impl FnMut(ColorRequest) -> Option<super::TitlebarMaterial> + Send + 'static,
+        mut sample: impl FnMut(ColorRequest) -> Option<super::TitlebarMaterial> + Send + 'static,
     ) -> Option<Self> {
-        Self::start_with_factory(wake_tx, move || sample)
+        Self::start_with_factory(wake_tx, move || move |request| (sample(request), None))
     }
 
     fn start_with_factory<F, Factory>(wake_tx: SyncSender<()>, factory: Factory) -> Option<Self>
     where
         Factory: FnOnce() -> F + Send + 'static,
-        F: FnMut(ColorRequest) -> Option<super::TitlebarMaterial> + 'static,
+        F: FnMut(
+                ColorRequest,
+            ) -> (
+                Option<super::TitlebarMaterial>,
+                Option<super::caption_anchor::CaptionObservation>,
+            ) + 'static,
     {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("snapbar-titlebar-color".to_string())
             .spawn(move || {
+                let _physical = crate::dpi::PhysicalPixels::enter();
                 let mut sample = factory();
                 while let Ok(request) = request_rx.recv() {
-                    let material = sample(request);
+                    let (material, caption) = sample(request);
                     if result_tx
-                        .try_send(ColorSample { request, material })
+                        .try_send(ColorSample {
+                            request,
+                            material,
+                            caption,
+                        })
                         .is_ok()
                     {
                         let _ = wake_tx.try_send(());

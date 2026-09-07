@@ -74,6 +74,56 @@ fn for_each_separator_strip(
     }
 }
 
+// Rasterize the opaque material itself, rather than assuming DirectComposition
+// will obey the HWND region on every GPU/Windows configuration. The very same
+// row-inset function defines native hit testing and the separator. Coalesce
+// equal adjacent scanlines without allocating a vector on an animation frame.
+fn for_each_drop_strip(region: WindowRegion, mut paint: impl FnMut(RectI)) {
+    let WindowRegionShape::Island {
+        shoulder_start,
+        shoulder_depth,
+        shoulder_inset,
+        bottom_radius,
+    } = region.shape
+    else {
+        return;
+    };
+    let width = region.right - region.left;
+    let height = region.bottom - region.top;
+    let mut run: Option<RectI> = None;
+    for row in shoulder_start..height {
+        let inset = island_row_inset(
+            row,
+            width,
+            height,
+            shoulder_start,
+            shoulder_depth,
+            shoulder_inset,
+            bottom_radius,
+        );
+        let strip = RectI {
+            left: region.left + inset,
+            top: region.top + row,
+            right: region.right - inset,
+            bottom: region.top + row + 1,
+        };
+        if let Some(previous) = run.as_mut() {
+            if previous.left == strip.left
+                && previous.right == strip.right
+                && previous.bottom == strip.top
+            {
+                previous.bottom = strip.bottom;
+                continue;
+            }
+            paint(*previous);
+        }
+        run = Some(strip);
+    }
+    if let Some(run) = run {
+        paint(run);
+    }
+}
+
 pub(crate) fn paint_island_drop(
     bounds: Bounds<Pixels>,
     progress: f32,
@@ -121,17 +171,9 @@ pub(crate) fn paint_island_drop(
             ),
         )
     };
-    // The native silhouette clips this opaque extension. It also masks the old
-    // straight separator inside the growing island, but leaves the caption clear.
-    window.paint_quad(fill(
-        to_bounds(RectI {
-            left: region.left,
-            top: drop_top,
-            right: region.right,
-            bottom: region.bottom,
-        }),
-        rgb(material.surface),
-    ));
+    for_each_drop_strip(region, |strip| {
+        window.paint_quad(fill(to_bounds(strip), rgb(material.surface)));
+    });
     if material.surface != material.separator {
         let thickness = scale_logical(1.0, height, WINDOW_HEIGHT).max(1);
         for_each_separator_strip(region, thickness, material.separator_offset, |strip| {
@@ -244,5 +286,49 @@ mod tests {
         strips.clear();
         for_each_separator_strip(region, 1, 1, |strip| strips.push(strip));
         assert!(strips.is_empty());
+    }
+    #[test]
+    fn material_matches_the_native_silhouette_without_os_clipping() {
+        for scale in [1.0_f32, 1.15, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let width = (super::super::WINDOW_WIDTH * scale).round() as i32;
+            let height = (WINDOW_HEIGHT * scale).round() as i32;
+            for progress in (0..=DISCLOSURE_PROGRESS_LIMIT).step_by(7) {
+                let region = window_region_for_attachment(
+                    WindowMetrics {
+                        window_rect: RectI {
+                            left: 0,
+                            top: 0,
+                            right: width,
+                            bottom: height,
+                        },
+                        client_screen_left: 0,
+                        client_screen_top: 0,
+                        client_width: width,
+                        client_height: height,
+                    },
+                    OverlayPresentation::HoverIsland,
+                    false,
+                    false,
+                    progress,
+                );
+                let native = super::super::coalesced_region_rectangles(region);
+                let mut material = Vec::new();
+                for_each_drop_strip(region, |strip| material.push(strip));
+                if let WindowRegionShape::Island { shoulder_start, .. } = region.shape {
+                    for y in region.top + shoulder_start..region.bottom {
+                        let at_row = |rectangles: &[RectI]| {
+                            rectangles
+                                .iter()
+                                .filter(|r| y >= r.top && y < r.bottom)
+                                .map(|r| (r.left, r.right))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(at_row(&native), at_row(&material));
+                    }
+                } else {
+                    assert!(material.is_empty());
+                }
+            }
+        }
     }
 }
