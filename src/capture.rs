@@ -11,6 +11,7 @@ use std::{
 mod content_detector;
 mod engine;
 mod flash;
+mod layout;
 mod local_share;
 mod output;
 mod uia;

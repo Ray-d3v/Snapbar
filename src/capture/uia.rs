@@ -1,11 +1,16 @@
 use std::{thread, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
+use std::ffi::c_void;
 use uiautomation::types::{
     ControlType, ElementMode, Handle, Point, Rect as UiRect, TreeScope, UIProperty,
 };
 use uiautomation::{UIAutomation, UIElement};
-use xcap::Window;
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+    UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow},
+};
 
 use super::{ScreenRect, content_detector::PixelRect};
 
@@ -24,31 +29,43 @@ pub(super) struct WindowGeometry {
 }
 
 impl WindowGeometry {
-    pub(super) fn from_window_dimensions(
-        window: &Window,
+    pub(super) fn from_hwnd_dimensions(
+        target_id: u32,
         image_width: u32,
         image_height: u32,
     ) -> Result<Self> {
-        let screen_width = window
-            .width()
-            .context("Teamsウィンドウの幅を取得できませんでした")?;
-        let screen_height = window
-            .height()
-            .context("Teamsウィンドウの高さを取得できませんでした")?;
-        if screen_width == 0 || screen_height == 0 || image_width == 0 || image_height == 0 {
+        let _physical = crate::dpi::PhysicalPixels::enter();
+        let hwnd = HWND(target_id as usize as *mut c_void);
+        let mut rect = RECT::default();
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
+                return Err(anyhow!("撮影対象のTeamsウィンドウを確認できませんでした"));
+            }
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut rect as *mut RECT).cast(),
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_err()
+            {
+                GetWindowRect(hwnd, &mut rect)
+                    .context("Teamsウィンドウの位置を取得できませんでした")?;
+            }
+        }
+        if rect.right <= rect.left
+            || rect.bottom <= rect.top
+            || image_width == 0
+            || image_height == 0
+        {
             return Err(anyhow!("Teamsウィンドウのサイズが不正です"));
         }
-
         Ok(Self::from_screen_rect(
             ScreenRect {
-                x: window
-                    .x()
-                    .context("TeamsウィンドウのX座標を取得できませんでした")?,
-                y: window
-                    .y()
-                    .context("TeamsウィンドウのY座標を取得できませんでした")?,
-                width: screen_width,
-                height: screen_height,
+                x: rect.left,
+                y: rect.top,
+                width: (i64::from(rect.right) - i64::from(rect.left)) as u32,
+                height: (i64::from(rect.bottom) - i64::from(rect.top)) as u32,
             },
             image_width,
             image_height,
@@ -189,38 +206,240 @@ struct AuthoritativeCandidate {
     rank: u8,
 }
 
-pub(super) fn detect_content_rect(
-    target_id: u32,
-    geometry: WindowGeometry,
-) -> Result<Option<PixelRect>> {
-    let automation = UIAutomation::new()
-        .or_else(|_| UIAutomation::new_direct())
-        .context("Windows UI Automationを初期化できませんでした")?;
+// UIA clients and selected identities are kept only on LayoutResolver's MTA.
+// Every fast-path use calls BuildUpdatedCache: cached values are NEVER evidence.
+use super::layout::Request;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+    mpsc::SyncSender,
+};
+use std::time::Instant;
+use uiautomation::{
+    core::UICacheRequest,
+    events::{
+        CustomPropertyChangedEventHandler, CustomStructureChangedEventHandler,
+        UIPropertyChangedEventHandler, UIStructureChangeEventHandler,
+    },
+    types::StructureChangeType,
+    variants::Variant,
+};
 
-    let mut first = scan_authoritative_rect(&automation, target_id, geometry)?;
-    if first.is_none() {
-        let _ = automation.element_from_point(geometry.sample_point(0.50, 0.55));
-        thread::sleep(PROVIDER_WARMUP_DELAY);
-        first = scan_authoritative_rect(&automation, target_id, geometry)?;
+struct Invalidation {
+    revision: Arc<AtomicU64>,
+    wake: SyncSender<Request>,
+}
+impl Invalidation {
+    fn signal(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        let _ = self.wake.try_send(Request::Changed);
     }
-
-    let Some(first) = first else {
-        return Ok(None);
-    };
-
-    thread::sleep(STABILITY_DELAY);
-    let Some(second) = scan_authoritative_rect(&automation, target_id, geometry)? else {
-        return Ok(None);
-    };
-
-    Ok(rects_are_stable(first, second, RECT_STABILITY_TOLERANCE).then_some(second))
+}
+impl CustomStructureChangedEventHandler for Invalidation {
+    fn handle(
+        &self,
+        _: &UIElement,
+        _: StructureChangeType,
+        _: Option<&[i32]>,
+    ) -> uiautomation::Result<()> {
+        self.signal();
+        Ok(())
+    }
+}
+impl CustomPropertyChangedEventHandler for Invalidation {
+    fn handle(&self, _: &UIElement, _: UIProperty, _: Variant) -> uiautomation::Result<()> {
+        self.signal();
+        Ok(())
+    }
 }
 
-fn scan_authoritative_rect(
+struct LocatedContent {
+    element: UIElement,
+    candidate: AuthoritativeCandidate,
+    geometry: WindowGeometry,
+    revision: u64,
+}
+
+pub(super) struct ContentLocator {
+    automation: UIAutomation,
+    target: u32,
+    root: UIElement,
+    request: UICacheRequest,
+    structure: UIStructureChangeEventHandler,
+    properties: UIPropertyChangedEventHandler,
+    subscribed: bool,
+    revision: Arc<AtomicU64>,
+    selected: Option<LocatedContent>,
+    last_discovery: Option<Instant>,
+}
+
+impl ContentLocator {
+    pub(super) fn new(target: u32, wake: SyncSender<Request>) -> Result<Self> {
+        let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+        let root = automation.element_from_handle(Handle::from(target as isize))?;
+        let request = automation.create_cache_request()?;
+        request.set_tree_scope(TreeScope::Element)?;
+        request.set_tree_filter(automation.create_true_condition()?)?;
+        request.set_element_mode(ElementMode::Full)?;
+        for property in [
+            UIProperty::Name,
+            UIProperty::ControlType,
+            UIProperty::IsOffscreen,
+            UIProperty::BoundingRectangle,
+        ] {
+            request.add_property(property)?;
+        }
+        let revision = Arc::new(AtomicU64::new(1));
+        let structure = UIStructureChangeEventHandler::from(Invalidation {
+            revision: revision.clone(),
+            wake: wake.clone(),
+        });
+        let properties = UIPropertyChangedEventHandler::from(Invalidation {
+            revision: revision.clone(),
+            wake,
+        });
+        let structure_ok = automation
+            .add_structure_changed_event_handler(&root, TreeScope::Subtree, None, &structure)
+            .is_ok();
+        let properties_ok = automation
+            .add_property_changed_event_handler(
+                &root,
+                TreeScope::Subtree,
+                None,
+                &properties,
+                &[UIProperty::IsOffscreen],
+            )
+            .is_ok();
+        Ok(Self {
+            automation,
+            target,
+            root,
+            request,
+            structure,
+            properties,
+            subscribed: structure_ok && properties_ok,
+            revision,
+            selected: None,
+            last_discovery: None,
+        })
+    }
+
+    pub(super) fn is_current(&self, revision: u64) -> bool {
+        self.revision.load(Ordering::Acquire) == revision
+    }
+
+    pub(super) fn locate(
+        &mut self,
+        geometry: WindowGeometry,
+        background: bool,
+    ) -> Result<(PixelRect, u64)> {
+        let revision = self.revision.load(Ordering::Acquire);
+        let watchdog_due = background
+            && self
+                .last_discovery
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
+        if !requires_discovery(
+            self.subscribed,
+            self.selected.as_ref().is_some_and(|located| {
+                located.geometry == geometry && located.revision == revision
+            }),
+            watchdog_due,
+        ) && let Some(located) = self.selected.as_ref()
+        {
+            // One cross-process element refresh rather than two complete
+            // subtree enumerations and an unconditional 35ms sleep.
+            let raw: &windows::Win32::UI::Accessibility::IUIAutomationElement =
+                located.element.as_ref();
+            let refreshed =
+                unsafe { raw.BuildUpdatedCache(self.request.as_ref()) }.map(UIElement::from);
+            if let Ok(refreshed) = refreshed
+                && authoritative_candidate_from_element(&refreshed, geometry)
+                    == Some(located.candidate)
+                && self.is_current(revision)
+            {
+                return Ok((located.candidate.rect, revision));
+            }
+            // A live-property mismatch is a change even if a provider
+            // dropped its event. Do not continue using the old crop.
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+        self.discover(geometry)
+    }
+
+    fn discover(&mut self, geometry: WindowGeometry) -> Result<(PixelRect, u64)> {
+        let revision = self.revision.load(Ordering::Acquire);
+        let result = (|| {
+            let mut first = scan_authoritative_element(&self.automation, self.target, geometry)?;
+            if first.is_none() {
+                let _ = self
+                    .automation
+                    .element_from_point(geometry.sample_point(0.50, 0.55));
+                thread::sleep(PROVIDER_WARMUP_DELAY);
+                first = scan_authoritative_element(&self.automation, self.target, geometry)?;
+            }
+            let (first_element, first) =
+                first.ok_or_else(|| anyhow!("Teamsの共有コンテンツ要素を確認できませんでした"))?;
+            thread::sleep(STABILITY_DELAY);
+            let (element, candidate) =
+                scan_authoritative_element(&self.automation, self.target, geometry)?
+                    .ok_or_else(|| anyhow!("Teamsの共有範囲が確定していません"))?;
+            if !rects_are_stable(first.rect, candidate.rect, RECT_STABILITY_TOLERANCE)
+                || !self.automation.compare_elements(&first_element, &element)?
+                || !self.is_current(revision)
+            {
+                return Err(anyhow!("Teamsの共有範囲を更新中です"));
+            }
+            let changed = self.selected.as_ref().is_some_and(|old| {
+                old.geometry != geometry
+                    || old.candidate != candidate
+                    || !self
+                        .automation
+                        .compare_elements(&old.element, &element)
+                        .unwrap_or(false)
+            });
+            let next_revision = revision + u64::from(changed);
+            self.revision
+                .compare_exchange(revision, next_revision, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| anyhow!("共有範囲の確認中にTeamsの構造が変わりました"))?;
+            let revision = next_revision;
+            self.selected = Some(LocatedContent {
+                element,
+                candidate,
+                geometry,
+                revision,
+            });
+            Ok((candidate.rect, revision))
+        })();
+        self.last_discovery = Some(Instant::now());
+        if result.is_err() {
+            self.selected = None;
+            // A failed discovery must invalidate pixels authorized by its old
+            // selection, including failures in the very first provider call.
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+        result
+    }
+}
+fn requires_discovery(subscribed: bool, unchanged: bool, watchdog_due: bool) -> bool {
+    !subscribed || !unchanged || watchdog_due
+}
+
+impl Drop for ContentLocator {
+    fn drop(&mut self) {
+        let _ = self
+            .automation
+            .remove_structure_changed_event_handler(&self.root, &self.structure);
+        let _ = self
+            .automation
+            .remove_property_changed_event_handler(&self.root, &self.properties);
+    }
+}
+
+fn scan_authoritative_element(
     automation: &UIAutomation,
     target_id: u32,
     geometry: WindowGeometry,
-) -> Result<Option<PixelRect>> {
+) -> Result<Option<(UIElement, AuthoritativeCandidate)>> {
     let root = automation
         .element_from_handle(Handle::from(target_id as isize))
         .context("TeamsウィンドウのUI Automationルートを取得できませんでした")?;
@@ -258,14 +477,21 @@ fn scan_authoritative_rect(
         .context("TeamsのUI Automationツリーを走査できませんでした")?;
 
     let mut candidates = Vec::new();
+    let mut identities = Vec::new();
     for element in elements {
         let Some(candidate) = authoritative_candidate_from_element(&element, geometry) else {
             continue;
         };
         insert_or_replace_candidate(&mut candidates, candidate);
+        identities.push((element, candidate));
     }
 
-    Ok(select_unique_authoritative_candidate(&candidates).map(|candidate| candidate.rect))
+    let selected = select_unique_authoritative_candidate(&candidates);
+    Ok(selected.and_then(|candidate| {
+        identities
+            .into_iter()
+            .find(|(_, value)| *value == candidate)
+    }))
 }
 
 fn authoritative_candidate_from_element(
@@ -522,5 +748,15 @@ mod tests {
         };
 
         assert_eq!(select_unique_authoritative_candidate(&[left, right]), None);
+    }
+    #[test]
+    fn unchanged_identity_does_not_require_full_discovery_on_capture() {
+        assert!(!super::requires_discovery(true, true, false));
+    }
+    #[test]
+    fn changes_lost_subscriptions_and_watchdog_force_discovery() {
+        assert!(super::requires_discovery(true, false, false));
+        assert!(super::requires_discovery(false, true, false));
+        assert!(super::requires_discovery(true, true, true));
     }
 }

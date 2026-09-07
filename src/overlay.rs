@@ -37,7 +37,10 @@ use windows::Win32::{
 
 use crate::{shutdown::defer_cleanup, window_z_order::sync_window_above_target};
 
+mod caption_anchor;
 mod caption_readback;
+use caption_anchor::CaptionObservation;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 mod color_sampler;
 mod island_paint;
 use caption_readback::CaptionReadback;
@@ -939,14 +942,15 @@ fn sample_titlebar_color(
     hwnd: HWND,
     caption_height: i32,
     readback: &mut CaptionReadback,
+    observation: Option<CaptionObservation>,
 ) -> Option<TitlebarMaterial> {
-    let caption = current_caption_geometry(hwnd, caption_height)?;
+    let caption = current_caption_geometry(hwnd, caption_height, observation)?;
     let surface_points = titlebar_sample_points(caption);
     let separator_points = separator_sample_points(caption, &surface_points);
     let mut points = surface_points.clone();
     points.extend(separator_points.iter().copied());
     let samples = sample_screen_colors(hwnd, &points, readback);
-    if current_caption_geometry(hwnd, caption_height) != Some(caption) {
+    if current_caption_geometry(hwnd, caption_height, observation) != Some(caption) {
         return None;
     }
     let (surface_samples, _) = split_sample_colors(&surface_points, &separator_points, &samples);
@@ -1024,10 +1028,19 @@ fn separator_material(
     None
 }
 
-fn current_caption_geometry(hwnd: HWND, caption_height: i32) -> Option<CaptionGeometry> {
+fn current_caption_geometry(
+    hwnd: HWND,
+    caption_height: i32,
+    observation: Option<CaptionObservation>,
+) -> Option<CaptionGeometry> {
     let window = get_window_rect(hwnd)?;
     let frame = extended_frame_bounds(hwnd).unwrap_or(window);
-    caption_geometry(window, frame, caption_button_bounds(hwnd), caption_height)
+    caption_geometry(
+        window,
+        frame,
+        observed_caption_bounds(hwnd, window, frame, observation),
+        caption_height,
+    )
 }
 
 #[derive(Clone)]
@@ -1216,12 +1229,14 @@ impl TeamsWindowFollower {
         let worker = thread::Builder::new()
             .name("snapbar-window-follow".to_string())
             .spawn(move || {
+                let _physical = crate::dpi::PhysicalPixels::enter();
                 let overlay_hwnd = HWND(overlay_value as *mut c_void);
                 unsafe {
                     let _ = SetWindowDisplayAffinity(overlay_hwnd, display_affinity);
                 }
 
                 let mut previous_placement = None;
+                let mut measured_caption = None;
                 let mut previous_region_state = None;
                 let mut previous_visible = false;
                 let mut previous_compact = false;
@@ -1253,7 +1268,25 @@ impl TeamsWindowFollower {
                     let mut structural_change = false;
 
                     if run_full_follow {
-                        let placement = if presenter_attached {
+                        if anchor_changed {
+                            measured_caption = None;
+                        }
+                        let anchor_id = if presenter_attached {
+                            presenter_toolbar_id
+                        } else {
+                            target_id
+                        };
+                        let size_ready = anchor_id == 0
+                            || synchronize_client_dpi(
+                                overlay_hwnd,
+                                HWND(anchor_id as usize as *mut c_void),
+                            );
+                        if !size_ready {
+                            previous_placement = None;
+                        }
+                        let placement = if !size_ready {
+                            OverlayPlacement::Hidden
+                        } else if presenter_attached {
                             let presenter_hwnd = HWND(presenter_toolbar_id as usize as *mut c_void);
                             desired_presenter_placement(
                                 overlay_hwnd,
@@ -1264,7 +1297,12 @@ impl TeamsWindowFollower {
                             OverlayPlacement::Hidden
                         } else {
                             let target_hwnd = HWND(target_id as usize as *mut c_void);
-                            desired_placement(overlay_hwnd, target_hwnd, thread_presentation)
+                            desired_placement(
+                                overlay_hwnd,
+                                target_hwnd,
+                                thread_presentation,
+                                measured_caption,
+                            )
                         };
 
                         let visible_now = matches!(placement, OverlayPlacement::Visible { .. });
@@ -1284,7 +1322,8 @@ impl TeamsWindowFollower {
                             let _ = thread_event_tx.try_send(());
                         }
 
-                        let placement_changed = previous_placement != Some(placement);
+                        let placement_changed = previous_placement != Some(placement)
+                            || (visible_now && !unsafe { IsWindowVisible(overlay_hwnd).as_bool() });
                         if placement_changed {
                             apply_placement(overlay_hwnd, placement);
                             if visible_now {
@@ -1368,6 +1407,22 @@ impl TeamsWindowFollower {
                         .and_then(ColorSampler::try_take_result)
                     {
                         last_titlebar_sample = Instant::now();
+                        if sample.request.target_id == target_id
+                            && !presenter_attached
+                            && let Some(observation) = sample.caption
+                        {
+                            let hwnd = HWND(target_id as usize as *mut c_void);
+                            if let (Some(window), Some(frame)) =
+                                (get_window_rect(hwnd), extended_frame_bounds(hwnd))
+                                && observation.bottom(hwnd, window, frame).is_some()
+                                && measured_caption != Some(observation)
+                            {
+                                measured_caption = Some(observation);
+                                thread_pending_work
+                                    .fetch_or(WORK_FOLLOW | WORK_REGION, Ordering::Release);
+                                last_full_follow = None;
+                            }
+                        }
                         let current_caption_height = cached_overlay_metrics
                             .map(nominal_caption_height)
                             .unwrap_or(32);
@@ -2348,10 +2403,102 @@ fn desired_presenter_placement(
     calculate_presenter_placement(presenter_frame, overlay, presentation)
 }
 
+fn observed_caption_bounds(
+    hwnd: HWND,
+    window: RectI,
+    frame: RectI,
+    observation: Option<CaptionObservation>,
+) -> Option<RectI> {
+    let native = caption_button_bounds(hwnd);
+    let Some(bottom) = observation.and_then(|value| value.bottom(hwnd, window, frame)) else {
+        return native;
+    };
+    let mut bounds = native.unwrap_or(RectI {
+        left: frame.right - frame.width() / 8 - window.left,
+        right: frame.right - window.left,
+        top: 0,
+        bottom: 0,
+    });
+    bounds.top = frame.top - window.top;
+    bounds.bottom = bottom - window.top;
+    Some(bounds)
+}
+
+fn client_size_for_dpi(dpi: u32) -> Option<(i32, i32)> {
+    if !(96..=768).contains(&dpi) {
+        return None;
+    }
+    let scale = dpi as f32 / 96.0;
+    Some((
+        (WINDOW_WIDTH * scale).round() as i32,
+        (WINDOW_HEIGHT * scale).round() as i32,
+    ))
+}
+
+fn synchronize_client_dpi(hwnd: HWND, target: HWND) -> bool {
+    if !unsafe { IsWindow(Some(target)).as_bool() } {
+        return false;
+    }
+    let dpi = unsafe { GetDpiForWindow(target) };
+    let Some((width, height)) = client_size_for_dpi(dpi) else {
+        return false;
+    };
+    // First move into the target monitor while hidden. Let GPUI receive the
+    // genuine WM_DPICHANGED before correcting its client size; never synthesize
+    // that message or keep a size derived from the previous display's DPI.
+    if unsafe { GetDpiForWindow(hwnd) } != dpi {
+        let Some(frame) = extended_frame_bounds(target).or_else(|| get_window_rect(target)) else {
+            return false;
+        };
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            if SetWindowPos(
+                hwnd,
+                None,
+                frame.center_x() - width / 2,
+                frame.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    let Some(metrics) = window_metrics(hwnd) else {
+        return false;
+    };
+    if (metrics.client_width, metrics.client_height) != (width, height) {
+        let nonclient_width = metrics.window_rect.width() - metrics.client_width;
+        let nonclient_height = metrics.window_rect.height() - metrics.client_height;
+        unsafe {
+            if SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                width + nonclient_width,
+                height + nonclient_height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    (unsafe { GetDpiForWindow(hwnd) }) == dpi
+        && window_metrics(hwnd)
+            .is_some_and(|m| (m.client_width, m.client_height) == (width, height))
+}
+
 fn desired_placement(
     overlay_hwnd: HWND,
     target_hwnd: HWND,
     presentation: OverlayPresentation,
+    observation: Option<CaptionObservation>,
 ) -> OverlayPlacement {
     unsafe {
         if !IsWindow(Some(target_hwnd)).as_bool()
@@ -2374,7 +2521,7 @@ fn desired_placement(
     calculate_placement(
         target_window,
         target_frame,
-        caption_button_bounds(target_hwnd),
+        observed_caption_bounds(target_hwnd, target_window, target_frame, observation),
         overlay,
         presentation,
     )
@@ -4092,5 +4239,20 @@ mod tests {
             OverlayPresentation::HoverIsland,
         );
         assert!(matches!(placement, OverlayPlacement::Visible { .. }));
+    }
+    #[test]
+    fn window_client_dimensions_are_repaired_from_target_dpi_not_old_monitor_size() {
+        for (dpi, expected) in [
+            (96, (304, 52)),
+            (120, (380, 65)),
+            (144, (456, 78)),
+            (168, (532, 91)),
+            (192, (608, 104)),
+            (288, (912, 156)),
+        ] {
+            assert_eq!(client_size_for_dpi(dpi), Some(expected));
+        }
+        assert_eq!(client_size_for_dpi(0), None);
+        assert_eq!(client_size_for_dpi(u32::MAX), None);
     }
 }
