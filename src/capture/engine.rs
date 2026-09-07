@@ -142,7 +142,21 @@ struct RuntimeState {
     latest: Option<CachedFrame>,
     content_rect: Option<PixelRect>,
     last_error: Option<String>,
+    last_error_sequence: u64,
+    source_size: Option<(u32, u32)>,
     requested_after_sequence: u64,
+}
+
+impl RuntimeState {
+    fn source_dimensions(&self) -> Option<(u32, u32)> {
+        // Dimensions are not crop authorization. UIA is still read afresh at
+        // preflight, cropping, and output, even after the pixel cache was lost.
+        self.source_size.or_else(|| {
+            self.latest
+                .as_ref()
+                .map(|frame| (frame.source_width, frame.source_height))
+        })
+    }
 }
 
 struct CachedFrame {
@@ -314,11 +328,9 @@ impl CaptureEngine {
                 .state
                 .lock()
                 .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
-            let cached = state
-                .latest
-                .as_ref()
-                .ok_or_else(|| anyhow!("共有コンテンツを準備中です"))?;
-            (cached.source_width, cached.source_height)
+            state
+                .source_dimensions()
+                .ok_or_else(|| anyhow!("共有コンテンツを準備中です"))?
         };
         detect_remote_layout(target_id, width, height).map(Some)
     }
@@ -420,14 +432,16 @@ impl CaptureEngine {
         drop(state);
         let _request_guard = CaptureRequestGuard::new(Arc::clone(&self.inner.shared));
 
-        let timeout = if !had_frame {
+        let timeout = if !had_frame && baseline_sequence == 0 {
             READY_TIMEOUT
         } else if local_monitor {
             LOCAL_FRESH_FRAME_WAIT
         } else {
             FRESH_FRAME_WAIT
         };
-        let deadline = Instant::now() + timeout;
+        let wait_started = Instant::now();
+        let arrival_deadline = wait_started + timeout;
+        let processing_deadline = wait_started + READY_TIMEOUT;
         let mut state = self
             .inner
             .shared
@@ -436,6 +450,16 @@ impl CaptureEngine {
             .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
 
         loop {
+            // A failed fresh crop must report its actual error, rather than
+            // waiting out both timeouts and misdiagnosing it as a dead session.
+            if state.last_error_sequence > baseline_sequence {
+                return Err(anyhow!(
+                    state
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "共有画面の取得に失敗しました".to_string())
+                ));
+            }
             let has_fresh_frame = state
                 .latest
                 .as_ref()
@@ -444,21 +468,30 @@ impl CaptureEngine {
                 break;
             }
 
+            // FrameArrived increments the sequence before UIA/cropping. A new
+            // frame can be healthy yet still processing after 200 ms. Keep the
+            // total wait bounded; subsequent frames must not extend it again.
+            let deadline = if self.inner.shared.observed_sequence.load(Ordering::Acquire)
+                > baseline_sequence
+            {
+                processing_deadline
+            } else {
+                arrival_deadline
+            };
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
             let wait_for = deadline.saturating_duration_since(now);
-            let (next_state, wait_result) =
-                self.inner
-                    .shared
-                    .ready
-                    .wait_timeout(state, wait_for)
-                    .map_err(|_| anyhow!("キャプチャ状態の待機に失敗しました"))?;
+            let (next_state, _) = self
+                .inner
+                .shared
+                .ready
+                .wait_timeout(state, wait_for)
+                .map_err(|_| anyhow!("キャプチャ状態の待機に失敗しました"))?;
             state = next_state;
-            if wait_result.timed_out() {
-                break;
-            }
+            // Recheck arrival/processing state after every wake, including a
+            // timeout: a notification may have preceded the condvar wait.
         }
 
         let cached_sequence = state.latest.as_ref().map_or(0, |frame| frame.sequence);
@@ -547,6 +580,9 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             .observed_sequence
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.source_size = Some(source_size);
+        }
         let requested = self.shared.capture_requested.load(Ordering::Acquire);
         if let CaptureSource::LocalMonitor(target) = self.shared.source.clone() {
             return self.on_local_monitor_frame(frame, now, observed_sequence, requested, target);
@@ -580,10 +616,13 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         // of dirty-region hints cannot prove that a side panel did not open.
         self.last_detection = Some(now);
         let result = self.detect_and_cache(frame, now, observed_sequence);
+        // Measure the watchdog interval from completion, not from the beginning
+        // of a potentially slow provider call; otherwise it can run continuously.
+        self.last_detection = Some(Instant::now());
 
         match result {
             Ok(()) => {
-                self.last_cache_update = Some(now);
+                self.last_cache_update = Some(Instant::now());
             }
             Err(error) => {
                 let message = error.to_string();
@@ -592,6 +631,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
                     state.content_rect = None;
                     self.shared.has_cached_frame.store(false, Ordering::Release);
                     state.last_error = Some(message);
+                    state.last_error_sequence = observed_sequence;
                 }
                 self.shared.ready.notify_all();
             }
@@ -605,6 +645,11 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             state.latest = None;
             state.content_rect = None;
             state.last_error = Some("選択中のTeamsウィンドウが閉じられました".to_string());
+            state.last_error_sequence = self
+                .shared
+                .observed_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1);
             self.shared.has_cached_frame.store(false, Ordering::Release);
         }
         self.shared.ready.notify_all();
@@ -667,6 +712,7 @@ impl FrameHandler {
                     state.latest = None;
                     state.content_rect = None;
                     state.last_error = Some(error.to_string());
+                    state.last_error_sequence = observed_sequence;
                     self.shared.has_cached_frame.store(false, Ordering::Release);
                 }
                 self.shared.ready.notify_all();
@@ -783,6 +829,7 @@ impl FrameHandler {
         });
         state.content_rect = Some(content_rect);
         state.last_error = None;
+        state.last_error_sequence = 0;
         // A crop already in flight when the user clicked cannot consume the
         // new request. Keep refreshing until a subsequent frame is cached.
         if sequence > state.requested_after_sequence {
@@ -969,6 +1016,7 @@ mod tests {
                         content_rect: Some(rect),
                         last_error: None,
                         requested_after_sequence: 0,
+                        ..RuntimeState::default()
                     }),
                     ready: Condvar::new(),
                 }),
@@ -1438,5 +1486,154 @@ mod tests {
                 .capture_requested
                 .load(Ordering::Acquire)
         );
+    }
+
+    #[test]
+    fn arrived_frame_finishes_uia_after_the_arrival_timeout_without_restart() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let shared = Arc::clone(&engine.inner.shared);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !shared.capture_requested.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "capture request was not published"
+                    );
+                    std::thread::yield_now();
+                }
+                shared.observed_sequence.store(2, Ordering::Release);
+                // Exceed the 200 ms arrival budget while processing a real arrival.
+                std::thread::sleep(Duration::from_millis(300));
+                let mut state = shared.state.lock().unwrap();
+                let cached = state.latest.as_mut().unwrap();
+                cached.sequence = 2;
+                cached.bytes = vec![40, 50, 60, 255];
+                drop(state);
+                shared.ready.notify_all();
+            });
+            let mut copied = Vec::new();
+            let outcome = engine.copy_with_recovery(
+                |_, _, bytes| {
+                    copied = bytes.to_vec();
+                    Ok(())
+                },
+                |_| panic!("a healthy in-flight crop must not restart WGC"),
+            );
+            outcome.result.unwrap();
+            assert!(outcome.replacement.is_none());
+            assert_eq!(copied, [40, 50, 60, 255]);
+        });
+    }
+
+    #[test]
+    fn fresh_uia_failure_is_reported_without_a_timeout_or_session_restart() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let shared = Arc::clone(&engine.inner.shared);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !shared.capture_requested.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "capture request was not published"
+                    );
+                    std::thread::yield_now();
+                }
+                shared.observed_sequence.store(2, Ordering::Release);
+                let mut state = shared.state.lock().unwrap();
+                state.latest = None;
+                state.last_error = Some("test: authoritative UIA unavailable".to_string());
+                state.last_error_sequence = 2;
+                drop(state);
+                shared.ready.notify_all();
+            });
+            let outcome = engine.copy_with_recovery(
+                |_, _, _| panic!("unconfirmed pixels must not be copied"),
+                |_| panic!("a UIA failure is not a dead WGC session"),
+            );
+            assert_eq!(
+                outcome.result.unwrap_err().to_string(),
+                "test: authoritative UIA unavailable"
+            );
+            assert!(outcome.replacement.is_none());
+        });
+    }
+
+    #[test]
+    fn lost_crop_keeps_only_source_dimensions_for_a_new_preflight() {
+        let state = RuntimeState {
+            source_size: Some((1920, 1080)),
+            last_error: Some("transient UIA failure".to_string()),
+            ..RuntimeState::default()
+        };
+        assert_eq!(state.source_dimensions(), Some((1920, 1080)));
+        assert!(state.latest.is_none());
+        assert!(state.content_rect.is_none());
+        assert_eq!(RuntimeState::default().source_dimensions(), None);
+    }
+
+    #[test]
+    fn explicit_retry_can_recover_an_empty_pixel_cache() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        {
+            let mut state = engine.inner.shared.state.lock().unwrap();
+            state.source_size = Some((1, 1));
+            state.latest = None;
+            state.last_error = Some("previous UIA failure".to_string());
+            state.last_error_sequence = 1;
+        }
+        engine
+            .inner
+            .shared
+            .has_cached_frame
+            .store(false, Ordering::Release);
+        let mut copied = false;
+        let outcome = engine.copy_with_recovery(
+            |_, _, _| {
+                copied = true;
+                Ok(())
+            },
+            |_| Ok(cached_remote_engine(window.target_id())),
+        );
+        outcome.result.unwrap();
+        assert!(copied);
+        assert!(outcome.replacement.is_some());
+    }
+
+    #[test]
+    fn in_flight_crop_has_a_fixed_total_deadline() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let shared = Arc::clone(&engine.inner.shared);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !shared.capture_requested.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "capture request was not published"
+                    );
+                    std::thread::yield_now();
+                }
+                shared.observed_sequence.store(2, Ordering::Release);
+            });
+            let started = Instant::now();
+            let error = engine
+                .copy_latest_with(|_, _, _| panic!("no fresh crop"))
+                .unwrap_err();
+            assert!(error.downcast_ref::<FrameUnavailable>().is_some());
+            assert!(started.elapsed() >= READY_TIMEOUT);
+            assert!(
+                !engine
+                    .inner
+                    .shared
+                    .capture_requested
+                    .load(Ordering::Acquire)
+            );
+        });
     }
 }

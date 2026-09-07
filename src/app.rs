@@ -89,6 +89,10 @@ const EXPANDED_STATUS_CENTER_X: f32 = EXPANDED_CONTENT_SHIFT_X - EXPANDED_CONTRO
     + 4.0
     + STATUS_INDICATOR_SIZE / 2.0;
 
+fn capture_action_available(has_engine: bool, quitting: bool) -> bool {
+    has_engine && !quitting
+}
+
 fn smoothstep_between(start: f32, end: f32, value: f32) -> f32 {
     let phase = ((value - start) / (end - start)).clamp(0.0, 1.0);
     phase * phase * (3.0 - 2.0 * phase)
@@ -1120,12 +1124,8 @@ impl Snapbar {
             cx.notify();
             return;
         };
-        if !engine.is_ready() {
-            self.capture_state = CaptureState::WaitingForShare;
-            self.last_error = Some("共有コンテンツを待機中です".to_string());
-            cx.notify();
-            return;
-        }
+        // Keep explicit retries available after a transient cache failure.
+        // The engine must still establish fresh UIA and pixel evidence before output.
 
         let local_monitor_capture = engine.is_local_monitor();
         let overlay_exclusion = if local_monitor_capture {
@@ -1264,11 +1264,7 @@ impl Snapbar {
 
 impl Render for Snapbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_capture = self
-            .capture_engine
-            .as_ref()
-            .is_some_and(CaptureEngine::is_ready)
-            && !self.quitting;
+        let can_capture = capture_action_available(self.capture_engine.is_some(), self.quitting);
         let presentation = self.presentation;
         let presenter_attached = self.presenter_toolbar_id.is_some();
         let caption_morph = !presenter_attached && !presentation.is_inline();
@@ -2753,5 +2749,12 @@ mod tests {
         let visual_bottom_margin = HOVER_ISLAND_HEIGHT - visual_top - ACTION_VISUAL_SIZE;
         assert_eq!(visual_top, 10.5);
         assert_eq!(visual_bottom_margin, visual_top);
+    }
+
+    #[test]
+    fn capture_retry_remains_available_without_a_ready_pixel_cache() {
+        assert!(super::capture_action_available(true, false));
+        assert!(!super::capture_action_available(false, false));
+        assert!(!super::capture_action_available(true, true));
     }
 }
