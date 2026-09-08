@@ -1,9 +1,8 @@
 use gpui::{Bounds, Pixels, Window, fill, point, px, rgb, size};
 
 use super::{
-    OverlayPresentation, RectI, TitlebarMaterial, WINDOW_HEIGHT, WindowMetrics, WindowRegion,
-    WindowRegionShape, encode_disclosure_progress, island_row_inset, scale_logical,
-    window_region_for_attachment,
+    OverlayPresentation, RectI, TitlebarMaterial, WindowMetrics, WindowRegion, WindowRegionShape,
+    encode_disclosure_progress, island_row_inset, window_region_for_attachment,
 };
 
 // These rectangles are the inner edge of the very same physical scanlines used
@@ -180,7 +179,8 @@ pub(crate) fn paint_island_drop(
         window.paint_quad(fill(to_bounds(strip), rgb(material.surface)));
     });
     if material.surface != material.separator {
-        let thickness = scale_logical(1.0, height, WINDOW_HEIGHT).max(1);
+        // This is a measured physical-pixel stroke, independent of Teams zoom.
+        let thickness = i32::from(material.separator_thickness).max(1);
         for_each_separator_strip(region, thickness, material.separator_offset, |strip| {
             window.paint_quad(fill(to_bounds(strip), rgb(material.separator)));
         });
@@ -189,7 +189,9 @@ pub(crate) fn paint_island_drop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DISCLOSURE_PROGRESS_LIMIT, window_region_for_attachment};
+    use super::super::{
+        DISCLOSURE_PROGRESS_LIMIT, WINDOW_HEIGHT, scale_logical, window_region_for_attachment,
+    };
     use super::*;
     #[test]
     fn teams_separator_above_uia_boundary_is_covered() {

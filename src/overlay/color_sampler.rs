@@ -181,6 +181,7 @@ mod tests {
                     surface: request.target_id,
                     separator: request.target_id,
                     separator_offset: 0,
+                    separator_thickness: 1,
                 })
             })
             .expect("worker should start");

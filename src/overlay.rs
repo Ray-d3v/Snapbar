@@ -103,8 +103,8 @@ pub const INLINE_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const COMPACT_WIDTH: f32 = 46.0;
 pub const COMPACT_HEIGHT: f32 = TITLEBAR_SURFACE_HEIGHT;
 pub const ISLAND_BOTTOM_RADIUS: f32 = 12.0;
-pub const ISLAND_SHOULDER_DEPTH: f32 = 8.0;
-pub const ISLAND_SHOULDER_INSET: f32 = 24.0;
+pub const ISLAND_SHOULDER_DEPTH: f32 = 10.0;
+pub const ISLAND_SHOULDER_INSET: f32 = 16.0;
 pub const ISLAND_DROP: f32 = 20.0;
 pub const PRESENTER_COLLAPSED_HEIGHT: f32 = 39.0;
 pub const PRESENTER_CORNER_RADIUS: f32 = 16.0;
@@ -116,10 +116,12 @@ pub struct TitlebarMaterial {
     pub surface: u32,
     pub separator: u32,
     pub separator_offset: u8,
+    pub separator_thickness: u8,
 }
 
 fn pack_titlebar_material(material: TitlebarMaterial) -> u64 {
-    (u64::from(material.separator_offset) << 48)
+    (u64::from(material.separator_thickness) << 56)
+        | (u64::from(material.separator_offset) << 48)
         | ((u64::from(material.surface) & 0x00ff_ffff) << 24)
         | (u64::from(material.separator) & 0x00ff_ffff)
 }
@@ -129,6 +131,7 @@ fn unpack_titlebar_material(value: u64) -> TitlebarMaterial {
         surface: ((value >> 24) & 0x00ff_ffff) as u32,
         separator: (value & 0x00ff_ffff) as u32,
         separator_offset: (value >> 48) as u8,
+        separator_thickness: (value >> 56) as u8,
     }
 }
 
@@ -209,8 +212,8 @@ impl OverlayPresentation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OverlayCaptureMode {
-    Excluded,
     #[default]
+    Excluded,
     Recordable,
 }
 
@@ -224,15 +227,19 @@ impl OverlayCaptureMode {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        if arguments.into_iter().any(|argument| {
-            matches!(
-                argument.as_ref().to_str(),
-                Some("--exclude-overlay-from-capture")
-            )
-        }) {
-            Self::Excluded
-        } else {
+        let mut demo = false;
+        let mut excluded = false;
+        for argument in arguments {
+            match argument.as_ref().to_str() {
+                Some("--recordable-overlay" | "--demo-mode") => demo = true,
+                Some("--exclude-overlay-from-capture") => excluded = true,
+                _ => {}
+            }
+        }
+        if demo && !excluded {
             Self::Recordable
+        } else {
+            Self::Excluded
         }
     }
 
@@ -890,7 +897,7 @@ fn separator_sample_points(caption: CaptionGeometry, surface: &[(i32, i32)]) -> 
     x_positions
         .into_iter()
         .flat_map(|x| {
-            (0..row_count.min(9)).map(move |row| (x, caption.band.bottom.saturating_add(row)))
+            (-8..row_count.min(9)).map(move |row| (x, caption.band.bottom.saturating_add(row)))
         })
         .collect()
 }
@@ -960,6 +967,7 @@ fn sample_titlebar_color(
             surface,
             separator: surface,
             separator_offset: 0,
+            separator_thickness: 1,
         });
     };
     let (separator, separator_offset) =
@@ -968,6 +976,12 @@ fn sample_titlebar_color(
         surface,
         separator,
         separator_offset,
+        separator_thickness: measured_separator_thickness(
+            separator,
+            caption.band.bottom,
+            separator_offset,
+            &samples,
+        ),
     })
 }
 
@@ -1007,8 +1021,10 @@ fn separator_material(
     band_bottom: i32,
     samples: &[((i32, i32), u32)],
 ) -> Option<(u32, u8)> {
-    for offset in 0_u8..=8 {
-        let y = band_bottom.saturating_add(i32::from(offset));
+    // Teams can paint the separator on the final caption row, immediately
+    // above the UIA toolbar rectangle. Prefer it over the toolbar background.
+    for offset in -1_i32..=8 {
+        let y = band_bottom.saturating_add(offset);
         let mut row = [0_u32; 8];
         let mut count = 0;
         for &((_, sample_y), color) in samples {
@@ -1023,10 +1039,45 @@ fn separator_material(
         if let Some(color) = stable_separator_color(&row[..count])
             .filter(|&color| colors_materially_differ(surface, color))
         {
-            return Some((color, offset));
+            return Some((color, offset.max(0) as u8));
         }
     }
     None
+}
+
+fn measured_separator_thickness(
+    separator: u32,
+    band_bottom: i32,
+    offset: u8,
+    samples: &[((i32, i32), u32)],
+) -> u8 {
+    let matches = |y: i32| {
+        let mut row = [0_u32; 8];
+        let mut count = 0;
+        for &((_, sample_y), color) in samples {
+            if sample_y == y && count < row.len() {
+                row[count] = color;
+                count += 1;
+            }
+        }
+        stable_separator_color(&row[..count])
+            .is_some_and(|color| !colors_materially_differ(color, separator))
+    };
+    let anchor = if offset == 0 && matches(band_bottom.saturating_sub(1)) {
+        band_bottom.saturating_sub(1)
+    } else {
+        band_bottom.saturating_add(i32::from(offset))
+    };
+    let mut thickness = 1;
+    for direction in [-1, 1] {
+        for distance in 1..8 {
+            if !matches(anchor.saturating_add(direction * distance)) {
+                break;
+            }
+            thickness += 1;
+        }
+    }
+    thickness.min(8)
 }
 
 fn current_caption_geometry(
@@ -1199,6 +1250,7 @@ impl TeamsWindowFollower {
                 surface: DEFAULT_TITLEBAR_COLOR,
                 separator: DEFAULT_TITLEBAR_COLOR,
                 separator_offset: 0,
+                separator_thickness: 1,
             })));
         let expanded = Arc::new(AtomicBool::new(false));
         let disclosure_progress = Arc::new(AtomicU32::new(0));
@@ -1475,6 +1527,8 @@ impl TeamsWindowFollower {
                                     sampled_material.separator,
                                 )
                                 || current.separator_offset != sampled_material.separator_offset
+                                || current.separator_thickness
+                                    != sampled_material.separator_thickness
                             {
                                 thread_titlebar_material.store(
                                     pack_titlebar_material(sampled_material),
@@ -1502,6 +1556,7 @@ impl TeamsWindowFollower {
                                 surface: PRESENTER_TOOLBAR_COLOR,
                                 separator: PRESENTER_TOOLBAR_COLOR,
                                 separator_offset: 0,
+                                separator_thickness: 1,
                             };
                             let current = unpack_titlebar_material(
                                 thread_titlebar_material.load(Ordering::Acquire),
@@ -1512,6 +1567,8 @@ impl TeamsWindowFollower {
                                     sampled_material.separator,
                                 )
                                 || current.separator_offset != sampled_material.separator_offset
+                                || current.separator_thickness
+                                    != sampled_material.separator_thickness
                             {
                                 thread_titlebar_material.store(
                                     pack_titlebar_material(sampled_material),
@@ -1654,6 +1711,15 @@ impl TeamsWindowFollower {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
+    }
+
+    pub fn set_capture_mode(&mut self, mode: OverlayCaptureMode) -> bool {
+        let hwnd = HWND(self.overlay_hwnd as *mut c_void);
+        if unsafe { SetWindowDisplayAffinity(hwnd, mode.display_affinity()) }.is_err() {
+            return false;
+        }
+        self.capture_mode = mode;
+        true
     }
 
     pub fn exclude_overlay_from_capture(&self) -> Option<TemporaryOverlayCaptureExclusion> {
@@ -2751,6 +2817,7 @@ mod tests {
             surface: 0x112233,
             separator: 0xaabbcc,
             separator_offset: 5,
+            separator_thickness: 2,
         };
         assert_eq!(
             unpack_titlebar_material(pack_titlebar_material(material)),
@@ -2828,6 +2895,39 @@ mod tests {
             stable_separator_color(&[0xdfdfdf, 0xdfdfdf, 0xdfdfdf, 0x242424, 0x242424, 0x242424]),
             None
         );
+    }
+
+    #[test]
+    fn separator_prefers_last_caption_row_over_light_toolbar_background() {
+        let samples = [
+            ((10, 84), 0xdfdfdf),
+            ((20, 84), 0xdfdfdf),
+            ((30, 84), 0xdfdfdf),
+            ((10, 85), 0xffffff),
+            ((20, 85), 0xffffff),
+            ((30, 85), 0xffffff),
+        ];
+        assert_eq!(
+            separator_material(0xebebeb, 85, &samples),
+            Some((0xdfdfdf, 0))
+        );
+        assert_eq!(measured_separator_thickness(0xdfdfdf, 85, 0, &samples), 1);
+    }
+
+    #[test]
+    fn separator_thickness_counts_only_adjacent_matching_physical_rows() {
+        let mut samples = Vec::new();
+        for (y, color) in [
+            (82, 0xebebeb),
+            (83, 0xdfdfdf),
+            (84, 0xdfdfdf),
+            (85, 0xffffff),
+        ] {
+            for x in [10, 20, 30] {
+                samples.push(((x, y), color));
+            }
+        }
+        assert_eq!(measured_separator_thickness(0xdfdfdf, 85, 0, &samples), 2);
     }
 
     fn expected_row_inset(region: WindowRegion, row: i32, width: i32, height: i32) -> i32 {
@@ -2989,10 +3089,10 @@ mod tests {
     }
 
     #[test]
-    fn capture_is_recordable_by_default_but_can_be_explicitly_excluded() {
+    fn capture_is_excluded_by_default_and_demo_is_explicit() {
         assert_eq!(
             OverlayCaptureMode::from_arguments(["snapbar.exe"]),
-            OverlayCaptureMode::Recordable
+            OverlayCaptureMode::Excluded
         );
         assert_eq!(
             OverlayCaptureMode::from_arguments(["snapbar.exe", "--recordable-overlay"]),
@@ -3006,6 +3106,11 @@ mod tests {
             ]),
             OverlayCaptureMode::Excluded
         );
+        assert_eq!(
+            OverlayCaptureMode::from_arguments(["snapbar.exe", "--demo-mode"]),
+            OverlayCaptureMode::Recordable
+        );
+        assert_eq!(OverlayCaptureMode::default(), OverlayCaptureMode::Excluded);
         assert_eq!(
             OverlayCaptureMode::Excluded.display_affinity(),
             WDA_EXCLUDEFROMCAPTURE
@@ -3380,9 +3485,9 @@ mod tests {
             expanded.shape,
             WindowRegionShape::Island {
                 shoulder_start: 29,
-                shoulder_depth: 8,
-                shoulder_inset: 24,
-                bottom_radius: 12,
+                shoulder_depth: 10,
+                shoulder_inset: 16,
+                bottom_radius: 10,
             }
         );
     }
@@ -3544,9 +3649,9 @@ mod tests {
                 bottom: 75,
                 shape: WindowRegionShape::Island {
                     shoulder_start: 44,
-                    shoulder_depth: 12,
-                    shoulder_inset: 36,
-                    bottom_radius: 18,
+                    shoulder_depth: 15,
+                    shoulder_inset: 24,
+                    bottom_radius: 15,
                 },
             }
         );

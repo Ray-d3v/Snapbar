@@ -1,4 +1,5 @@
 use std::{
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -24,8 +25,8 @@ use crate::{
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ClickEvent, Context, FontWeight, MouseButton,
     MouseDownEvent, SpringAnimation, SpringConfig, Task, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowKind, WindowOptions, canvas, div, prelude::*, px,
-    relative, rgb, rgba, size, svg, transparent_black,
+    WindowBounds, WindowDecorations, WindowHandle, WindowKind, WindowOptions, canvas, div,
+    prelude::*, px, relative, rgb, rgba, size, svg, transparent_black,
 };
 use gpui_platform::application;
 
@@ -480,6 +481,7 @@ enum IslandPage {
     Controls,
     SaveInfo,
     ConfirmQuit,
+    DemoSettings,
 }
 
 #[derive(Clone, Copy)]
@@ -556,9 +558,19 @@ impl CaptureRequests {
     }
 }
 
+fn demo_caption_visible(
+    mode: OverlayCaptureMode,
+    sharing: bool,
+    presenter: Option<u32>,
+    quitting: bool,
+) -> bool {
+    mode == OverlayCaptureMode::Recordable && sharing && presenter.is_some() && !quitting
+}
+
 struct Snapbar {
     presentation: OverlayPresentation,
     capture_mode: OverlayCaptureMode,
+    demo_mode_error: bool,
     targets: Vec<CaptureTarget>,
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
@@ -568,8 +580,10 @@ struct Snapbar {
     remote_minimized: bool,
     capture_authorization: CaptureAuthorization,
     follower: Option<TeamsWindowFollower>,
-    meeting_monitor: MeetingMonitor,
-    resident: ResidentController,
+    meeting_monitor: Arc<MeetingMonitor>,
+    resident: Arc<ResidentController>,
+    owner: Option<WindowHandle<Snapbar>>,
+    companion: Option<WindowHandle<Snapbar>>,
     last_monitor_generation: u64,
     shared_content_hint: bool,
     presenter_toolbar_id: Option<u32>,
@@ -598,6 +612,7 @@ impl Snapbar {
         cx: &mut Context<Self>,
         presentation: OverlayPresentation,
         capture_mode: OverlayCaptureMode,
+        owner: Option<WindowHandle<Snapbar>>,
     ) -> Self {
         window.set_window_title("Snapbar");
         let follower = TeamsWindowFollower::start(window, presentation, capture_mode);
@@ -605,11 +620,24 @@ impl Snapbar {
         let geometry_notifier = follower
             .as_ref()
             .map(TeamsWindowFollower::geometry_notifier);
-        let meeting_monitor = MeetingMonitor::start(move |window_id| {
-            geometry_notifier
-                .as_ref()
-                .is_some_and(|notifier| notifier.window_changed(window_id))
+        let shared = owner.and_then(|handle| handle.read(cx).ok()).map(|source| {
+            (
+                Arc::clone(&source.meeting_monitor),
+                Arc::clone(&source.resident),
+            )
         });
+        let (meeting_monitor, resident) = if let Some(shared) = shared {
+            shared
+        } else {
+            (
+                Arc::new(MeetingMonitor::start(move |window_id| {
+                    geometry_notifier
+                        .as_ref()
+                        .is_some_and(|notifier| notifier.window_changed(window_id))
+                })),
+                Arc::new(ResidentController::start()),
+            )
+        };
         let meeting_events = meeting_monitor.subscribe();
         let titlebar_material = follower
             .as_ref()
@@ -618,10 +646,12 @@ impl Snapbar {
                 surface: DEFAULT_TITLEBAR_COLOR,
                 separator: DEFAULT_TITLEBAR_COLOR,
                 separator_offset: 0,
+                separator_thickness: 1,
             });
         let mut snapbar = Self {
             presentation,
             capture_mode,
+            demo_mode_error: false,
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
@@ -632,7 +662,9 @@ impl Snapbar {
             capture_authorization: CaptureAuthorization::default(),
             follower,
             meeting_monitor,
-            resident: ResidentController::start(),
+            resident,
+            owner,
+            companion: None,
             last_monitor_generation: u64::MAX,
             shared_content_hint: false,
             presenter_toolbar_id: None,
@@ -654,16 +686,68 @@ impl Snapbar {
             last_error: None,
             quitting: false,
         };
-        let snapshot = snapbar.meeting_monitor.snapshot();
-        snapbar.apply_meeting_snapshot(snapshot, cx);
-        let capture_requests = snapbar.resident.capture_requests();
-        snapbar.start_capture_hotkey_sync(capture_requests, window, cx);
-        snapbar.start_meeting_sync(meeting_events, window, cx);
+        if owner.is_none() {
+            let snapshot = snapbar.meeting_monitor.snapshot();
+            snapbar.apply_meeting_snapshot(snapshot, cx);
+            let capture_requests = snapbar.resident.capture_requests();
+            snapbar.start_capture_hotkey_sync(capture_requests, window, cx);
+            snapbar.start_meeting_sync(meeting_events, window, cx);
+        }
         snapbar.start_resident_sync(window, cx);
         if let Some(events) = overlay_events {
             snapbar.start_overlay_sync(events, window, cx);
         }
         snapbar
+    }
+
+    fn forward_to_owner(
+        &self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        // Defer so the primary can safely inspect/update this companion window.
+        cx.defer(move |cx| {
+            let _ = owner.update(cx, action);
+        });
+        true
+    }
+
+    fn sync_companion(&mut self, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner else {
+            return;
+        };
+        let Ok(source) = owner.read(cx) else {
+            return;
+        };
+        let show = demo_caption_visible(
+            source.capture_mode,
+            source.local_share_active,
+            source.presenter_toolbar_id,
+            source.quitting,
+        );
+        self.targets = if show {
+            source.targets.clone()
+        } else {
+            Vec::new()
+        };
+        self.selected_target = source.selected_target;
+        self.settings = source.settings;
+        self.capture_engine = source.capture_engine.clone();
+        self.capture_state = source.capture_state;
+        self.last_error = source.last_error.clone();
+        self.demo_mode_error = source.demo_mode_error;
+        if self.capture_mode != source.capture_mode {
+            self.capture_mode = source.capture_mode;
+            if let Some(follower) = self.follower.as_mut() {
+                follower.set_capture_mode(self.capture_mode);
+            }
+        }
+        self.sync_follower();
+        self.sync_overlay_state();
+        cx.notify();
     }
 
     fn current_target(&self) -> Option<&CaptureTarget> {
@@ -734,6 +818,9 @@ impl Snapbar {
             if self.control_hover.current == Some(ExpandedControl::Save) {
                 self.start_save_info_dwell(cx);
             }
+            if self.control_hover.current == Some(ExpandedControl::Quit) {
+                self.start_demo_mode_dwell(cx);
+            }
             if let Some(control) = self.control_hover.pending_hint() {
                 // This owned task changes text only. Native disclosure remains
                 // the sole authority for the visible surface and input region.
@@ -759,6 +846,70 @@ impl Snapbar {
             }
             cx.notify();
         }
+    }
+
+    fn start_demo_mode_dwell(&mut self, cx: &mut Context<Self>) {
+        // An owned content-only dwell; native disclosure still owns visibility.
+        self.save_info_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            let _ = this.update(cx, |this, cx| {
+                let ready = this
+                    .follower
+                    .as_ref()
+                    .is_some_and(|f| f.is_visible() && f.is_expanded() && !f.is_compact());
+                if ready
+                    && this.expanded
+                    && !this.quitting
+                    && this.island_page == IslandPage::Controls
+                    && this.control_hover.current == Some(ExpandedControl::Quit)
+                {
+                    this.island_page = IslandPage::DemoSettings;
+                    this.demo_mode_error = false;
+                    this.reset_control_hover();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn on_demo_toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_demo_mode(cx);
+    }
+
+    fn toggle_demo_mode(&mut self, cx: &mut Context<Self>) {
+        if self.forward_to_owner(cx, |source, _, cx| source.toggle_demo_mode(cx)) {
+            return;
+        }
+        // A capture guard must restore the same mode it acquired.
+        if self.capture_requests.active.is_some() || self.quitting {
+            return;
+        }
+        let mode = if self.capture_mode == OverlayCaptureMode::Recordable {
+            OverlayCaptureMode::Excluded
+        } else {
+            OverlayCaptureMode::Recordable
+        };
+        self.demo_mode_error = !self
+            .follower
+            .as_mut()
+            .is_some_and(|f| f.set_capture_mode(mode));
+        if !self.demo_mode_error {
+            self.capture_mode = mode;
+            if let Some(companion) = self.companion {
+                let _ = companion.update(cx, |other, _, cx| {
+                    if let Some(follower) = other.follower.as_mut() {
+                        follower.set_capture_mode(mode);
+                        if mode == OverlayCaptureMode::Excluded {
+                            follower.set_target(None);
+                        }
+                    }
+                    other.capture_mode = mode;
+                    cx.notify();
+                });
+            }
+            crate::diagnostics::log(format_args!("demo mode={mode:?}"));
+        }
+        cx.notify();
     }
 
     fn start_save_info_dwell(&mut self, cx: &mut Context<Self>) {
@@ -900,6 +1051,10 @@ impl Snapbar {
     }
 
     fn sync_resident_state(&mut self, cx: &mut Context<Self>) {
+        if self.owner.is_some() {
+            self.sync_companion(cx);
+            return;
+        }
         if self.resident.quit_requested() {
             self.begin_quit(cx);
             return;
@@ -1146,11 +1301,21 @@ impl Snapbar {
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.forward_to_owner(cx, |source, _, cx| source.request_redetection(cx)) {
+            return;
+        }
         self.request_redetection(cx);
         cx.notify();
     }
 
     fn on_save_toggle_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_save(cx);
+    }
+
+    fn toggle_save(&mut self, cx: &mut Context<Self>) {
+        if self.forward_to_owner(cx, |source, _, cx| source.toggle_save(cx)) {
+            return;
+        }
         let next = AppSettings {
             save_to_screenshots: !self.settings.save_to_screenshots,
         };
@@ -1175,6 +1340,9 @@ impl Snapbar {
     }
 
     fn begin_quit(&mut self, cx: &mut Context<Self>) {
+        if self.forward_to_owner(cx, |source, _, cx| source.begin_quit(cx)) {
+            return;
+        }
         if self.quitting {
             return;
         }
@@ -1247,6 +1415,11 @@ impl Snapbar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_to_owner(cx, move |source, window, cx| {
+            source.start_capture_at(received_at, input_source, window, cx);
+        }) {
+            return;
+        }
         if self.quitting || self.capture_requests.queue_if_active() {
             return;
         }
@@ -1292,6 +1465,23 @@ impl Snapbar {
         } else {
             None
         };
+
+        let mut overlay_exclusion: Vec<_> = overlay_exclusion.into_iter().collect();
+        if local_monitor_capture && let Some(companion) = self.companion {
+            let other = companion
+                .read(cx)
+                .ok()
+                .and_then(|view| view.follower.as_ref());
+            if let Some(other) = other.filter(|f| f.is_visible()) {
+                let Some(exclusion) = other.exclude_overlay_from_capture() else {
+                    self.last_error = Some("デモUIを撮影から除外できませんでした".into());
+                    self.capture_state = CaptureState::Error;
+                    cx.notify();
+                    return;
+                };
+                overlay_exclusion.push(exclusion);
+            }
+        }
 
         self.capture_generation = self.capture_generation.wrapping_add(1);
         let generation = self.capture_generation;
@@ -1906,6 +2096,79 @@ impl Render for Snapbar {
                             .child("キャンセル"),
                     ),
             );
+        let demo_settings = (self.island_page == IslandPage::DemoSettings).then(|| {
+            let enabled = self.capture_mode == OverlayCaptureMode::Recordable;
+            let busy = self.capture_requests.active.is_some()
+                || matches!(self.capture_state, CaptureState::Capturing);
+            div()
+                .absolute()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(EXPANDED_WIDTH))
+                .h(px(presentation_height))
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(120.0))
+                        .items_center()
+                        .text_center()
+                        .text_color(primary_text)
+                        .text_size(px(11.0))
+                        .line_height(px(13.0))
+                        .child("デモモード")
+                        .child(div().text_size(px(9.0)).child(if self.demo_mode_error {
+                            "切り替えに失敗しました"
+                        } else if enabled {
+                            "画面共有に表示する"
+                        } else {
+                            "画面共有に表示しない"
+                        })),
+                )
+                .child(
+                    div()
+                        .id("demo-mode-toggle")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(46.0))
+                        .h(px(28.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(if enabled {
+                            0x277a46
+                        } else {
+                            palette.control_hover
+                        }))
+                        .text_color(primary_text)
+                        .text_size(px(11.0))
+                        .cursor_pointer()
+                        .opacity(if busy { 0.5 } else { 1.0 })
+                        .on_click(cx.listener(Self::on_demo_toggle))
+                        .child(if busy {
+                            "撮影中"
+                        } else if enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }),
+                )
+                .child(
+                    div()
+                        .id("demo-mode-back")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(40.0))
+                        .h(px(28.0))
+                        .text_size(px(10.0))
+                        .text_color(primary_text)
+                        .cursor_pointer()
+                        .on_click(cx.listener(Self::on_save_info_back_clicked))
+                        .child("戻る"),
+                )
+        });
         let save_info = showing_save_info.then(|| {
             let save_path = match &self.save_info_path {
                 Some(Ok(path)) => path.clone(),
@@ -2156,6 +2419,11 @@ impl Render for Snapbar {
                                 content.top(px(morph.center_y - presentation_height / 2.0))
                             }))
                         })
+                        .when_some(demo_settings, |surface, content| {
+                            surface.child(content.when(caption_morph, |content| {
+                                content.top(px(morph.center_y - presentation_height / 2.0))
+                            }))
+                        })
                         .when_some(save_info, |surface, content| surface.child(content))
                         .when(
                             showing_controls && !caption_morph && content_progress < 0.72,
@@ -2286,26 +2554,33 @@ pub fn run() {
     let capture_mode = OverlayCaptureMode::from_command_line();
     application().with_assets(Assets).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
-                focus: false,
-                // This popup intentionally never activates. GPUI otherwise throttles
-                // inactive windows to 33.3 ms frames, which makes hover disclosure
-                // render at roughly 30 fps even on a high-refresh-rate display.
-                inactive_frame_interval: None,
-                kind: WindowKind::PopUp,
-                is_movable: false,
-                is_resizable: false,
-                is_minimizable: false,
-                window_background: WindowBackgroundAppearance::Transparent,
-                window_decorations: Some(WindowDecorations::Client),
-                ..Default::default()
-            },
-            move |window, cx| cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode)),
-        )
-        .expect("Snapbar window could not be created");
+        let options = || WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            focus: false,
+            // This popup intentionally never activates. GPUI otherwise throttles
+            // inactive windows to 33.3 ms frames, which makes hover disclosure
+            // render at roughly 30 fps even on a high-refresh-rate display.
+            inactive_frame_interval: None,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            window_decorations: Some(WindowDecorations::Client),
+            ..Default::default()
+        };
+        let primary = cx
+            .open_window(options(), move |window, cx| {
+                cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode, None))
+            })
+            .expect("Snapbar window could not be created");
+        let companion = cx
+            .open_window(options(), move |window, cx| {
+                cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode, Some(primary)))
+            })
+            .expect("Snapbar demo window could not be created");
+        let _ = primary.update(cx, |source, _, _| source.companion = Some(companion));
 
         cx.activate(true);
     });
@@ -2314,6 +2589,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_is_only_visible_during_demo_self_sharing() {
+        use OverlayCaptureMode::{Excluded, Recordable};
+        let cases = [
+            (Recordable, true, Some(7), false, true),
+            (Excluded, true, Some(7), false, false),
+            (Recordable, false, Some(7), false, false),
+            (Recordable, true, None, false, false),
+            (Recordable, true, Some(7), true, false),
+        ];
+        for (mode, sharing, presenter, quitting, expected) in cases {
+            assert_eq!(
+                demo_caption_visible(mode, sharing, presenter, quitting),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn demo_page_cannot_confirm_exit() {
+        let mut page = IslandPage::DemoSettings;
+        assert!(!page.handle_quit(QuitAction::Confirm));
+        assert_eq!(page, IslandPage::Controls);
+    }
 
     #[test]
     fn ready_engine_does_not_display_stale_waiting_state() {
