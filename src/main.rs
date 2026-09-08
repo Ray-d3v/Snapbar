@@ -8,7 +8,11 @@ mod app;
 #[cfg(target_os = "windows")]
 mod assets;
 #[cfg(target_os = "windows")]
+mod automation;
+#[cfg(target_os = "windows")]
 mod capture;
+#[cfg(target_os = "windows")]
+mod diagnostics;
 #[cfg(target_os = "windows")]
 mod meeting;
 #[cfg(target_os = "windows")]

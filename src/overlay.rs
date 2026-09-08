@@ -532,6 +532,7 @@ impl HoverSubclassState {
 
         if let Some(expanded) = effects.expanded_changed {
             if self.expanded.swap(expanded, Ordering::AcqRel) != expanded {
+                crate::diagnostics::log(format_args!("hover expanded={expanded}"));
                 self.publish();
             }
         }
@@ -694,7 +695,7 @@ fn pointer_is_over(hwnd: HWND) -> bool {
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return false;
     }
-    unsafe { WindowFromPoint(point) == hwnd.0 }
+    point_belongs_to_window(hwnd, point)
 }
 
 fn post_overlay_message(hwnd: HWND, message: u32) {
@@ -1275,17 +1276,19 @@ impl TeamsWindowFollower {
 
                         let visibility_changed = visible_now != previous_visible;
                         let compact_changed = compact_now != previous_compact;
-                        if visibility_changed || compact_changed || anchor_changed {
-                            if !visible_now || compact_now {
-                                thread_expanded.store(false, Ordering::Release);
-                                thread_disclosure_progress.store(0, Ordering::Release);
-                                post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
-                            }
-                            let _ = thread_event_tx.try_send(());
+                        if (visibility_changed || compact_changed || anchor_changed)
+                            && (!visible_now || compact_now)
+                        {
+                            thread_expanded.store(false, Ordering::Release);
+                            thread_disclosure_progress.store(0, Ordering::Release);
+                            post_overlay_message(overlay_hwnd, WM_APP_RESET_DISCLOSURE);
                         }
 
                         let placement_changed = previous_placement != Some(placement);
                         if placement_changed {
+                            crate::diagnostics::log(format_args!(
+                                "overlay placement={placement:?}"
+                            ));
                             apply_placement(overlay_hwnd, placement);
                             if visible_now {
                                 post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
@@ -1361,6 +1364,12 @@ impl TeamsWindowFollower {
                             Some(_) => {}
                             None => previous_region_state = None,
                         }
+                    }
+
+                    if structural_change {
+                        // Publish only after HWND placement and the input region
+                        // have committed, so GPUI redraws the exposed surface.
+                        let _ = thread_event_tx.try_send(());
                     }
 
                     if let Some(sample) = color_sampler

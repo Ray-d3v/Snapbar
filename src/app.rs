@@ -22,14 +22,16 @@ use crate::{
     settings::AppSettings,
 };
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, ClickEvent, Context, FontWeight, SpringAnimation,
-    SpringConfig, Task, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowKind, WindowOptions, canvas, div, prelude::*, px, relative, rgb, rgba, size, svg,
-    transparent_black,
+    Animation, AnimationExt as _, App, Bounds, ClickEvent, Context, FontWeight, MouseButton,
+    MouseDownEvent, SpringAnimation, SpringConfig, Task, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowKind, WindowOptions, canvas, div, prelude::*, px,
+    relative, rgb, rgba, size, svg, transparent_black,
 };
 use gpui_platform::application;
 
 const RESIDENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const READINESS_LOSS_DELAY: Duration = Duration::from_millis(750);
 const SAVE_INFO_HOVER_DELAY: Duration = Duration::from_secs(1);
 const CONTROL_HINT_SWITCH_DELAY: Duration = Duration::from_millis(160);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
@@ -295,7 +297,31 @@ enum CaptureState {
     Error,
 }
 
+#[derive(Default)]
+struct ReadinessDisplay {
+    missing_since: Option<Instant>,
+}
+
+impl ReadinessDisplay {
+    fn waiting(&mut self, ready: bool, now: Instant) -> bool {
+        if ready {
+            self.missing_since = None;
+            return false;
+        }
+        let since = *self.missing_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= READINESS_LOSS_DELAY
+    }
+}
+
 impl CaptureState {
+    fn with_readiness(self, ready: bool) -> Self {
+        if self == Self::WaitingForShare && ready {
+            Self::Idle
+        } else {
+            self
+        }
+    }
+
     fn after_feedback_timeout(self, now: Instant) -> Self {
         match self {
             Self::Copied { until } if now >= until => Self::Idle,
@@ -533,6 +559,10 @@ struct Snapbar {
     targets: Vec<CaptureTarget>,
     selected_target: usize,
     capture_engine: Option<CaptureEngine>,
+    capture_starting: bool,
+    capture_retry_at: Option<Instant>,
+    readiness_display: ReadinessDisplay,
+    remote_minimized: bool,
     capture_authorization: CaptureAuthorization,
     follower: Option<TeamsWindowFollower>,
     meeting_monitor: MeetingMonitor,
@@ -592,6 +622,10 @@ impl Snapbar {
             targets: Vec::new(),
             selected_target: 0,
             capture_engine: None,
+            capture_starting: false,
+            capture_retry_at: None,
+            readiness_display: ReadinessDisplay::default(),
+            remote_minimized: false,
             capture_authorization: CaptureAuthorization::default(),
             follower,
             meeting_monitor,
@@ -637,7 +671,7 @@ impl Snapbar {
         if let Some(target) = self.local_monitor_target.as_ref() {
             return Some(CaptureSource::LocalMonitor(target.clone()));
         }
-        if self.shared_content_hint {
+        if self.shared_content_hint && !self.remote_minimized {
             self.current_target()
                 .map(|target| CaptureSource::RemoteTeamsWindow(target.id))
         } else {
@@ -797,15 +831,15 @@ impl Snapbar {
 
     fn start_capture_hotkey_sync(
         &self,
-        capture_requests: async_channel::Receiver<()>,
+        capture_requests: async_channel::Receiver<Instant>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.spawn_in(window, async move |this, cx| {
-            while capture_requests.recv().await.is_ok() {
+            while let Ok(received_at) = capture_requests.recv().await {
                 if this
                     .update_in(cx, |this, window, cx| {
-                        this.start_capture(window, cx);
+                        this.start_capture_at(received_at, "hotkey", window, cx);
                     })
                     .is_err()
                 {
@@ -844,10 +878,14 @@ impl Snapbar {
         cx.spawn_in(window, async move |this, cx| {
             while events.recv().await.is_ok() {
                 if this
-                    .update(cx, |this, cx| {
+                    .update_in(cx, |this, window, cx| {
                         if this.sync_overlay_state() {
                             cx.notify();
                         }
+                        // Native visibility/region changes can expose pixels
+                        // without changing the view's expanded/material state.
+                        // Rebuild the scene after that native geometry commits.
+                        window.refresh();
                     })
                     .is_err()
                 {
@@ -866,7 +904,7 @@ impl Snapbar {
 
         let mut changed = false;
         if self.resident.take_rescan_requested() {
-            self.request_redetection();
+            self.request_redetection(cx);
             changed = true;
         }
 
@@ -877,6 +915,31 @@ impl Snapbar {
         }
 
         changed |= self.sync_overlay_state();
+
+        let now = Instant::now();
+        let ready = self
+            .capture_engine
+            .as_ref()
+            .is_some_and(CaptureEngine::is_ready);
+        let waiting = self.readiness_display.waiting(ready, now);
+        if ready {
+            self.capture_retry_at = Some(now + CAPTURE_RETRY_INTERVAL);
+        }
+
+        // A failed startup or a closed WGC session may never produce another
+        // meeting-generation change. Retry on the existing resident tick.
+        if !self.quitting
+            && !self.capture_starting
+            && self.capture_requests.active.is_none()
+            && self.current_capture_source().is_some()
+            && !ready
+            && self
+                .capture_retry_at
+                .is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            self.restart_capture_engine(cx);
+            changed = true;
+        }
 
         let previous_state = self.capture_state;
         // Reuse the existing resident tick; capture feedback needs no animation
@@ -892,7 +955,7 @@ impl Snapbar {
                     self.last_error = None;
                 }
             }
-            Some(_) if self.capture_state != CaptureState::Capturing => {
+            Some(_) if self.capture_state != CaptureState::Capturing && waiting => {
                 self.capture_state = CaptureState::WaitingForShare;
             }
             Some(_) => {}
@@ -905,6 +968,12 @@ impl Snapbar {
             None => {}
         }
         changed |= previous_state != self.capture_state;
+        if previous_state != self.capture_state {
+            crate::diagnostics::log(format_args!(
+                "capture state {:?} -> {:?}",
+                previous_state, self.capture_state
+            ));
+        }
 
         if changed {
             cx.notify();
@@ -919,6 +988,7 @@ impl Snapbar {
         let previous_presenter_toolbar_id = self.presenter_toolbar_id;
         self.presenter_toolbar_id = snapshot.presenter_toolbar_id;
         self.shared_content_hint = snapshot.shared_content_hint;
+        self.remote_minimized = snapshot.minimized;
         self.local_share_active = snapshot.local_share_active;
         self.local_monitor_target = snapshot.local_monitor_target;
 
@@ -944,9 +1014,10 @@ impl Snapbar {
 
         let next_source = self.current_capture_source();
         if next_source.is_some()
-            && (previous_source != next_source || self.capture_engine.is_none())
+            && (previous_source != next_source
+                || (self.capture_engine.is_none() && !self.capture_starting))
         {
-            self.restart_capture_engine();
+            self.restart_capture_engine(cx);
         } else if next_source.is_none() {
             self.capture_generation = self.capture_generation.wrapping_add(1);
             self.capture_requests.clear_pending();
@@ -970,13 +1041,14 @@ impl Snapbar {
         // Serialize revocation with the actual clipboard/file write boundary.
         // A worker retaining an Arc must neither publish nor keep WGC alive.
         self.capture_authorization.invalidate();
+        self.readiness_display = ReadinessDisplay::default();
         if let Some(engine) = self.capture_engine.take() {
             engine.stop();
         }
         self.capture_authorization = CaptureAuthorization::default();
     }
 
-    fn restart_capture_engine(&mut self) {
+    fn restart_capture_engine(&mut self, cx: &mut Context<Self>) {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.capture_requests.clear_pending();
         self.invalidate_capture();
@@ -991,23 +1063,61 @@ impl Snapbar {
             return;
         };
 
-        match CaptureEngine::start_source(source) {
-            Ok(engine) => {
-                self.capture_engine = Some(engine);
-                self.capture_state = CaptureState::WaitingForShare;
-                self.last_error = None;
-            }
-            Err(error) => {
-                self.capture_state = CaptureState::Error;
-                self.last_error = Some(error.to_string());
-            }
+        self.capture_state = CaptureState::WaitingForShare;
+        self.last_error = None;
+        // Only one startup may be outstanding. Its completion will launch the
+        // latest source if meeting/share evidence changed while it was blocked.
+        if self.capture_starting {
+            return;
         }
+        self.capture_starting = true;
+        let generation = self.capture_generation;
+        let authorization = self.capture_authorization.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { CaptureEngine::start_authorized(source, &authorization) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.capture_starting = false;
+                if this.quitting || this.capture_generation != generation {
+                    if let Ok(engine) = result {
+                        engine.stop();
+                    }
+                    if !this.quitting && this.current_capture_source().is_some() {
+                        this.restart_capture_engine(cx);
+                    }
+                    return;
+                }
+                this.capture_retry_at = Some(Instant::now() + CAPTURE_RETRY_INTERVAL);
+                match result {
+                    Ok(engine) => {
+                        crate::diagnostics::log(format_args!(
+                            "capture engine started generation={generation}"
+                        ));
+                        this.capture_state =
+                            CaptureState::WaitingForShare.with_readiness(engine.is_ready());
+                        this.capture_engine = Some(engine);
+                        this.last_error = None;
+                    }
+                    Err(error) => {
+                        crate::diagnostics::log(format_args!(
+                            "capture engine start failed: {error:#}"
+                        ));
+                        this.capture_state = CaptureState::Error;
+                        this.last_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    fn request_redetection(&mut self) {
+    fn request_redetection(&mut self, cx: &mut Context<Self>) {
         self.meeting_monitor.request_scan();
         if self.current_capture_source().is_some() {
-            self.restart_capture_engine();
+            self.restart_capture_engine(cx);
         }
     }
 
@@ -1033,7 +1143,7 @@ impl Snapbar {
     }
 
     fn on_refresh_clicked(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.request_redetection();
+        self.request_redetection(cx);
         cx.notify();
     }
 
@@ -1101,11 +1211,39 @@ impl Snapbar {
         }
     }
 
-    fn on_capture_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_capture(window, cx);
+    fn on_capture_pressed(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_capture_at(Instant::now(), "pointer-down", window, cx);
+    }
+
+    fn on_capture_clicked(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Mouse capture already started on press. Keep keyboard/accessibility
+        // activation without taking a second image on mouse release.
+        if !matches!(event, ClickEvent::Mouse(_)) {
+            self.start_capture_at(Instant::now(), "keyboard-click", window, cx);
+        }
     }
 
     fn start_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_capture_at(Instant::now(), "queued", window, cx);
+    }
+
+    fn start_capture_at(
+        &mut self,
+        received_at: Instant,
+        input_source: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.quitting || self.capture_requests.queue_if_active() {
             return;
         }
@@ -1120,12 +1258,6 @@ impl Snapbar {
             cx.notify();
             return;
         };
-        if !engine.is_ready() {
-            self.capture_state = CaptureState::WaitingForShare;
-            self.last_error = Some("共有コンテンツを待機中です".to_string());
-            cx.notify();
-            return;
-        }
 
         let local_monitor_capture = engine.is_local_monitor();
         let overlay_exclusion = if local_monitor_capture {
@@ -1173,6 +1305,12 @@ impl Snapbar {
                 let outcome = engine.copy_latest_to_clipboard(&authorization, save_to_screenshots);
                 replacement = outcome.replacement;
                 let receipt = outcome.result?;
+                crate::diagnostics::log(format_args!(
+                    "capture input={} input_to_output_ms={} engine_ms={}",
+                    input_source,
+                    received_at.elapsed().as_millis(),
+                    receipt.latency.as_millis()
+                ));
                 drop(overlay_exclusion);
                 drop(flash_suspension);
                 let save_result = outcome.save_result;
@@ -1197,6 +1335,11 @@ impl Snapbar {
                 }
                 match result {
                     Ok((receipt, save_result)) => {
+                        crate::diagnostics::log(format_args!(
+                            "capture copied latency_ms={} frame_age_ms={}",
+                            receipt.latency.as_millis(),
+                            receipt.frame_age.as_millis()
+                        ));
                         if !capture_again {
                             show_capture_flash(
                                 receipt.screen_rect,
@@ -1217,6 +1360,7 @@ impl Snapbar {
                         }
                     }
                     Err(error) => {
+                        crate::diagnostics::log(format_args!("capture output failed: {error:#}"));
                         this.capture_state = CaptureState::Error;
                         this.last_error = Some(error.to_string());
                     }
@@ -1235,7 +1379,7 @@ impl Snapbar {
         if self.last_error.is_some() {
             return "要確認";
         }
-        match self.capture_state {
+        match self.display_capture_state() {
             CaptureState::Idle => "準備完了",
             CaptureState::WaitingForShare => "共有待ち",
             CaptureState::Capturing => "撮影中",
@@ -1248,7 +1392,8 @@ impl Snapbar {
     fn status_color(&self, light_surface: bool) -> u32 {
         match (
             light_surface,
-            self.capture_state.with_error(self.last_error.is_some()),
+            self.display_capture_state()
+                .with_error(self.last_error.is_some()),
         ) {
             (true, CaptureState::Idle | CaptureState::Copied { .. }) => 0x277a46,
             (true, CaptureState::Capturing) => 0xc7363f,
@@ -1260,6 +1405,14 @@ impl Snapbar {
             (false, CaptureState::Error) => 0xf07178,
         }
     }
+
+    fn display_capture_state(&self) -> CaptureState {
+        self.capture_state.with_readiness(
+            self.capture_engine
+                .as_ref()
+                .is_some_and(CaptureEngine::is_ready),
+        )
+    }
 }
 
 impl Render for Snapbar {
@@ -1267,7 +1420,7 @@ impl Render for Snapbar {
         let can_capture = self
             .capture_engine
             .as_ref()
-            .is_some_and(CaptureEngine::is_ready)
+            .is_some_and(|engine| !engine.is_finished())
             && !self.quitting;
         let presentation = self.presentation;
         let presenter_attached = self.presenter_toolbar_id.is_some();
@@ -1294,7 +1447,9 @@ impl Render for Snapbar {
             0.0
         };
         let save_to_screenshots = self.settings.save_to_screenshots;
-        let feedback_state = self.capture_state.with_error(self.last_error.is_some());
+        let feedback_state = self
+            .display_capture_state()
+            .with_error(self.last_error.is_some());
         let capture_icon_path = feedback_state.icon_path();
         let control_hint = self
             .control_hover
@@ -1358,7 +1513,9 @@ impl Render for Snapbar {
                     .cursor_pointer()
                     .active(move |button| button.bg(idle_active_backplate))
                     .when(can_capture, |button| {
-                        button.on_click(cx.listener(Self::on_capture_clicked))
+                        button
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_capture_pressed))
+                            .on_click(cx.listener(Self::on_capture_clicked))
                     })
                     .child(idle_camera_icon()),
             );
@@ -1483,6 +1640,7 @@ impl Render for Snapbar {
                         button.hover(|button| button.opacity(0.91))
                     })
                     .active(|button| button.opacity(0.68))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_capture_pressed))
                     .on_click(cx.listener(Self::on_capture_clicked))
             })
             .when(!can_capture && !caption_morph, |button| {
@@ -2145,6 +2303,44 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_engine_does_not_display_stale_waiting_state() {
+        assert_eq!(
+            CaptureState::WaitingForShare.with_readiness(true),
+            CaptureState::Idle
+        );
+        assert_eq!(
+            CaptureState::WaitingForShare.with_readiness(false),
+            CaptureState::WaitingForShare
+        );
+        for state in [
+            CaptureState::NoTarget,
+            CaptureState::Error,
+            CaptureState::Capturing,
+        ] {
+            assert_eq!(state.with_readiness(true), state);
+        }
+        assert_eq!(
+            CaptureState::WaitingForShare
+                .with_readiness(true)
+                .with_error(true),
+            CaptureState::Error
+        );
+    }
+
+    #[test]
+    fn readiness_display_ignores_brief_loss_but_reports_sustained_loss() {
+        let now = Instant::now();
+        let mut display = ReadinessDisplay::default();
+        assert!(!display.waiting(true, now));
+        assert!(!display.waiting(false, now));
+        assert!(!display.waiting(false, now + Duration::from_millis(250)));
+        assert!(!display.waiting(true, now + Duration::from_millis(500)));
+        assert!(!display.waiting(false, now + Duration::from_secs(1)));
+        assert!(display.waiting(false, now + Duration::from_secs(1) + READINESS_LOSS_DELAY));
+        assert!(!display.waiting(true, now + Duration::from_secs(2)));
+    }
 
     #[test]
     fn busy_capture_coalesces_click_and_hotkey_bursts_into_one_followup() {

@@ -1,9 +1,15 @@
 use std::{thread, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
-use uiautomation::types::{ControlType, Handle, Point, Rect as UiRect, TreeScope};
+use uiautomation::types::{
+    ControlType, ElementMode, Handle, Point, Rect as UiRect, TreeScope, UIProperty,
+};
 use uiautomation::{UIAutomation, UIElement};
-use xcap::Window;
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+    UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible},
+};
 
 use super::{ScreenRect, content_detector::PixelRect};
 
@@ -22,29 +28,49 @@ pub(super) struct WindowGeometry {
 }
 
 impl WindowGeometry {
-    pub(super) fn from_window_dimensions(
-        window: &Window,
+    pub(super) fn from_target_dimensions(
+        target_id: u32,
         image_width: u32,
         image_height: u32,
     ) -> Result<Self> {
-        let screen_width = window
-            .width()
-            .context("Teamsウィンドウの幅を取得できませんでした")?;
-        let screen_height = window
-            .height()
-            .context("Teamsウィンドウの高さを取得できませんでした")?;
+        let hwnd = HWND(target_id as usize as *mut std::ffi::c_void);
+        if !unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() }
+            || unsafe { IsIconic(hwnd).as_bool() }
+        {
+            return Err(anyhow!("撮影対象のTeamsウィンドウを表示してください"));
+        }
+        let mut cloaked = 0_u32;
+        let mut bounds = RECT::default();
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                size_of::<u32>() as u32,
+            )?;
+            // Read all four edges atomically from the known HWND. Enumerating
+            // every desktop window and reading each coordinate separately can
+            // fail on unrelated window changes and mixes different instants.
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut bounds as *mut RECT).cast(),
+                size_of::<RECT>() as u32,
+            )?;
+        }
+        if cloaked != 0 {
+            return Err(anyhow!("撮影対象のTeamsウィンドウは非表示です"));
+        }
+        let screen_width = u32::try_from(i64::from(bounds.right) - i64::from(bounds.left))?;
+        let screen_height = u32::try_from(i64::from(bounds.bottom) - i64::from(bounds.top))?;
         if screen_width == 0 || screen_height == 0 || image_width == 0 || image_height == 0 {
             return Err(anyhow!("Teamsウィンドウのサイズが不正です"));
         }
 
         Ok(Self::from_screen_rect(
             ScreenRect {
-                x: window
-                    .x()
-                    .context("TeamsウィンドウのX座標を取得できませんでした")?,
-                y: window
-                    .y()
-                    .context("TeamsウィンドウのY座標を取得できませんでした")?,
+                x: bounds.left,
+                y: bounds.top,
                 width: screen_width,
                 height: screen_height,
             },
@@ -190,12 +216,18 @@ struct AuthoritativeCandidate {
 pub(super) fn detect_content_rect(
     target_id: u32,
     geometry: WindowGeometry,
+    previous: Option<PixelRect>,
 ) -> Result<Option<PixelRect>> {
-    let automation = UIAutomation::new()
-        .or_else(|_| UIAutomation::new_direct())
-        .context("Windows UI Automationを初期化できませんでした")?;
+    let started = std::time::Instant::now();
+    let automation = crate::automation::AutomationClient::new()?;
+    let initialized = started.elapsed();
 
     let mut first = scan_authoritative_rect(&automation, target_id, geometry)?;
+    crate::diagnostics::log(format_args!(
+        "uia phases initialize_ms={} scan_ms={}",
+        initialized.as_millis(),
+        started.elapsed().saturating_sub(initialized).as_millis()
+    ));
     if first.is_none() {
         let _ = automation.element_from_point(geometry.sample_point(0.50, 0.55));
         thread::sleep(PROVIDER_WARMUP_DELAY);
@@ -206,8 +238,25 @@ pub(super) fn detect_content_rect(
         return Ok(None);
     };
 
-    thread::sleep(STABILITY_DELAY);
-    let Some(second) = scan_authoritative_rect(&automation, target_id, geometry)? else {
+    confirm_stable_rect(first, previous, || {
+        thread::sleep(STABILITY_DELAY);
+        scan_authoritative_rect(&automation, target_id, geometry)
+    })
+}
+
+fn confirm_stable_rect(
+    first: PixelRect,
+    previous: Option<PixelRect>,
+    rescan: impl FnOnce() -> Result<Option<PixelRect>>,
+) -> Result<Option<PixelRect>> {
+    // A previously stable rectangle plus a fresh identical observation is
+    // already two observations. The caller only supplies previous when the
+    // full screen/capture geometry matches; changed layouts still settle twice.
+    if previous == Some(first) {
+        return Ok(Some(first));
+    }
+
+    let Some(second) = rescan()? else {
         return Ok(None);
     };
 
@@ -225,8 +274,55 @@ fn scan_authoritative_rect(
     let condition = automation
         .create_true_condition()
         .context("UI Automationの検索条件を作成できませんでした")?;
-    let elements = root
-        .find_all(TreeScope::Subtree, &condition)
+    let snapshot = || -> uiautomation::Result<Vec<UIElement>> {
+        let visible =
+            automation.create_property_condition(UIProperty::IsOffscreen, false.into(), None)?;
+        let named = automation.create_not_condition(automation.create_property_condition(
+            UIProperty::Name,
+            "".into(),
+            None,
+        )?)?;
+        let mut types = automation.create_property_condition(
+            UIProperty::ControlType,
+            (ControlType::MenuItem as i32).into(),
+            None,
+        )?;
+        for control in [
+            ControlType::Document,
+            ControlType::Pane,
+            ControlType::Custom,
+            ControlType::Group,
+            ControlType::Image,
+        ] {
+            types = automation.create_or_condition(
+                types,
+                automation.create_property_condition(
+                    UIProperty::ControlType,
+                    (control as i32).into(),
+                    None,
+                )?,
+            )?;
+        }
+        let relevant = automation
+            .create_and_condition(automation.create_and_condition(visible, named)?, types)?;
+        let request = automation.create_cache_request()?;
+        request.set_tree_scope(TreeScope::Element)?;
+        request.set_element_mode(ElementMode::Full)?;
+        request.set_tree_filter(automation.create_true_condition()?)?;
+        for property in [
+            UIProperty::Name,
+            UIProperty::ControlType,
+            UIProperty::IsOffscreen,
+            UIProperty::BoundingRectangle,
+        ] {
+            request.add_property(property)?;
+        }
+        // One current provider snapshot replaces per-property, cross-process
+        // reads for every descendant. Candidate ranking and stability stay exact.
+        root.find_all_build_cache(TreeScope::Subtree, &relevant, &request)
+    };
+    let elements = snapshot()
+        .or_else(|_| root.find_all(TreeScope::Subtree, &condition))
         .context("TeamsのUI Automationツリーを走査できませんでした")?;
 
     let mut candidates = Vec::new();
@@ -244,13 +340,32 @@ fn authoritative_candidate_from_element(
     element: &UIElement,
     geometry: WindowGeometry,
 ) -> Option<AuthoritativeCandidate> {
-    if element.is_offscreen().unwrap_or(true) {
+    if element
+        .is_cached_offscreen()
+        .or_else(|_| element.is_offscreen())
+        .unwrap_or(true)
+    {
         return None;
     }
 
-    let name_rank = authoritative_name_rank(&element.get_name().ok()?)?;
-    let control_rank = authoritative_control_rank(element.get_control_type().ok()?)?;
-    let rect = geometry.map_ui_rect_strict(element.get_bounding_rectangle().ok()?)?;
+    let name_rank = authoritative_name_rank(
+        &element
+            .get_cached_name()
+            .or_else(|_| element.get_name())
+            .ok()?,
+    )?;
+    let control_rank = authoritative_control_rank(
+        element
+            .get_cached_control_type()
+            .or_else(|_| element.get_control_type())
+            .ok()?,
+    )?;
+    let rect = geometry.map_ui_rect_strict(
+        element
+            .get_cached_bounding_rectangle()
+            .or_else(|_| element.get_bounding_rectangle())
+            .ok()?,
+    )?;
     if !is_authoritative_content_rect(rect, geometry) {
         return None;
     }
@@ -379,6 +494,94 @@ mod tests {
         select_unique_authoritative_candidate,
     };
     use crate::capture::{ScreenRect, content_detector::PixelRect};
+
+    #[test]
+    fn unchanged_confirmed_rect_skips_only_the_duplicate_stability_wait() {
+        let rect = PixelRect::new(10, 20, 500, 400);
+        assert_eq!(
+            super::confirm_stable_rect(rect, Some(rect), || {
+                panic!("fresh identical observation needs no duplicate wait")
+            })
+            .unwrap(),
+            Some(rect)
+        );
+    }
+
+    #[test]
+    fn changed_or_unconfirmed_rect_requires_a_second_observation() {
+        let old = PixelRect::new(10, 20, 500, 400);
+        let changed = PixelRect::new(11, 20, 500, 400);
+        for previous in [None, Some(old)] {
+            assert_eq!(
+                super::confirm_stable_rect(changed, previous, || Ok(None)).unwrap(),
+                None
+            );
+            assert_eq!(
+                super::confirm_stable_rect(changed, previous, || Ok(Some(changed))).unwrap(),
+                Some(changed)
+            );
+            assert!(
+                super::confirm_stable_rect(changed, previous, || Err(anyhow::anyhow!(
+                    "provider unavailable"
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "read-only UIA timing probe against currently open Teams windows"]
+    fn live_teams_uia_scan_timings() {
+        use std::time::Instant;
+        use uiautomation::types::{Handle, TreeScope};
+        let automation = crate::automation::AutomationClient::new().unwrap();
+        let mut inspected = 0;
+        for window in xcap::Window::all().unwrap() {
+            if !window
+                .app_name()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("teams")
+            {
+                continue;
+            }
+            let id = window.id().unwrap();
+            let Ok(geometry) = WindowGeometry::from_target_dimensions(
+                id,
+                window.width().unwrap_or_default(),
+                window.height().unwrap_or_default(),
+            ) else {
+                continue;
+            };
+            let root = automation
+                .element_from_handle(Handle::from(id as isize))
+                .unwrap();
+            let condition = automation.create_true_condition().unwrap();
+            let started = Instant::now();
+            let elements = root.find_all(TreeScope::Subtree, &condition).unwrap();
+            let mut candidates = Vec::new();
+            for element in elements {
+                if let Some(candidate) =
+                    super::authoritative_candidate_from_element(&element, geometry)
+                {
+                    super::insert_or_replace_candidate(&mut candidates, candidate);
+                }
+            }
+            let old = super::select_unique_authoritative_candidate(&candidates)
+                .map(|candidate| candidate.rect);
+            let legacy_ms = started.elapsed().as_millis();
+            let started = Instant::now();
+            let current = super::scan_authoritative_rect(&automation, id, geometry).unwrap();
+            eprintln!(
+                "UIA: legacy={legacy_ms}ms bulk={}ms shared={} same={}",
+                started.elapsed().as_millis(),
+                current.is_some(),
+                old == current
+            );
+            inspected += 1;
+        }
+        eprintln!("Inspected {inspected} Teams windows; no capture or clipboard output.");
+    }
 
     #[test]
     fn screen_coordinates_map_across_dpi_and_negative_monitor_origin() {

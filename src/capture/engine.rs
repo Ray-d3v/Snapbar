@@ -26,7 +26,6 @@ use windows_capture::{
     },
     window::Window as CaptureWindow,
 };
-use xcap::Window;
 
 use super::{
     CaptureAuthorization, CaptureReceipt, LocalMonitorCaptureTarget, ScreenRect,
@@ -97,6 +96,12 @@ impl Drop for EngineInner {
 
 impl EngineInner {
     fn stop(&self) {
+        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.has_cached_frame.store(false, Ordering::Release);
+        self.shared
+            .capture_requested
+            .store(false, Ordering::Release);
+        self.shared.ready.notify_all();
         let control = self
             .control
             .lock()
@@ -113,11 +118,35 @@ impl EngineInner {
 
 pub(super) struct SharedState {
     source: CaptureSource,
+    stopped: AtomicBool,
+    preflight_in_progress: AtomicBool,
     capture_requested: AtomicBool,
     observed_sequence: std::sync::atomic::AtomicU64,
     has_cached_frame: AtomicBool,
     state: Mutex<RuntimeState>,
     ready: Condvar,
+}
+
+impl SharedState {
+    fn observe_frame(&self, source_size: (u32, u32), now: Instant) -> Result<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("キャプチャ状態を更新できませんでした"))?;
+        state.source_size = Some(source_size);
+        state.last_frame_interval = state
+            .last_observed_at
+            .map(|last| now.saturating_duration_since(last));
+        state.last_observed_at = Some(now);
+        Ok(self
+            .observed_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1))
+    }
+
+    fn backup_paused(&self, requested: bool) -> bool {
+        !requested && self.preflight_in_progress.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -140,6 +169,10 @@ pub struct CaptureOutcome {
 #[derive(Default)]
 struct RuntimeState {
     latest: Option<CachedFrame>,
+    last_observed_at: Option<Instant>,
+    last_frame_interval: Option<Duration>,
+    source_size: Option<(u32, u32)>,
+    confirmed_layout: Option<RemoteLayout>,
     content_rect: Option<PixelRect>,
     last_error: Option<String>,
     requested_after_sequence: u64,
@@ -169,6 +202,27 @@ struct CaptureRequestGuard {
     shared: Arc<SharedState>,
 }
 
+#[derive(Clone, Copy)]
+struct ArmedRequest {
+    baseline_sequence: u64,
+    requested_at_100ns: i64,
+}
+
+struct PreflightGuard(Arc<SharedState>);
+
+impl PreflightGuard {
+    fn new(shared: Arc<SharedState>) -> Self {
+        shared.preflight_in_progress.store(true, Ordering::Release);
+        Self(shared)
+    }
+}
+
+impl Drop for PreflightGuard {
+    fn drop(&mut self) {
+        self.0.preflight_in_progress.store(false, Ordering::Release);
+    }
+}
+
 impl CaptureRequestGuard {
     fn new(shared: Arc<SharedState>) -> Self {
         Self { shared }
@@ -191,13 +245,47 @@ pub(super) struct FrameHandler {
 }
 
 impl CaptureEngine {
+    pub fn start_authorized(
+        source: CaptureSource,
+        authorization: &CaptureAuthorization,
+    ) -> Result<Self> {
+        Self::start_authorized_with(authorization, || Self::start_source(source))
+    }
+
+    fn start_authorized_with(
+        authorization: &CaptureAuthorization,
+        start: impl FnOnce() -> Result<Self>,
+    ) -> Result<Self> {
+        authorization.with_current(|| Ok(()))?;
+        // WGC startup waits for its native worker. Never hold the output
+        // authorization mutex here: revocation runs on the UI thread.
+        let engine = start()?;
+        if let Err(error) = authorization.with_current(|| Ok(())) {
+            engine.stop();
+            return Err(error);
+        }
+        Ok(engine)
+    }
+
     pub fn start_source(source: CaptureSource) -> Result<Self> {
+        Self::start_source_with_layout(source, None)
+    }
+
+    fn start_source_with_layout(
+        source: CaptureSource,
+        confirmed_layout: Option<RemoteLayout>,
+    ) -> Result<Self> {
         let shared = Arc::new(SharedState {
             source: source.clone(),
+            stopped: AtomicBool::new(false),
+            preflight_in_progress: AtomicBool::new(false),
             capture_requested: AtomicBool::new(false),
             observed_sequence: std::sync::atomic::AtomicU64::new(0),
             has_cached_frame: AtomicBool::new(false),
-            state: Mutex::new(RuntimeState::default()),
+            state: Mutex::new(RuntimeState {
+                confirmed_layout,
+                ..Default::default()
+            }),
             ready: Condvar::new(),
         });
         let control = match source {
@@ -251,7 +339,14 @@ impl CaptureEngine {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.shared.has_cached_frame.load(Ordering::Acquire)
+        self.inner.shared.has_cached_frame.load(Ordering::Acquire) && !self.is_finished()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.inner.shared.stopped.load(Ordering::Acquire)
+            || self.inner.control.lock().map_or(true, |control| {
+                control.as_ref().is_some_and(CaptureControl::is_finished)
+            })
     }
 
     pub fn is_local_monitor(&self) -> bool {
@@ -267,12 +362,15 @@ impl CaptureEngine {
         authorization: &CaptureAuthorization,
         save_to_screenshots: bool,
     ) -> CaptureOutcome {
+        let request_started = Instant::now();
+        let preflight = PreflightGuard::new(Arc::clone(&self.inner.shared));
+        let latest_sequence = self.current_cached_sequence();
         // Bracket the requested frame with matching UIA observations. A UIA
         // read only after FrameArrived could describe a newer layout than the
         // pixels in that frame, even with identical window dimensions.
         let request_evidence = match authorization.with_current(|| Ok(())).and_then(|()| {
             let layout = self.confirm_request_layout()?;
-            Ok((layout, performance_time_100ns()?))
+            Ok(layout)
         }) {
             Ok(evidence) => evidence,
             Err(error) => {
@@ -283,23 +381,134 @@ impl CaptureEngine {
                 };
             }
         };
-        let (request_layout, requested_at_100ns) = request_evidence;
+        let request_layout = request_evidence;
         let mut save_result = None;
-        let mut outcome = self.copy_with_recovery_checked(
+        if let Some(sequence) = latest_sequence {
+            match self.copy_current_validated(sequence, request_layout, |width, height, bytes| {
+                save_result =
+                    output_capture(authorization, width, height, bytes, save_to_screenshots)?;
+                Ok(())
+            }) {
+                Ok(Some(mut receipt)) => {
+                    receipt.latency = request_started.elapsed();
+                    crate::diagnostics::log(format_args!("capture latest-frame fast path"));
+                    return CaptureOutcome {
+                        result: Ok(receipt),
+                        replacement: None,
+                        save_result,
+                    };
+                }
+                Err(error) => {
+                    return CaptureOutcome {
+                        result: Err(error),
+                        replacement: None,
+                        save_result,
+                    };
+                }
+                Ok(None) => {}
+            }
+        }
+        let request = match self.arm_request(None) {
+            Ok(request) => request,
+            Err(error) => {
+                return CaptureOutcome {
+                    result: Err(error),
+                    replacement: None,
+                    save_result,
+                };
+            }
+        };
+        drop(preflight);
+        let mut outcome = self.copy_with_recovery_armed(
             |width, height, bytes| {
                 save_result =
                     output_capture(authorization, width, height, bytes, save_to_screenshots)?;
                 Ok(())
             },
-            |source| authorization.with_current(|| Self::start_source(source)),
+            |source| {
+                Self::start_authorized_with(authorization, || {
+                    Self::start_source_with_layout(source, request_layout)
+                })
+            },
             |cached| {
                 authorization.with_current(|| Ok(()))?;
-                require_frame_after_request(cached.rendered_at_100ns, requested_at_100ns)?;
+                require_frame_after_request(cached.rendered_at_100ns, request.requested_at_100ns)?;
                 self.validate_cached_layout(cached, request_layout)
             },
+            Some(request),
         );
         outcome.save_result = save_result;
+        if let Ok(receipt) = outcome.result.as_mut() {
+            // Include preflight and any recovery wait/startup, not just the
+            // final successful attempt, in user-visible diagnostic latency.
+            receipt.latency = request_started.elapsed();
+        }
         outcome
+    }
+
+    // Snapshot only metadata. In particular, never hold the frame-state lock
+    // across UIA preflight: FrameArrived must be able to invalidate this snapshot.
+    fn current_cached_sequence(&self) -> Option<u64> {
+        if self.inner.shared.source.is_local_monitor() {
+            return None;
+        }
+        let state = self.inner.shared.state.lock().ok()?;
+        let cached = state.latest.as_ref()?;
+        (cached.sequence == self.inner.shared.observed_sequence.load(Ordering::Acquire))
+            .then_some(cached.sequence)
+    }
+
+    fn copy_current_validated(
+        &self,
+        sequence: u64,
+        current_layout: Option<RemoteLayout>,
+        mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+    ) -> Result<Option<CaptureReceipt>> {
+        if self.inner.shared.source.is_local_monitor() || current_layout.is_none() {
+            return Ok(None);
+        }
+        if self.inner.shared.stopped.load(Ordering::Acquire) {
+            return Err(anyhow!("キャプチャは停止しています"));
+        }
+        if self
+            .inner
+            .control
+            .lock()
+            .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?
+            .as_ref()
+            .is_some_and(CaptureControl::is_finished)
+        {
+            return Ok(None);
+        }
+        let state = self
+            .inner
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
+        let Some(cached) = state.latest.as_ref() else {
+            return Ok(None);
+        };
+        if cached.sequence != sequence
+            || self.inner.shared.observed_sequence.load(Ordering::Acquire) != sequence
+            || cached.remote_layout != current_layout
+            || state.source_size != Some((cached.source_width, cached.source_height))
+        {
+            return Ok(None);
+        }
+        self.inner.shared.source.validate_remote_target()?;
+        if self.inner.shared.stopped.load(Ordering::Acquire) {
+            return Err(anyhow!("キャプチャは停止しています"));
+        }
+        // output_capture checks authorization at the clipboard write boundary.
+        // No image allocation: retain the single cropped buffer under this lock.
+        copy(cached.width, cached.height, &cached.bytes)?;
+        Ok(Some(CaptureReceipt {
+            screen_rect: cached.fallback_screen_rect,
+            target_window_id: self.inner.shared.source.remote_target_id(),
+            latency: Duration::ZERO,
+            frame_age: cached.captured_at.elapsed(),
+        }))
     }
 
     fn confirm_request_layout(&self) -> Result<Option<RemoteLayout>> {
@@ -307,20 +516,22 @@ impl CaptureEngine {
         let Some(target_id) = self.inner.shared.source.remote_target_id() else {
             return Ok(None);
         };
-        let (width, height) = {
+        let (width, height, previous) = {
             let state = self
                 .inner
                 .shared
                 .state
                 .lock()
                 .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
-            let cached = state
+            let (width, height) = state
                 .latest
                 .as_ref()
+                .map(|cached| (cached.source_width, cached.source_height))
+                .or(state.source_size)
                 .ok_or_else(|| anyhow!("共有コンテンツを準備中です"))?;
-            (cached.source_width, cached.source_height)
+            (width, height, state.confirmed_layout)
         };
-        detect_remote_layout(target_id, width, height).map(Some)
+        detect_remote_layout(target_id, width, height, previous, "preflight").map(Some)
     }
 
     fn validate_cached_layout(
@@ -331,18 +542,25 @@ impl CaptureEngine {
         let Some(target_id) = self.inner.shared.source.remote_target_id() else {
             return Ok(());
         };
-        let current = detect_remote_layout(target_id, cached.source_width, cached.source_height)?;
+        let current = detect_remote_layout(
+            target_id,
+            cached.source_width,
+            cached.source_height,
+            cached.remote_layout,
+            "output",
+        )?;
         require_matching_layout(request_layout, current)?;
         require_matching_layout(cached.remote_layout, current)
     }
 
-    fn copy_with_recovery_checked(
+    fn copy_with_recovery_armed(
         &self,
         mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
         restart: impl FnOnce(CaptureSource) -> Result<CaptureEngine>,
         mut validate: impl FnMut(&CachedFrame) -> Result<()>,
+        request: Option<ArmedRequest>,
     ) -> CaptureOutcome {
-        let first = self.copy_latest_since_checked(&mut copy, None, &mut validate);
+        let first = self.copy_latest_armed(&mut copy, None, &mut validate, request);
         if first
             .as_ref()
             .err()
@@ -364,6 +582,10 @@ impl CaptureEngine {
                 save_result: None,
             };
         }
+        // The old session cannot satisfy this request. Retire it before
+        // starting its replacement, so backup UIA/crops do not compete with
+        // the new session while the UI still retains the old engine handle.
+        self.stop();
         let new_engine = match restart(source) {
             Ok(engine) => engine,
             Err(error) => {
@@ -374,7 +596,7 @@ impl CaptureEngine {
                 };
             }
         };
-        let result = new_engine.copy_latest_since_checked(copy, Some(0), validate);
+        let result = new_engine.copy_latest_armed(copy, Some(0), validate, None);
         CaptureOutcome {
             result,
             replacement: Some(new_engine),
@@ -382,13 +604,41 @@ impl CaptureEngine {
         }
     }
 
-    fn copy_latest_since_checked(
+    fn arm_request(&self, baseline_override: Option<u64>) -> Result<ArmedRequest> {
+        let mut state = self
+            .inner
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
+        let baseline_sequence = baseline_override
+            .unwrap_or_else(|| self.inner.shared.observed_sequence.load(Ordering::Acquire));
+        let requested_at_100ns = performance_time_100ns()?;
+        // Frame observation takes this same lock: no post-timestamp frame can
+        // enter the baseline and be discarded as if it preceded the request.
+        state.requested_after_sequence = baseline_sequence;
+        self.inner
+            .shared
+            .capture_requested
+            .store(true, Ordering::Release);
+        Ok(ArmedRequest {
+            baseline_sequence,
+            requested_at_100ns,
+        })
+    }
+
+    fn copy_latest_armed(
         &self,
         mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
         baseline_override: Option<u64>,
         mut validate: impl FnMut(&CachedFrame) -> Result<()>,
+        request: Option<ArmedRequest>,
     ) -> Result<CaptureReceipt> {
         let started_at = Instant::now();
+        let _request_guard = CaptureRequestGuard::new(Arc::clone(&self.inner.shared));
+        if self.inner.shared.stopped.load(Ordering::Acquire) {
+            return Err(anyhow!("キャプチャは停止しています"));
+        }
         self.inner.shared.source.validate_remote_target()?;
         if self
             .inner
@@ -403,29 +653,28 @@ impl CaptureEngine {
             )));
         }
         let local_monitor = self.inner.shared.source.is_local_monitor();
-        let mut state = self
+        let request = match request {
+            Some(request) => request,
+            None => self.arm_request(baseline_override)?,
+        };
+        let state = self
             .inner
             .shared
             .state
             .lock()
             .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
-        let baseline_sequence = baseline_override
-            .unwrap_or_else(|| self.inner.shared.observed_sequence.load(Ordering::Acquire));
+        let baseline_sequence = request.baseline_sequence;
         let had_frame = state.latest.is_some();
-        state.requested_after_sequence = baseline_sequence;
-        self.inner
-            .shared
-            .capture_requested
-            .store(true, Ordering::Release);
+        let last_observed_at = state.last_observed_at;
+        let last_frame_interval = state.last_frame_interval;
         drop(state);
-        let _request_guard = CaptureRequestGuard::new(Arc::clone(&self.inner.shared));
 
         let timeout = if !had_frame {
             READY_TIMEOUT
         } else if local_monitor {
             LOCAL_FRESH_FRAME_WAIT
         } else {
-            FRESH_FRAME_WAIT
+            remote_frame_wait(last_observed_at, last_frame_interval, started_at)
         };
         let deadline = Instant::now() + timeout;
         let mut state = self
@@ -436,6 +685,9 @@ impl CaptureEngine {
             .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
 
         loop {
+            if self.inner.shared.stopped.load(Ordering::Acquire) {
+                return Err(anyhow!("キャプチャは停止しています"));
+            }
             let has_fresh_frame = state
                 .latest
                 .as_ref()
@@ -492,6 +744,13 @@ impl CaptureEngine {
         // output. A static source recovers through a new WGC session, whose
         // initial frame is acquired after the request's UIA preflight.
         validate(cached)?;
+        crate::diagnostics::log(format_args!(
+            "capture validation complete elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        ));
+        if self.inner.shared.stopped.load(Ordering::Acquire) {
+            return Err(anyhow!("キャプチャは停止しています"));
+        }
         // The window can be minimized or closed while waiting for a new frame.
         // Validate at the write boundary instead of relying on meeting snapshots.
         self.inner.shared.source.validate_remote_target()?;
@@ -542,12 +801,17 @@ impl GraphicsCaptureApiHandler for FrameHandler {
     ) -> std::result::Result<(), Self::Error> {
         let now = Instant::now();
         let source_size = (frame.width(), frame.height());
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let observed_sequence = self
             .shared
-            .observed_sequence
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
+            .observe_frame(source_size, now)
+            .map_err(|error| error.to_string())?;
         let requested = self.shared.capture_requested.load(Ordering::Acquire);
+        if self.shared.backup_paused(requested) {
+            return Ok(());
+        }
         if let CaptureSource::LocalMonitor(target) = self.shared.source.clone() {
             return self.on_local_monitor_frame(frame, now, observed_sequence, requested, target);
         }
@@ -588,6 +852,11 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             Err(error) => {
                 let message = error.to_string();
                 if let Ok(mut state) = self.shared.state.lock() {
+                    if state.latest.is_some() || state.last_error.as_ref() != Some(&message) {
+                        crate::diagnostics::log(format_args!(
+                            "remote frame unavailable: {message}"
+                        ));
+                    }
                     state.latest = None;
                     state.content_rect = None;
                     self.shared.has_cached_frame.store(false, Ordering::Release);
@@ -688,7 +957,14 @@ impl FrameHandler {
             .source
             .remote_target_id()
             .ok_or_else(|| anyhow!("Teams会議ウィンドウの対象がありません"))?;
-        let layout = detect_remote_layout(target_id, source_width, source_height)?;
+        let previous = self
+            .shared
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.confirmed_layout);
+        let layout =
+            detect_remote_layout(target_id, source_width, source_height, previous, "frame")?;
         let screen_rect = layout
             .geometry
             .map_pixel_rect_to_screen(layout.content_rect)
@@ -782,6 +1058,7 @@ impl FrameHandler {
             rendered_at_100ns,
         });
         state.content_rect = Some(content_rect);
+        state.confirmed_layout = remote_layout;
         state.last_error = None;
         // A crop already in flight when the user clicked cannot consume the
         // new request. Keep refreshing until a subsequent frame is cached.
@@ -794,6 +1071,32 @@ impl FrameHandler {
         drop(state);
         self.shared.ready.notify_all();
         Ok(())
+    }
+}
+
+fn remote_frame_wait(
+    last_observed_at: Option<Instant>,
+    last_frame_interval: Option<Duration>,
+    now: Instant,
+) -> Duration {
+    // A low-rate source may have delivered a frame during UIA preflight,
+    // making its last-arrival age small even though the next update is far
+    // away. Avoid spending the entire wait budget before the same recovery.
+    // Cadence only chooses when to restart; it never authorizes cached pixels.
+    if let (Some(last), Some(interval)) = (last_observed_at, last_frame_interval)
+        && interval.saturating_sub(now.saturating_duration_since(last)) > FRESH_FRAME_WAIT
+    {
+        return Duration::ZERO;
+    }
+    // A quiescent WGC source may not emit until its pixels change. If it has
+    // already been silent for the entire frame budget, recover immediately
+    // instead of paying that budget again on every click. This only changes
+    // when recovery starts; output still requires new, timestamp-checked pixels.
+    if last_observed_at.is_some_and(|last| now.saturating_duration_since(last) >= FRESH_FRAME_WAIT)
+    {
+        Duration::ZERO
+    } else {
+        FRESH_FRAME_WAIT
     }
 }
 
@@ -826,14 +1129,24 @@ fn detect_remote_layout(
     target_id: u32,
     source_width: u32,
     source_height: u32,
+    previous: Option<RemoteLayout>,
+    phase: &'static str,
 ) -> Result<RemoteLayout> {
-    let target = find_target_window(target_id)?;
-    let geometry = WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
-    let content_rect = detect_content_rect(target_id, geometry)?.ok_or_else(|| anyhow!(
+    let started = Instant::now();
+    let geometry = WindowGeometry::from_target_dimensions(target_id, source_width, source_height)?;
+    let previous_rect = previous
+        .filter(|layout| layout.geometry == geometry)
+        .map(|layout| layout.content_rect);
+    let content_rect = detect_content_rect(target_id, geometry, previous_rect)?.ok_or_else(|| anyhow!(
         "Teamsの確定UIA共有要素を取得できませんでした。メニューから会議・共有を再検出してください"
     ))?;
+    crate::diagnostics::log(format_args!(
+        "uia layout phase={phase} elapsed_ms={} reused={}",
+        started.elapsed().as_millis(),
+        previous_rect == Some(content_rect)
+    ));
     let current_geometry =
-        WindowGeometry::from_window_dimensions(&target, source_width, source_height)?;
+        WindowGeometry::from_target_dimensions(target_id, source_width, source_height)?;
     if current_geometry != geometry {
         return Err(anyhow!("UIA確認中にTeamsの位置またはサイズが変わりました"));
     }
@@ -852,14 +1165,6 @@ fn require_matching_layout(cached: Option<RemoteLayout>, current: RemoteLayout) 
     Ok(())
 }
 
-fn find_target_window(target_id: u32) -> Result<Window> {
-    Window::all()
-        .context("ウィンドウ一覧を再取得できませんでした")?
-        .into_iter()
-        .find(|window| window.id().ok() == Some(target_id))
-        .ok_or_else(|| anyhow!("選択中のTeamsウィンドウが見つかりません"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +1177,24 @@ mod tests {
     };
 
     impl CaptureEngine {
+        fn copy_latest_since_checked(
+            &self,
+            copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+            baseline: Option<u64>,
+            validate: impl FnMut(&CachedFrame) -> Result<()>,
+        ) -> Result<CaptureReceipt> {
+            self.copy_latest_armed(copy, baseline, validate, None)
+        }
+
+        fn copy_with_recovery_checked(
+            &self,
+            copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+            restart: impl FnOnce(CaptureSource) -> Result<CaptureEngine>,
+            validate: impl FnMut(&CachedFrame) -> Result<()>,
+        ) -> CaptureOutcome {
+            self.copy_with_recovery_armed(copy, restart, validate, None)
+        }
+
         fn copy_latest_with(
             &self,
             copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
@@ -944,6 +1267,8 @@ mod tests {
             inner: Arc::new(EngineInner {
                 shared: Arc::new(SharedState {
                     source: CaptureSource::RemoteTeamsWindow(target_id),
+                    stopped: AtomicBool::new(false),
+                    preflight_in_progress: AtomicBool::new(false),
                     capture_requested: AtomicBool::new(false),
                     observed_sequence: std::sync::atomic::AtomicU64::new(1),
                     has_cached_frame: AtomicBool::new(true),
@@ -967,6 +1292,10 @@ mod tests {
                             rendered_at_100ns: 0,
                         }),
                         content_rect: Some(rect),
+                        source_size: Some((1, 1)),
+                        confirmed_layout: None,
+                        last_observed_at: None,
+                        last_frame_interval: None,
                         last_error: None,
                         requested_after_sequence: 0,
                     }),
@@ -975,6 +1304,127 @@ mod tests {
                 control: Mutex::new(None),
             }),
         }
+    }
+
+    #[test]
+    fn latest_frame_fast_path_rechecks_observations_layout_and_stop() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let layout = RemoteLayout {
+            geometry: WindowGeometry::from_screen_rect(
+                ScreenRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                1,
+                1,
+            ),
+            content_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        };
+        engine
+            .inner
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .latest
+            .as_mut()
+            .unwrap()
+            .remote_layout = Some(layout);
+        let sequence = engine.current_cached_sequence().unwrap();
+        let mut copies = 0;
+        // A static frame can be old in wall-clock time while still being the
+        // latest observed frame. It must not require a session restart.
+        assert!(
+            engine
+                .copy_current_validated(sequence, Some(layout), |_, _, bytes| {
+                    assert_eq!(bytes, &[10, 20, 30, 255]);
+                    copies += 1;
+                    Ok(())
+                })
+                .unwrap()
+                .is_some()
+        );
+        let changed = RemoteLayout {
+            content_rect: PixelRect {
+                x: 1,
+                ..layout.content_rect
+            },
+            ..layout
+        };
+        assert!(
+            engine
+                .copy_current_validated(sequence, Some(changed), |_, _, _| panic!("changed crop"))
+                .unwrap()
+                .is_none()
+        );
+        // This can run while UIA validates because the metadata snapshot holds
+        // no mutex guard. An un-cached newer arrival invalidates the fast path.
+        engine
+            .inner
+            .shared
+            .observe_frame((1, 1), Instant::now())
+            .unwrap();
+        assert!(engine.current_cached_sequence().is_none());
+        assert!(
+            engine
+                .copy_current_validated(sequence, Some(layout), |_, _, _| panic!("stale frame"))
+                .unwrap()
+                .is_none()
+        );
+        engine.stop();
+        assert!(
+            engine
+                .copy_current_validated(sequence, Some(layout), |_, _, _| panic!("stopped"))
+                .is_err()
+        );
+        assert_eq!(copies, 1);
+    }
+
+    #[test]
+    fn revocation_during_startup_does_not_block_and_stops_result() {
+        use std::sync::mpsc;
+        let authorization = CaptureAuthorization::new();
+        let worker_authorization = authorization.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let retained = cached_remote_engine(0);
+        let worker_engine = retained.clone();
+        let worker = std::thread::spawn(move || {
+            CaptureEngine::start_authorized_with(&worker_authorization, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(worker_engine)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        authorization.invalidate();
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert!(retained.is_finished());
+        assert!(!retained.is_ready());
+    }
+
+    #[test]
+    fn stopped_engine_does_not_report_ready_or_copy_retained_frame() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        assert!(engine.is_ready());
+        engine.stop();
+        assert!(!engine.is_ready());
+        assert!(engine.is_finished());
+        let result = engine.copy_latest_since(
+            |_, _, _| panic!("stopped capture must not publish"),
+            Some(0),
+        );
+        assert!(result.unwrap_err().to_string().contains("停止"));
     }
 
     #[test]
@@ -1206,6 +1656,123 @@ mod tests {
     }
 
     #[test]
+    fn quiescent_source_skips_wait_without_authorizing_old_pixels() {
+        let now = Instant::now();
+        assert_eq!(remote_frame_wait(None, None, now), FRESH_FRAME_WAIT);
+        assert_eq!(remote_frame_wait(Some(now), None, now), FRESH_FRAME_WAIT);
+        assert_eq!(
+            remote_frame_wait(Some(now - FRESH_FRAME_WAIT), None, now),
+            Duration::ZERO
+        );
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        engine.inner.shared.state.lock().unwrap().last_observed_at =
+            Some(now - Duration::from_secs(1));
+        let outcome = engine.copy_with_recovery(
+            |_, _, _| panic!("quiescence does not authorize old pixels"),
+            |_| Err(anyhow!("fresh session unavailable")),
+        );
+        assert_eq!(
+            outcome.result.unwrap_err().to_string(),
+            "fresh session unavailable"
+        );
+        assert!(outcome.replacement.is_none());
+    }
+
+    #[test]
+    fn low_rate_frame_during_preflight_skips_wait_but_still_requires_new_pixels() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let now = Instant::now();
+        engine
+            .inner
+            .shared
+            .observe_frame((1, 1), now - Duration::from_secs(1))
+            .unwrap();
+        engine.inner.shared.observe_frame((1, 1), now).unwrap();
+        let interval = engine
+            .inner
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .last_frame_interval;
+        assert_eq!(remote_frame_wait(Some(now), interval, now), Duration::ZERO);
+        assert_eq!(
+            remote_frame_wait(Some(now), Some(Duration::from_millis(16)), now),
+            FRESH_FRAME_WAIT
+        );
+        let outcome = engine.copy_with_recovery(
+            |_, _, _| panic!("cadence must not authorize old pixels"),
+            |_| Err(anyhow!("fresh session unavailable")),
+        );
+        assert_eq!(
+            outcome.result.unwrap_err().to_string(),
+            "fresh session unavailable"
+        );
+    }
+
+    #[test]
+    fn preflight_pauses_backup_without_consuming_the_capture_request() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let shared = &engine.inner.shared;
+        {
+            let _preflight = PreflightGuard::new(Arc::clone(shared));
+            assert!(shared.backup_paused(false));
+            assert!(!shared.capture_requested.load(Ordering::Acquire));
+            shared.observe_frame((20, 30), Instant::now()).unwrap();
+            assert_eq!(shared.state.lock().unwrap().source_size, Some((20, 30)));
+            assert!(!shared.backup_paused(true));
+        }
+        assert!(!shared.backup_paused(false));
+        assert!(!shared.capture_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn frame_between_arming_and_waiting_is_not_swallowed_by_a_new_baseline() {
+        let window = TestWindow::new(false);
+        let engine = cached_remote_engine(window.target_id());
+        let request = engine.arm_request(None).unwrap();
+        let sequence = engine
+            .inner
+            .shared
+            .observe_frame((1, 1), Instant::now())
+            .unwrap();
+        assert!(sequence > request.baseline_sequence);
+        {
+            let mut state = engine.inner.shared.state.lock().unwrap();
+            assert_eq!(state.requested_after_sequence, request.baseline_sequence);
+            let frame = state.latest.as_mut().unwrap();
+            frame.sequence = sequence;
+            frame.rendered_at_100ns = request.requested_at_100ns + 1;
+            frame.bytes[0] = 77;
+        }
+        let mut copied = 0;
+        engine
+            .copy_latest_armed(
+                |_, _, bytes| {
+                    copied = bytes[0];
+                    Ok(())
+                },
+                None,
+                |frame| {
+                    require_frame_after_request(frame.rendered_at_100ns, request.requested_at_100ns)
+                },
+                Some(request),
+            )
+            .unwrap();
+        assert_eq!(copied, 77);
+        assert!(
+            !engine
+                .inner
+                .shared
+                .capture_requested
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
     fn remote_copy_waits_for_each_80ms_frame_at_4hz() {
         let window = TestWindow::new(false);
         let engine = cached_remote_engine(window.target_id());
@@ -1314,7 +1881,11 @@ mod tests {
                 copied = bytes[0];
                 Ok(())
             },
-            |_| Ok(replacement),
+            |_| {
+                assert!(engine.is_finished());
+                assert!(!engine.is_ready());
+                Ok(replacement)
+            },
         );
 
         assert!(outcome.result.is_ok());
@@ -1359,6 +1930,7 @@ mod tests {
 
         assert_eq!(outcome.result.unwrap_err().to_string(), "restart failed");
         assert!(outcome.replacement.is_none());
+        assert!(engine.is_finished());
     }
 
     #[test]

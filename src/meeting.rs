@@ -373,6 +373,11 @@ impl DebouncedMeetingState {
             if self.missing_scans < REQUIRED_EXIT_SCANS
                 || now.duration_since(missing_since) < EXIT_STABLE_FOR
             {
+                // Debounce meeting exit, not permission to keep capturing a
+                // share that is no longer observed in the current scan.
+                if let Some(active) = self.active.as_mut() {
+                    active.has_shared_content = false;
+                }
                 return self.active.clone();
             }
 
@@ -440,12 +445,14 @@ fn run_monitor(
         // still read afresh on every scan; only the client and process metadata
         // are reused.
         if automation.is_none() {
-            automation = UIAutomation::new()
-                .or_else(|_| UIAutomation::new_direct())
-                .ok();
+            automation = crate::automation::AutomationClient::new().ok();
+            crate::diagnostics::log(format_args!(
+                "meeting automation initialized={}",
+                automation.is_some()
+            ));
         }
         let scan =
-            scan_meeting_windows(automation.as_ref(), &mut process_names).unwrap_or_default();
+            scan_meeting_windows(automation.as_deref(), &mut process_names).unwrap_or_default();
         let now = Instant::now();
         let active = state.update(now, scan.meetings);
         let presenter_evidence = scan.presenter_toolbars;
@@ -481,6 +488,15 @@ fn run_monitor(
                 current.presenter_toolbar_id = next_presenter_toolbar;
                 current.local_share_active = next_local_share_active;
                 current.local_monitor_target = next_local_monitor_target;
+                crate::diagnostics::log(format_args!(
+                    "meeting generation={} target={:?} minimized={} shared={} presenter={:?} local={}",
+                    current.generation,
+                    current.target.as_ref().map(|target| target.id),
+                    current.minimized,
+                    current.shared_content_hint,
+                    current.presenter_toolbar_id,
+                    current.local_share_active
+                ));
                 // The snapshot is the sole stored value; queued notifications
                 // only request a read of its latest generation.
                 let _ = changes.try_send(());
@@ -886,9 +902,6 @@ fn scan_meeting_uia(automation: &UIAutomation, target_id: u32) -> Result<Meeting
         }
         if is_shared_content_name(&name) {
             evidence.has_shared_content = true;
-        }
-        if evidence.has_leave_control && evidence.has_call_control && evidence.has_shared_content {
-            break;
         }
     }
     Ok(evidence)
@@ -1507,5 +1520,24 @@ mod tests {
                 .map(|meeting| meeting.target.id),
             Some(42)
         );
+    }
+
+    #[test]
+    fn missing_meeting_evidence_revokes_share_during_exit_debounce() {
+        let started = Instant::now();
+        let mut state = DebouncedMeetingState::default();
+        state.update(started, vec![evidence(42, true, true, true, true)]);
+        let active = state
+            .update(
+                started + Duration::from_millis(700),
+                vec![evidence(42, true, true, true, true)],
+            )
+            .unwrap();
+        assert!(active.has_shared_content);
+        let active = state
+            .update(started + Duration::from_millis(800), Vec::new())
+            .unwrap();
+        assert_eq!(active.target.id, 42);
+        assert!(!active.has_shared_content);
     }
 }

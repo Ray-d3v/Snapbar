@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use async_channel::{Receiver, Sender};
@@ -50,7 +51,7 @@ static TASKBAR_CREATED_MESSAGE: OnceLock<u32> = OnceLock::new();
 pub struct ResidentController {
     flags: Arc<ResidentFlags>,
     hwnd: Arc<AtomicIsize>,
-    capture_requests: Receiver<()>,
+    capture_requests: Receiver<Instant>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -84,7 +85,7 @@ impl ResidentController {
         self.flags.rescan.swap(false, Ordering::AcqRel)
     }
 
-    pub fn capture_requests(&self) -> Receiver<()> {
+    pub fn capture_requests(&self) -> Receiver<Instant> {
         self.capture_requests.clone()
     }
 
@@ -135,12 +136,12 @@ struct ResidentFlags {
     rescan: AtomicBool,
     hotkey_enabled: AtomicBool,
     hotkey_registered: AtomicBool,
-    capture_sender: Sender<()>,
+    capture_sender: Sender<Instant>,
     tray_error: Mutex<Option<String>>,
 }
 
 impl ResidentFlags {
-    fn new(capture_sender: Sender<()>) -> Self {
+    fn new(capture_sender: Sender<Instant>) -> Self {
         Self {
             quit: AtomicBool::new(false),
             rescan: AtomicBool::new(false),
@@ -152,7 +153,7 @@ impl ResidentFlags {
     }
 
     fn request_capture(&self) {
-        let _ = self.capture_sender.try_send(());
+        let _ = self.capture_sender.try_send(Instant::now());
     }
 
     fn record_error(&self, error: String) {
