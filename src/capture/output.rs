@@ -5,7 +5,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
+use image::{
+    ColorType, ImageEncoder,
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 
 use super::{copy_rgba_to_clipboard, next_screenshot_path, windows_screenshots_folder};
 
@@ -92,7 +95,7 @@ fn encode_capture_png(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> 
         return Err(anyhow!("保存する画像のバッファサイズが不正です"));
     }
     let mut encoded = Vec::new();
-    PngEncoder::new(&mut encoded)
+    PngEncoder::new_with_quality(&mut encoded, CompressionType::Fast, FilterType::Adaptive)
         .write_image(bytes, width, height, ColorType::Rgba8.into())
         .context("PNGのエンコードに失敗しました")?;
     Ok(encoded)

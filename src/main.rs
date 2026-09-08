@@ -14,6 +14,8 @@ mod capture;
 #[cfg(target_os = "windows")]
 mod diagnostics;
 #[cfg(target_os = "windows")]
+mod dpi;
+#[cfg(target_os = "windows")]
 mod meeting;
 #[cfg(target_os = "windows")]
 mod overlay;
