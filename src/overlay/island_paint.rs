@@ -78,7 +78,7 @@ fn for_each_separator_strip(
 // will obey the HWND region on every GPU/Windows configuration. The very same
 // row-inset function defines native hit testing and the separator. Coalesce
 // equal adjacent scanlines without allocating a vector on an animation frame.
-fn for_each_drop_strip(region: WindowRegion, mut paint: impl FnMut(RectI)) {
+fn for_each_drop_strip(region: WindowRegion, seam_overlap: i32, mut paint: impl FnMut(RectI)) {
     let WindowRegionShape::Island {
         shoulder_start,
         shoulder_depth,
@@ -91,7 +91,9 @@ fn for_each_drop_strip(region: WindowRegion, mut paint: impl FnMut(RectI)) {
     let width = region.right - region.left;
     let height = region.bottom - region.top;
     let mut run: Option<RectI> = None;
-    for row in shoulder_start..height {
+    // Teams paints its separator immediately ABOVE the UIA toolbar rectangle.
+    // Cover that border inside the existing native caption silhouette as well.
+    for row in (shoulder_start - seam_overlap.max(0)).max(0)..height {
         let inset = island_row_inset(
             row,
             width,
@@ -125,14 +127,17 @@ fn for_each_drop_strip(region: WindowRegion, mut paint: impl FnMut(RectI)) {
 }
 
 pub(crate) fn paint_island_drop(
-    bounds: Bounds<Pixels>,
+    _bounds: Bounds<Pixels>,
     progress: f32,
     material: TitlebarMaterial,
     window: &mut Window,
 ) {
+    // The canvas lives inside a proportionally scaled, centered GPUI element.
+    // Its fractional origin must not shift the physical HWND silhouette: use
+    // client coordinates and the actual viewport, just like SetWindowRgn.
     let scale = window.scale_factor();
-    let width = (f32::from(bounds.size.width) * scale).round() as i32;
-    let height = (f32::from(bounds.size.height) * scale).round() as i32;
+    let width = (f32::from(window.viewport_size().width) * scale).round() as i32;
+    let height = (f32::from(window.viewport_size().height) * scale).round() as i32;
     if width <= 0 || height <= 0 {
         return;
     }
@@ -164,14 +169,14 @@ pub(crate) fn paint_island_drop(
     }
     let to_bounds = |rect: RectI| {
         Bounds::new(
-            bounds.origin + point(px(rect.left as f32 / scale), px(rect.top as f32 / scale)),
+            point(px(rect.left as f32 / scale), px(rect.top as f32 / scale)),
             size(
                 px((rect.right - rect.left) as f32 / scale),
                 px((rect.bottom - rect.top) as f32 / scale),
             ),
         )
     };
-    for_each_drop_strip(region, |strip| {
+    for_each_drop_strip(region, scale.ceil() as i32, |strip| {
         window.paint_quad(fill(to_bounds(strip), rgb(material.surface)));
     });
     if material.surface != material.separator {
@@ -186,6 +191,34 @@ pub(crate) fn paint_island_drop(
 mod tests {
     use super::super::{DISCLOSURE_PROGRESS_LIMIT, window_region_for_attachment};
     use super::*;
+    #[test]
+    fn teams_separator_above_uia_boundary_is_covered() {
+        // User image: y=35 is RGB(35,35,35), y=36 is the UIA toolbar top.
+        // The old drop began at y=36 and left y=35 transparent.
+        let region = WindowRegion {
+            left: 0,
+            top: 1,
+            right: 355,
+            bottom: 60,
+            shape: WindowRegionShape::Island {
+                shoulder_start: 35,
+                shoulder_depth: 9,
+                shoulder_inset: 28,
+                bottom_radius: 8,
+            },
+        };
+        let mut strips = Vec::new();
+        for_each_drop_strip(region, 1, |strip| strips.push(strip));
+        for x in 1..354 {
+            assert!(
+                strips
+                    .iter()
+                    .any(|r| r.left <= x && x < r.right && r.top <= 35 && 35 < r.bottom)
+            );
+        }
+        assert!(strips.iter().all(|r| r.top >= 35));
+    }
+
     #[test]
     fn separator_stays_inside_the_native_drop_at_every_progress_and_dpi() {
         for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
@@ -313,9 +346,9 @@ mod tests {
                 );
                 let native = super::super::coalesced_region_rectangles(region);
                 let mut material = Vec::new();
-                for_each_drop_strip(region, |strip| material.push(strip));
+                for_each_drop_strip(region, 1, |strip| material.push(strip));
                 if let WindowRegionShape::Island { shoulder_start, .. } = region.shape {
-                    for y in region.top + shoulder_start..region.bottom {
+                    for y in region.top + (shoulder_start - 1).max(0)..region.bottom {
                         let at_row = |rectangles: &[RectI]| {
                             rectangles
                                 .iter()

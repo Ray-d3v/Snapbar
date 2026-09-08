@@ -56,7 +56,7 @@ const CONTEXT_PANEL_VISUAL_WIDTH: f32 = CONTEXT_PANEL_WIDTH - CONTROL_VISUAL_INS
 const ACTION_VISUAL_SIZE: f32 = ACTION_CONTROL_SIZE - CONTROL_VISUAL_INSET * 2.0;
 const STATUS_INDICATOR_SIZE: f32 = 6.0;
 const CONTEXT_STATUS_SLOT: f32 = STATUS_INDICATOR_SIZE + 4.0;
-const PERSISTENT_CAMERA_SIZE: f32 = 16.0;
+const PERSISTENT_CAMERA_SIZE: f32 = 12.0;
 const QUIT_PROMPT_WIDTH: f32 = 88.0;
 const QUIT_CONFIRM_WIDTH: f32 = 56.0;
 const QUIT_CANCEL_WIDTH: f32 = 68.0;
@@ -183,8 +183,7 @@ fn island_content_motion(progress: f32) -> IslandContentMotion {
     let expanded_center_y = HOVER_ISLAND_HEIGHT / 2.0 + HOVER_CONTROLS_OFFSET_Y;
     let status_progress = smoothstep_between(0.0, 0.48, progress);
     IslandContentMotion {
-        // The camera and its row ride the deforming lower edge. They never
-        // cross-fade between two separate vertical positions.
+        // Move from the caption center to the expanded island center.
         center_y: idle_center_y
             + (expanded_center_y - idle_center_y) * island_drop_progress(progress),
         // Use one interpolation for both coordinates, so the dot travels in a
@@ -1251,6 +1250,12 @@ impl Snapbar {
         if self.quitting || self.capture_requests.queue_if_active() {
             return;
         }
+        crate::diagnostics::log(format_args!(
+            "overlay render scale={} viewport={:?} window_bounds={:?}",
+            window.scale_factor(),
+            window.viewport_size(),
+            window.bounds(),
+        ));
 
         let Some(engine) = self.capture_engine.clone() else {
             self.meeting_monitor.request_scan();
@@ -1422,7 +1427,11 @@ impl Snapbar {
 }
 
 impl Render for Snapbar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Fit the complete island to a shorter Teams caption. Native client,
+        // painting and GPUI hit targets share the same proportional dimensions.
+        let fit = (f32::from(window.viewport_size().width) / WINDOW_WIDTH).clamp(0.5, 8.0);
+        let px = move |value: f32| gpui::px(value * fit);
         let can_capture = capture_action_available(self.capture_engine.is_some(), self.quitting);
         let presentation = self.presentation;
         let presenter_attached = self.presenter_toolbar_id.is_some();
@@ -1481,7 +1490,7 @@ impl Render for Snapbar {
         let idle_camera_icon = || {
             svg()
                 .path(capture_icon_path)
-                .size(px(16.0))
+                .size(px(12.0))
                 .text_color(rgb(capture_icon_color(
                     feedback_state,
                     idle_palette,
@@ -1665,7 +1674,7 @@ impl Render for Snapbar {
                     .rounded_full()
                     .bg(capture_background)
                     .shadow_sm()
-                    .child(svg().path(capture_icon_path).size(px(17.0)).text_color(
+                    .child(svg().path(capture_icon_path).size(px(12.0)).text_color(
                         if can_capture
                             || matches!(
                                 feedback_state,
@@ -1712,7 +1721,7 @@ impl Render for Snapbar {
                             rgba(0x00000000)
                         },
                     )
-                    .child(svg().path("icons/folder.svg").size(px(16.0)).text_color(
+                    .child(svg().path("icons/folder.svg").size(px(12.0)).text_color(
                         if save_to_screenshots {
                             rgb(palette.save_icon)
                         } else {
@@ -1761,7 +1770,7 @@ impl Render for Snapbar {
                     .child(
                         svg()
                             .path("icons/refresh.svg")
-                            .size(px(16.0))
+                            .size(px(12.0))
                             .text_color(rgb(palette.control_icon)),
                     ),
             );
@@ -1795,7 +1804,7 @@ impl Render for Snapbar {
                     .child(
                         svg()
                             .path("icons/power.svg")
-                            .size(px(16.0))
+                            .size(px(12.0))
                             .text_color(rgb(palette.danger_icon)),
                     ),
             );

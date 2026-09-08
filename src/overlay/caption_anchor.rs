@@ -4,7 +4,7 @@
 use super::{RectI, extended_frame_bounds, get_window_rect};
 use std::time::{Duration, Instant};
 use uiautomation::{
-    UIAutomation,
+    UIAutomation, UIElement,
     types::{ControlType, ElementMode, Handle, TreeScope, UIProperty},
 };
 use windows::Win32::{Foundation::HWND, UI::HiDpi::GetDpiForWindow};
@@ -50,12 +50,14 @@ impl CaptionObservation {
 }
 
 pub(super) struct CaptionProbe {
+    rows: Vec<(u8, UIElement)>,
     automation: Option<UIAutomation>,
     last: Option<(CaptionObservation, Instant)>,
 }
 impl CaptionProbe {
     pub(super) fn new() -> Self {
         Self {
+            rows: Vec::new(),
             automation: None,
             last: None,
         }
@@ -68,8 +70,34 @@ impl CaptionProbe {
             && checked.elapsed() < Duration::from_secs(2)
             && observation.bottom(hwnd, window, frame).is_some()
         {
-            return Some(observation);
+            let rows: Vec<_> = self
+                .rows
+                .iter()
+                .filter_map(|(role, element)| {
+                    if element.is_offscreen().unwrap_or(true) {
+                        return None;
+                    }
+                    let r = element.get_bounding_rectangle().ok()?;
+                    Some((
+                        *role,
+                        RectI {
+                            left: r.get_left(),
+                            top: r.get_top(),
+                            right: r.get_right(),
+                            bottom: r.get_bottom(),
+                        },
+                    ))
+                })
+                .collect();
+            if let Some(bottom) = select_meeting_row_top(frame, dpi, &rows)
+                && get_window_rect(hwnd) == Some(window)
+                && extended_frame_bounds(hwnd).unwrap_or(window) == frame
+                && unsafe { GetDpiForWindow(hwnd) } == dpi
+            {
+                return Some(CaptionObservation::new(hwnd, window, frame, dpi, bottom));
+            }
         }
+        self.rows.clear();
         if self.automation.is_none() {
             self.automation = UIAutomation::new()
                 .or_else(|_| UIAutomation::new_direct())
@@ -89,7 +117,27 @@ impl CaptionProbe {
         let visible = automation
             .create_property_condition(UIProperty::IsOffscreen, false.into(), None)
             .ok()?;
-        let condition = automation.create_and_condition(buttons, visible).ok()?;
+        let toolbars = automation
+            .create_property_condition(
+                UIProperty::ControlType,
+                (ControlType::ToolBar as i32).into(),
+                None,
+            )
+            .ok()?;
+        let groups = automation
+            .create_property_condition(
+                UIProperty::ControlType,
+                (ControlType::Group as i32).into(),
+                None,
+            )
+            .ok()?;
+        let types = automation
+            .create_or_condition(
+                buttons,
+                automation.create_or_condition(toolbars, groups).ok()?,
+            )
+            .ok()?;
+        let condition = automation.create_and_condition(types, visible).ok()?;
         let request = automation.create_cache_request().ok()?;
         request.set_tree_scope(TreeScope::Element).ok()?;
         request.set_element_mode(ElementMode::Full).ok()?;
@@ -98,6 +146,7 @@ impl CaptionProbe {
             .ok()?;
         for property in [
             UIProperty::Name,
+            UIProperty::AutomationId,
             UIProperty::BoundingRectangle,
             UIProperty::IsOffscreen,
         ] {
@@ -107,10 +156,27 @@ impl CaptionProbe {
             .find_all_build_cache(TreeScope::Subtree, &condition, &request)
             .ok()?;
         let mut controls = Vec::new();
+        let mut meeting_rows = Vec::new();
         for element in elements {
             let Ok(name) = element.get_cached_name() else {
                 continue;
             };
+            let id = element.get_cached_automation_id().unwrap_or_default();
+            if let Some(role) = meeting_row_role(&id)
+                && !element.is_cached_offscreen().unwrap_or(true)
+                && let Ok(rect) = element.get_cached_bounding_rectangle()
+            {
+                self.rows.push((role, element.clone()));
+                meeting_rows.push((
+                    role,
+                    RectI {
+                        left: rect.get_left(),
+                        top: rect.get_top(),
+                        right: rect.get_right(),
+                        bottom: rect.get_bottom(),
+                    },
+                ));
+            }
             let Some(role) = caption_role(&name) else {
                 continue;
             };
@@ -129,7 +195,10 @@ impl CaptionProbe {
                 ));
             }
         }
-        let bottom = select_caption_bottom(frame, dpi, &controls)?;
+        // The meeting toolbar's top is the actual boundary even when Teams
+        // exposes its standard caption buttons as offscreen zero rectangles.
+        let bottom = select_meeting_row_top(frame, dpi, &meeting_rows)
+            .or_else(|| select_caption_bottom(frame, dpi, &controls))?;
         // Results from a layout/DPI transition must never change the anchor.
         if get_window_rect(hwnd) != Some(window)
             || extended_frame_bounds(hwnd).unwrap_or(window) != frame
@@ -141,6 +210,51 @@ impl CaptionProbe {
         self.last = Some((observation, Instant::now()));
         Some(observation)
     }
+}
+
+fn meeting_row_role(id: &str) -> Option<u8> {
+    match id {
+        "indicators" => Some(1),
+        "horizontalMiddleEnd" => Some(2),
+        "horizontalEnd" => Some(3),
+        _ => None,
+    }
+}
+
+fn select_meeting_row_top(frame: RectI, dpi: u32, rows: &[(u8, RectI)]) -> Option<i32> {
+    if !(96..=768).contains(&dpi) {
+        return None;
+    }
+    let scale = dpi as f32 / 96.0;
+    let tolerance = scale.ceil() as i32;
+    let valid = |r: RectI| {
+        r.width() > 0
+            && r.height() > 0
+            && r.left >= frame.left - tolerance
+            && r.right <= frame.right + tolerance
+            && r.top >= frame.top + (12.0 * scale) as i32
+            && r.bottom <= frame.bottom
+            && r.top - frame.top <= r.height()
+    };
+    let mut tops = Vec::new();
+    for &(role, rect) in rows {
+        if valid(rect)
+            && rows.iter().any(|&(other, candidate)| {
+                other != role
+                    && valid(candidate)
+                    && (candidate.top - rect.top).abs() <= tolerance
+                    && (candidate.bottom - rect.bottom).abs() <= tolerance
+                    && (candidate.left >= rect.right - tolerance
+                        || rect.left >= candidate.right - tolerance)
+            })
+        {
+            tops.push(rect.top);
+        }
+    }
+    let top = *tops.iter().min()?;
+    tops.iter()
+        .all(|value| (*value - top).abs() <= tolerance)
+        .then_some(top)
 }
 
 fn caption_role(name: &str) -> Option<u8> {
@@ -193,6 +307,86 @@ fn select_caption_bottom(frame: RectI, dpi: u32, controls: &[(u8, RectI)]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn meeting_row_boundary_follows_zoom_and_rejects_disagreement() {
+        for dpi in [96, 120, 144, 192] {
+            for logical_top in [18, 24, 27, 32, 48, 64, 96, 128, 160] {
+                let scale = dpi as f32 / 96.0;
+                let frame = RectI {
+                    left: -1600,
+                    top: 50,
+                    right: 0,
+                    bottom: 1200,
+                };
+                let top = frame.top + (logical_top as f32 * scale).round() as i32;
+                let a = RectI {
+                    left: -1590,
+                    top,
+                    right: -1300,
+                    bottom: top + (logical_top as f32 * 2.0 * scale) as i32,
+                };
+                let b = RectI {
+                    left: -1200,
+                    right: -10,
+                    ..a
+                };
+                assert_eq!(
+                    select_meeting_row_top(frame, dpi, &[(1, a), (2, b)]),
+                    Some(top)
+                );
+                assert_eq!(select_meeting_row_top(frame, dpi, &[(1, a)]), None);
+                assert_eq!(
+                    select_meeting_row_top(
+                        frame,
+                        dpi,
+                        &[(1, a), (2, RectI { top: top + 10, ..b })]
+                    ),
+                    None
+                );
+                assert_eq!(select_meeting_row_top(frame, dpi, &[(1, a), (2, a)]), None);
+            }
+        }
+        assert_eq!(meeting_row_role("horizontalMiddleEnd"), Some(2));
+        assert_eq!(meeting_row_role("chat-toolbar"), None);
+    }
+
+    #[test]
+    #[ignore = "requires a live Teams HWND in SNAPBAR_DIAGNOSTIC_TARGET"]
+    fn live_caption_zoom_geometry() {
+        let target: usize = std::env::var("SNAPBAR_DIAGNOSTIC_TARGET")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let hwnd = HWND(target as *mut std::ffi::c_void);
+        let _physical = crate::dpi::PhysicalPixels::enter();
+        let automation = crate::automation::AutomationClient::new().unwrap();
+        let root = automation
+            .element_from_handle(Handle::from(target as isize))
+            .unwrap();
+        let condition = automation.create_true_condition().unwrap();
+        for element in root.find_all(TreeScope::Subtree, &condition).unwrap() {
+            let rect = element.get_bounding_rectangle().unwrap_or_default();
+            if !element.is_offscreen().unwrap_or(true)
+                && rect.get_top() < 85
+                && rect.get_bottom() > 0
+            {
+                eprintln!(
+                    "top element type={:?} id={:?} bounds={:?}",
+                    element.get_control_type(),
+                    element.get_automation_id(),
+                    rect
+                );
+            }
+        }
+        eprintln!(
+            "window={:?} frame={:?} dpi={}",
+            get_window_rect(hwnd),
+            extended_frame_bounds(hwnd),
+            unsafe { GetDpiForWindow(hwnd) }
+        );
+        eprintln!("observation={:?}", CaptionProbe::new().measure(hwnd));
+    }
+
     #[test]
     fn actual_custom_caption_row_overrides_a_taller_native_band() {
         for dpi in [96, 120, 144, 168, 192, 288] {

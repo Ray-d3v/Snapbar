@@ -2,6 +2,7 @@ use std::{
     ffi::c_void,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use windows::Win32::Foundation::HWND;
@@ -33,15 +34,28 @@ impl ColorSampler {
         Self::start_with_factory(wake_tx, || {
             let mut readback = super::caption_readback::CaptionReadback::default();
             let mut probe = super::caption_anchor::CaptionProbe::new();
+            let mut last_material = None;
+            let mut last_read = Instant::now() - Duration::from_secs(1);
+            let mut last_caption = None;
+            let mut last_target = None;
             move |request: ColorRequest| {
                 let hwnd = HWND(request.target_id as usize as *mut c_void);
                 let caption = probe.measure(hwnd);
-                let material = super::sample_titlebar_color(
-                    hwnd,
-                    request.caption_height,
-                    &mut readback,
-                    caption,
-                );
+                if last_target != Some(request.target_id)
+                    || caption != last_caption
+                    || last_read.elapsed() >= Duration::from_millis(350)
+                {
+                    last_material = super::sample_titlebar_color(
+                        hwnd,
+                        request.caption_height,
+                        &mut readback,
+                        caption,
+                    );
+                    last_read = Instant::now();
+                    last_caption = caption;
+                    last_target = Some(request.target_id);
+                }
+                let material = last_material;
                 (material, caption)
             }
         })

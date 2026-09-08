@@ -47,10 +47,10 @@ use caption_readback::CaptionReadback;
 use color_sampler::{ColorRequest, ColorSampler};
 pub(crate) use island_paint::paint_island_drop;
 
-const FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
+const FOLLOW_INTERVAL: Duration = Duration::from_millis(50);
 const PRESENTER_FOLLOW_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
-const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(350);
+const TITLEBAR_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 const COLOR_SAMPLE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 const EXPAND_DELAY_MS: u32 = 16;
 const COLLAPSE_DELAY_MS: u32 = 50;
@@ -1036,12 +1036,17 @@ fn current_caption_geometry(
 ) -> Option<CaptionGeometry> {
     let window = get_window_rect(hwnd)?;
     let frame = extended_frame_bounds(hwnd).unwrap_or(window);
-    caption_geometry(
+    let mut geometry = caption_geometry(
         window,
         frame,
         observed_caption_bounds(hwnd, window, frame, observation),
         caption_height,
-    )
+    )?;
+    if let Some(bottom) = observation.and_then(|value| value.bottom(hwnd, window, frame)) {
+        geometry.band.bottom = bottom;
+        geometry.band.top = bottom - caption_height;
+    }
+    Some(geometry)
 }
 
 #[derive(Clone)]
@@ -1281,6 +1286,11 @@ impl TeamsWindowFollower {
                             || synchronize_client_dpi(
                                 overlay_hwnd,
                                 HWND(anchor_id as usize as *mut c_void),
+                                if presenter_attached {
+                                    None
+                                } else {
+                                    measured_caption
+                                },
                             );
                         if !size_ready {
                             previous_placement = None;
@@ -1329,6 +1339,16 @@ impl TeamsWindowFollower {
                                 "overlay placement={placement:?}"
                             ));
                             apply_placement(overlay_hwnd, placement);
+                            if crate::diagnostics::enabled()
+                                && target_id != 0
+                                && !presenter_attached
+                            {
+                                log_placement_geometry(
+                                    overlay_hwnd,
+                                    HWND(target_id as usize as *mut c_void),
+                                    measured_caption,
+                                );
+                            }
                             if visible_now {
                                 post_overlay_message(overlay_hwnd, WM_APP_REEVALUATE_POINTER);
                             }
@@ -1751,19 +1771,17 @@ fn scale_logical(value: f32, actual: i32, logical: f32) -> i32 {
 }
 
 fn nominal_caption_height(overlay: WindowMetrics) -> i32 {
-    scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(24)
+    scale_logical(COLLAPSED_HEIGHT, overlay.client_height, WINDOW_HEIGHT).max(1)
 }
 
 fn nominal_island_drop(overlay: WindowMetrics) -> i32 {
-    let caption_height = nominal_caption_height(overlay);
-    // Scale the two logical edges before subtracting them. Scaling the 16px size
-    // independently can round away the reserved top-outline pixel at custom DPIs.
-    let caption_and_drop = scale_logical(
-        COLLAPSED_HEIGHT + ISLAND_DROP,
+    surface_rect(
+        overlay.client_width,
         overlay.client_height,
-        WINDOW_HEIGHT,
-    );
-    caption_and_drop.saturating_sub(caption_height)
+        OverlayMode::Expanded,
+    )
+    .bottom
+    .saturating_sub(nominal_caption_height(overlay))
 }
 
 fn surface_rect_for_size(
@@ -1941,12 +1959,9 @@ fn window_region_for_attachment(
     } else if compact || presentation.is_inline() || progress == 0 {
         WindowRegionShape::Rectangle
     } else {
-        let caption_height = scale_logical(
-            TITLEBAR_SURFACE_HEIGHT,
-            metrics.client_height,
-            WINDOW_HEIGHT,
-        )
-        .clamp(1, hover.height());
+        // Round the absolute caption edge once, then subtract the surface origin.
+        // Rounding the surface height independently leaves a transparent pixel.
+        let caption_height = (nominal_caption_height(metrics) - hover.top).clamp(1, hover.height());
         let animated_drop = hover.height().saturating_sub(caption_height);
         let shape_progress = island_drop_progress(normalized);
         let shoulder_depth = scale_logical(
@@ -2216,7 +2231,7 @@ fn caption_geometry(
     // bars keep their existing alignment, but make the occupied band at least the
     // product's fixed logical height. Invalid vertical data falls back to the top
     // of the visible DWM frame. The rectangle's X remains the button exclusion.
-    let height = caption_height.clamp(24, visible_frame.height());
+    let height = caption_height.clamp(1, visible_frame.height());
     let absolute_caption =
         caption_relative.map(|relative| relative.offset(window_rect.left, window_rect.top));
     let minimum_bottom = visible_frame
@@ -2257,12 +2272,31 @@ fn caption_geometry(
     })
 }
 
+#[cfg(test)]
 fn calculate_placement(
     target_window: RectI,
     target_frame: RectI,
     caption_relative: Option<RectI>,
     overlay: WindowMetrics,
     presentation: OverlayPresentation,
+) -> OverlayPlacement {
+    calculate_placement_with_boundary(
+        target_window,
+        target_frame,
+        caption_relative,
+        overlay,
+        presentation,
+        None,
+    )
+}
+
+fn calculate_placement_with_boundary(
+    target_window: RectI,
+    target_frame: RectI,
+    caption_relative: Option<RectI>,
+    overlay: WindowMetrics,
+    presentation: OverlayPresentation,
+    verified_bottom: Option<i32>,
 ) -> OverlayPlacement {
     let full_surface = surface_rect(
         overlay.client_width,
@@ -2293,7 +2327,7 @@ fn calculate_placement(
     // DWM outer frame. Keep the nominal caption at its full fixed height so bottom
     // anchoring leaves that outline unobscured independently of caption-button Y.
     let caption_height = nominal_caption_height(overlay);
-    let Some(caption) = caption_geometry(
+    let Some(mut caption) = caption_geometry(
         target_window,
         target_frame,
         caption_relative,
@@ -2301,6 +2335,10 @@ fn calculate_placement(
     ) else {
         return OverlayPlacement::Hidden;
     };
+    if let Some(bottom) = verified_bottom {
+        caption.band.bottom = bottom;
+        caption.band.top = bottom - caption_height;
+    }
     if full_height > caption.band.height().saturating_add(island_drop) {
         return OverlayPlacement::Hidden;
     }
@@ -2331,7 +2369,7 @@ fn calculate_placement(
     let x = desired_surface_left - client_offset_x - active_surface.left;
 
     let desired_surface_bottom = caption.band.bottom.saturating_add(island_drop);
-    let desired_surface_top = desired_surface_bottom.saturating_sub(full_surface.height());
+    let desired_surface_top = caption.band.bottom - caption_height + full_surface.top;
     let y = desired_surface_top - client_offset_y - full_surface.top;
     let placed_top = y + client_offset_y + full_surface.top;
     let placed_bottom = y + client_offset_y + full_surface.bottom;
@@ -2412,6 +2450,21 @@ fn desired_presenter_placement(
     calculate_presenter_placement(presenter_frame, overlay, presentation)
 }
 
+fn log_placement_geometry(overlay: HWND, target: HWND, observation: Option<CaptionObservation>) {
+    let window = get_window_rect(target);
+    let frame = extended_frame_bounds(target);
+    let native = caption_button_bounds(target);
+    let measured_bottom = window.zip(frame).and_then(|(window, frame)| {
+        observation.and_then(|value| value.bottom(target, window, frame))
+    });
+    let metrics = window_metrics(overlay);
+    crate::diagnostics::log(format_args!(
+        "overlay geometry target_dpi={} overlay_dpi={} target_window={window:?} target_frame={frame:?} native_caption_relative={native:?} uia_bottom={measured_bottom:?} overlay_metrics={metrics:?}",
+        unsafe { GetDpiForWindow(target) },
+        unsafe { GetDpiForWindow(overlay) },
+    ));
+}
+
 fn observed_caption_bounds(
     hwnd: HWND,
     window: RectI,
@@ -2444,12 +2497,35 @@ fn client_size_for_dpi(dpi: u32) -> Option<(i32, i32)> {
     ))
 }
 
-fn synchronize_client_dpi(hwnd: HWND, target: HWND) -> bool {
+fn client_size_for_caption(dpi: u32, caption_height: Option<i32>) -> Option<(i32, i32)> {
+    let (width, height) = client_size_for_dpi(dpi)?;
+    let native_caption = COLLAPSED_HEIGHT * dpi as f32 / 96.0;
+    let fit = caption_height.map_or(1.0, |height| {
+        (height as f32 / native_caption).clamp(0.5, 8.0)
+    });
+    Some((
+        (width as f32 * fit).round() as i32,
+        (height as f32 * fit).round() as i32,
+    ))
+}
+
+fn synchronize_client_dpi(
+    hwnd: HWND,
+    target: HWND,
+    observation: Option<CaptionObservation>,
+) -> bool {
     if !unsafe { IsWindow(Some(target)).as_bool() } {
         return false;
     }
     let dpi = unsafe { GetDpiForWindow(target) };
-    let Some((width, height)) = client_size_for_dpi(dpi) else {
+    let caption_height = get_window_rect(target)
+        .zip(extended_frame_bounds(target))
+        .and_then(|(window, frame)| {
+            observation
+                .and_then(|value| value.bottom(target, window, frame))
+                .map(|bottom| bottom - frame.top)
+        });
+    let Some((width, height)) = client_size_for_caption(dpi, caption_height) else {
         return false;
     };
     // First move into the target monitor while hidden. Let GPUI receive the
@@ -2527,12 +2603,13 @@ fn desired_placement(
     let Some(overlay) = window_metrics(overlay_hwnd) else {
         return OverlayPlacement::Hidden;
     };
-    calculate_placement(
+    calculate_placement_with_boundary(
         target_window,
         target_frame,
         observed_caption_bounds(target_hwnd, target_window, target_frame, observation),
         overlay,
         presentation,
+        observation.and_then(|value| value.bottom(target_hwnd, target_window, target_frame)),
     )
 }
 
@@ -2596,6 +2673,77 @@ fn extended_frame_bounds(hwnd: HWND) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_boundary_has_no_gap_and_large_caption_keeps_its_drop() {
+        let frame = RectI {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        for dpi in [96, 120, 144, 192] {
+            for logical in 15..=160 {
+                let bottom = logical * dpi / 96;
+                let (width, height) = client_size_for_caption(dpi as u32, Some(bottom)).unwrap();
+                let metrics = WindowMetrics {
+                    window_rect: RectI {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    client_screen_left: 0,
+                    client_screen_top: 0,
+                    client_width: width,
+                    client_height: height,
+                };
+                let placement = calculate_placement_with_boundary(
+                    frame,
+                    frame,
+                    None,
+                    metrics,
+                    OverlayPresentation::HoverIsland,
+                    Some(bottom),
+                );
+                let OverlayPlacement::Visible { y, .. } = placement else {
+                    panic!("missing island");
+                };
+                let region = window_region_for_attachment(
+                    metrics,
+                    OverlayPresentation::HoverIsland,
+                    false,
+                    false,
+                    DISCLOSURE_PROGRESS_MAX,
+                );
+                let WindowRegionShape::Island { shoulder_start, .. } = region.shape else {
+                    panic!("missing drop");
+                };
+                assert_eq!(
+                    y + region.top + shoulder_start,
+                    bottom,
+                    "dpi={dpi} caption={logical}"
+                );
+                assert!(y + region.bottom > bottom);
+            }
+        }
+    }
+
+    #[test]
+    fn shorter_teams_caption_scales_both_native_dimensions() {
+        for dpi in [96, 120, 144, 192] {
+            let normal = client_size_for_dpi(dpi).unwrap();
+            assert_eq!(client_size_for_caption(dpi, None), Some(normal));
+            let large =
+                client_size_for_caption(dpi, Some((48.0 * dpi as f32 / 96.0) as i32)).unwrap();
+            assert!((large.0 as f32 / normal.0 as f32 - 1.6).abs() < 0.02);
+            assert!((large.1 as f32 / normal.1 as f32 - 1.6).abs() < 0.02);
+            let small =
+                client_size_for_caption(dpi, Some((24.0 * dpi as f32 / 96.0) as i32)).unwrap();
+            assert!((small.0 as f32 / normal.0 as f32 - 0.8).abs() < 0.02);
+            assert!((small.1 as f32 / normal.1 as f32 - 0.8).abs() < 0.02);
+        }
+    }
 
     #[test]
     fn titlebar_material_pack_roundtrips_both_colors() {
