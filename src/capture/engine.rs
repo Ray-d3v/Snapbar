@@ -359,6 +359,22 @@ impl CaptureEngine {
         self.inner.shared.has_cached_frame.load(Ordering::Acquire) && !self.is_finished()
     }
 
+    pub fn diagnostic_status(&self) -> String {
+        let shared = &self.inner.shared;
+        let Ok(state) = shared.state.try_lock() else {
+            return "state_busy".into();
+        };
+        format!(
+            "local={} stopped={} cached={} size={:?} crop={:?} error={:?}",
+            shared.source.is_local_monitor(),
+            shared.stopped.load(Ordering::Acquire),
+            shared.has_cached_frame.load(Ordering::Acquire),
+            state.source_size,
+            state.content_rect,
+            state.last_error
+        )
+    }
+
     pub fn is_finished(&self) -> bool {
         self.inner.shared.stopped.load(Ordering::Acquire)
             || self.inner.control.lock().map_or(true, |control| {
@@ -380,13 +396,29 @@ impl CaptureEngine {
         save_to_screenshots: bool,
     ) -> CaptureOutcome {
         let request_started = Instant::now();
+        crate::diagnostics::log(format_args!("capture_engine {}", self.diagnostic_status()));
+        if let Ok(state) = self.inner.shared.state.try_lock() {
+            crate::diagnostics::log(format_args!(
+                "frame_snapshot observed={} cached_sequence={:?} age_ms={:?} interval_ms={:?}",
+                self.inner.shared.observed_sequence.load(Ordering::Acquire),
+                state.latest.as_ref().map(|frame| frame.sequence),
+                state
+                    .latest
+                    .as_ref()
+                    .map(|frame| frame.captured_at.elapsed().as_millis()),
+                state
+                    .last_frame_interval
+                    .map(|interval| interval.as_millis())
+            ));
+        }
         let preflight = PreflightGuard::new(Arc::clone(&self.inner.shared));
         let latest_sequence = self.current_cached_sequence();
         // Bracket the requested frame with matching UIA observations. A UIA
         // read only after FrameArrived could describe a newer layout than the
         // pixels in that frame, even with identical window dimensions.
         let request_evidence = match authorization.with_current(|| Ok(())).and_then(|()| {
-            let layout = self.confirm_request_layout()?;
+            let layout =
+                crate::diagnostics::measure("uia_preflight", || self.confirm_request_layout())?;
             Ok(layout)
         }) {
             Ok(evidence) => evidence,
@@ -422,7 +454,11 @@ impl CaptureEngine {
                         save_result,
                     };
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    crate::diagnostics::log(format_args!(
+                        "capture_fallback reason=latest_frame_not_validated"
+                    ));
+                }
             }
         }
         let request = match self.arm_request(None) {
@@ -980,6 +1016,13 @@ impl FrameHandler {
             }
             Err(error) => {
                 if let Ok(mut state) = self.shared.state.lock() {
+                    if state.latest.is_some()
+                        || state.last_error.as_deref() != Some(error.to_string().as_str())
+                    {
+                        crate::diagnostics::log(format_args!(
+                            "local_frame_unavailable error={error}"
+                        ));
+                    }
                     state.latest = None;
                     state.content_rect = None;
                     state.last_error = Some(error.to_string());
@@ -1042,6 +1085,7 @@ impl FrameHandler {
         sequence: u64,
         remote_layout: Option<RemoteLayout>,
     ) -> Result<()> {
+        let crop_started = Instant::now();
         let source_width = frame.width();
         let source_height = frame.height();
         let rendered_at_100ns = frame
@@ -1125,6 +1169,13 @@ impl FrameHandler {
         self.shared.has_cached_frame.store(true, Ordering::Release);
         drop(state);
         self.shared.ready.notify_all();
+        crate::diagnostics::log(format_args!(
+            "frame_cached sequence={sequence} source={}x{} crop={content_rect:?} gpu_cpu_us={} frame_age_ms={}",
+            source_width,
+            source_height,
+            crop_started.elapsed().as_micros(),
+            captured_at.elapsed().as_millis()
+        ));
         Ok(())
     }
 }
@@ -1189,9 +1240,11 @@ fn detect_remote_layout(
     phase: &str,
 ) -> Result<RemoteLayout> {
     let started = Instant::now();
-    let current = resolver
-        .ok_or_else(|| anyhow!("共有範囲の監視がありません"))?
-        .verify(source_width, source_height)?;
+    let current = crate::diagnostics::measure(phase, || {
+        resolver
+            .ok_or_else(|| anyhow!("共有範囲の監視がありません"))?
+            .verify(source_width, source_height)
+    })?;
     crate::diagnostics::log(format_args!(
         "uia layout phase={phase} elapsed_ms={} reused={}",
         started.elapsed().as_millis(),

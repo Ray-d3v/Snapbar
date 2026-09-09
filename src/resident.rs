@@ -42,6 +42,7 @@ const SYNC_CAPTURE_HOTKEY_MESSAGE: u32 = WM_APP + 42;
 const TRAY_ICON_ID: u32 = 1;
 const MENU_RESCAN: u32 = 1001;
 const MENU_QUIT: u32 = 1002;
+const MENU_LOG: u32 = 1003;
 const CAPTURE_HOTKEY_ID: i32 = 1;
 const APP_ICON_RESOURCE_ID: u16 = 101;
 
@@ -153,10 +154,13 @@ impl ResidentFlags {
     }
 
     fn request_capture(&self) {
-        let _ = self.capture_sender.try_send(Instant::now());
+        let received = Instant::now();
+        let queued = self.capture_sender.try_send(received).is_ok();
+        crate::diagnostics::log(format_args!("input source=hotkey queued={queued}"));
     }
 
     fn record_error(&self, error: String) {
+        crate::diagnostics::log(format_args!("resident error={error}"));
         if let Ok(mut tray_error) = self.tray_error.lock() {
             *tray_error = Some(error);
         }
@@ -401,6 +405,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         return;
     };
     let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_RESCAN as usize, w!("会議を再検出")) };
+    let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_LOG as usize, w!("ログを開く")) };
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, w!("")) };
     let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, w!("Snapbarを終了")) };
 
@@ -420,6 +425,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         }
         .0 as u32;
         match command {
+            MENU_LOG => crate::diagnostics::open_log(),
             MENU_RESCAN => with_flags(|flags| flags.rescan.store(true, Ordering::Release)),
             MENU_QUIT => with_flags(|flags| flags.quit.store(true, Ordering::Release)),
             _ => {}

@@ -62,9 +62,13 @@ pub fn output_capture(
     output_capture_with(
         authorization,
         save,
-        || copy_rgba_to_clipboard(width, height, bytes),
-        || encode_capture_png(width, height, bytes),
-        |encoded| write_capture_png(&encoded),
+        || {
+            crate::diagnostics::measure("clipboard", || {
+                copy_rgba_to_clipboard(width, height, bytes)
+            })
+        },
+        || crate::diagnostics::measure("png_encode", || encode_capture_png(width, height, bytes)),
+        |encoded| crate::diagnostics::measure("png_write", || write_capture_png(&encoded)),
     )
 }
 

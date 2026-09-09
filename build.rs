@@ -1,6 +1,22 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let build = env::var("GITHUB_RUN_NUMBER").unwrap_or_else(|_| "local".into());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    println!("cargo:rustc-env=SNAPBAR_BUILD_ID={build}-{commit}-{timestamp}");
     println!("cargo:rerun-if-changed=assets/branding/snapbar.ico");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

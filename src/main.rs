@@ -30,6 +30,7 @@ mod window_z_order;
 
 #[cfg(target_os = "windows")]
 fn main() {
+    let _diagnostics = diagnostics::init();
     app::run();
 }
 

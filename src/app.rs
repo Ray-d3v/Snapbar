@@ -577,6 +577,7 @@ struct Snapbar {
     capture_starting: bool,
     capture_retry_at: Option<Instant>,
     readiness_display: ReadinessDisplay,
+    diagnostic_status: String,
     remote_minimized: bool,
     capture_authorization: CaptureAuthorization,
     follower: Option<TeamsWindowFollower>,
@@ -658,6 +659,7 @@ impl Snapbar {
             capture_starting: false,
             capture_retry_at: None,
             readiness_display: ReadinessDisplay::default(),
+            diagnostic_status: String::new(),
             remote_minimized: false,
             capture_authorization: CaptureAuthorization::default(),
             follower,
@@ -1080,6 +1082,20 @@ impl Snapbar {
             .as_ref()
             .is_some_and(CaptureEngine::is_ready);
         let waiting = self.readiness_display.waiting(ready, now);
+        let status = format!(
+            "ready={ready} waiting={waiting} state={:?} starting={} active={:?} mode={:?} engine={}",
+            self.capture_state,
+            self.capture_starting,
+            self.capture_requests.active,
+            self.capture_mode,
+            self.capture_engine
+                .as_ref()
+                .map_or_else(|| "absent".into(), CaptureEngine::diagnostic_status)
+        );
+        if status != self.diagnostic_status {
+            crate::diagnostics::log(format_args!("readiness {status}"));
+            self.diagnostic_status = status;
+        }
         if ready {
             self.capture_retry_at = Some(now + CAPTURE_RETRY_INTERVAL);
         }
@@ -1420,7 +1436,17 @@ impl Snapbar {
         }) {
             return;
         }
+        let request_id = crate::diagnostics::next_request();
+        let _request_scope = crate::diagnostics::request_scope(request_id);
+        crate::diagnostics::log(format_args!(
+            "capture_input source={input_source} dispatch_us={}",
+            received_at.elapsed().as_micros()
+        ));
         if self.quitting || self.capture_requests.queue_if_active() {
+            crate::diagnostics::log(format_args!(
+                "capture_deferred quitting={} active={:?}",
+                self.quitting, self.capture_requests.active
+            ));
             return;
         }
         crate::diagnostics::log(format_args!(
@@ -1431,6 +1457,7 @@ impl Snapbar {
         ));
 
         let Some(engine) = self.capture_engine.clone() else {
+            crate::diagnostics::log(format_args!("capture_rejected reason=no_engine"));
             self.meeting_monitor.request_scan();
             self.capture_state = if self.has_capture_context() {
                 CaptureState::WaitingForShare
@@ -1495,6 +1522,8 @@ impl Snapbar {
             local_monitor_capture && self.capture_mode == OverlayCaptureMode::Recordable;
 
         let task = cx.background_executor().spawn(async move {
+            let _scope = crate::diagnostics::request_scope(request_id);
+            crate::diagnostics::log(format_args!("capture_worker input_elapsed_us={} save_png={} composition_wait={wait_for_composition}", received_at.elapsed().as_micros(), save_to_screenshots));
             let mut replacement = None;
             let result = (|| {
                 let overlay_exclusion = overlay_exclusion;
@@ -1517,12 +1546,14 @@ impl Snapbar {
                 let save_result = outcome.save_result;
                 Ok::<_, anyhow::Error>((receipt, save_result))
             })();
+            crate::diagnostics::log(format_args!("capture_finished success={} input_elapsed_us={} recovery={}", result.is_ok(), received_at.elapsed().as_micros(), replacement.is_some()));
             (replacement, result)
         });
 
         cx.spawn_in(window, async move |this, cx| {
             let (replacement, result) = task.await;
             this.update_in(cx, |this, window, cx| {
+                let _scope = crate::diagnostics::request_scope(request_id);
                 let capture_again = this.capture_requests.finish(generation);
                 if this.capture_generation != generation {
                     if capture_again && !this.quitting {
@@ -2552,6 +2583,9 @@ impl Render for Snapbar {
 pub fn run() {
     let presentation = OverlayPresentation::from_command_line();
     let capture_mode = OverlayCaptureMode::from_command_line();
+    crate::diagnostics::log(format_args!(
+        "configuration presentation={presentation:?} capture_mode={capture_mode:?}"
+    ));
     application().with_assets(Assets).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         let options = || WindowOptions {
