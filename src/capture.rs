@@ -2,7 +2,6 @@ use std::{
     borrow::Cow,
     ffi::c_void,
     path::{Path, PathBuf},
-    thread,
     time::Duration,
 };
 
@@ -60,31 +59,15 @@ pub(super) fn copy_rgba_to_clipboard(width: u32, height: u32, bytes: &[u8]) -> R
         return Err(anyhow!("共有画面フレームのバッファサイズが不正です"));
     }
 
-    let mut last_error = None;
-    for attempt in 0..3 {
-        let result = Clipboard::new().and_then(|mut clipboard| {
+    Clipboard::new()
+        .and_then(|mut clipboard| {
             clipboard.set_image(ImageData {
                 width: width as usize,
                 height: height as usize,
                 bytes: Cow::Borrowed(bytes),
             })
-        });
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < 2 {
-                    thread::sleep(Duration::from_millis(30));
-                }
-            }
-        }
-    }
-
-    Err(last_error
-        .map(anyhow::Error::new)
-        .unwrap_or_else(|| anyhow!("クリップボードへのコピーに失敗しました")))
-    .context("クリップボードへのコピーに失敗しました")
+        })
+        .context("クリップボードへのコピーに失敗しました")
 }
 
 pub(crate) fn windows_screenshots_folder() -> Result<PathBuf> {

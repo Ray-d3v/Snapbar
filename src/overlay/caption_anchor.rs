@@ -49,8 +49,28 @@ impl CaptionObservation {
     }
 }
 
+#[derive(Default)]
+struct DiscoveryThrottle {
+    last: Option<(CaptionObservation, RectI, Instant)>,
+}
+impl DiscoveryThrottle {
+    fn allow(&mut self, key: CaptionObservation, position: RectI, now: Instant) -> bool {
+        if self.last.is_some_and(|(old, old_position, attempted)| {
+            old == key
+                && old_position == position
+                && now.saturating_duration_since(attempted) < Duration::from_secs(2)
+        }) {
+            return false;
+        }
+        self.last = Some((key, position, now));
+        true
+    }
+}
+
 pub(super) struct CaptionProbe {
     rows: Vec<(u8, UIElement)>,
+    buttons: Vec<(u8, UIElement)>,
+    discovery: DiscoveryThrottle,
     automation: Option<UIAutomation>,
     last: Option<(CaptionObservation, Instant)>,
 }
@@ -58,6 +78,8 @@ impl CaptionProbe {
     pub(super) fn new() -> Self {
         Self {
             rows: Vec::new(),
+            buttons: Vec::new(),
+            discovery: DiscoveryThrottle::default(),
             automation: None,
             last: None,
         }
@@ -89,7 +111,27 @@ impl CaptionProbe {
                     ))
                 })
                 .collect();
+            let buttons: Vec<_> = self
+                .buttons
+                .iter()
+                .filter_map(|(role, element)| {
+                    if element.is_offscreen().unwrap_or(true) {
+                        return None;
+                    }
+                    let r = element.get_bounding_rectangle().ok()?;
+                    Some((
+                        *role,
+                        RectI {
+                            left: r.get_left(),
+                            top: r.get_top(),
+                            right: r.get_right(),
+                            bottom: r.get_bottom(),
+                        },
+                    ))
+                })
+                .collect();
             if let Some(bottom) = select_meeting_row_top(frame, dpi, &rows)
+                .or_else(|| select_caption_bottom(frame, dpi, &buttons))
                 && get_window_rect(hwnd) == Some(window)
                 && extended_frame_bounds(hwnd).unwrap_or(window) == frame
                 && unsafe { GetDpiForWindow(hwnd) } == dpi
@@ -97,7 +139,16 @@ impl CaptionProbe {
                 return Some(CaptionObservation::new(hwnd, window, frame, dpi, bottom));
             }
         }
+        let key = CaptionObservation::new(hwnd, window, frame, dpi, frame.top);
+        if !self.discovery.allow(key, window, Instant::now()) {
+            return None;
+        }
+        crate::diagnostics::log(format_args!(
+            "caption_discovery target={} dpi={dpi}",
+            hwnd.0 as isize
+        ));
         self.rows.clear();
+        self.buttons.clear();
         if self.automation.is_none() {
             self.automation = UIAutomation::new()
                 .or_else(|_| UIAutomation::new_direct())
@@ -184,6 +235,7 @@ impl CaptionProbe {
                 continue;
             }
             if let Ok(rect) = element.get_cached_bounding_rectangle() {
+                self.buttons.push((role, element.clone()));
                 controls.push((
                     role,
                     RectI {
@@ -307,6 +359,42 @@ fn select_caption_bottom(frame: RectI, dpi: u32, controls: &[(u8, RectI)]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_discovery_is_throttled_but_geometry_changes_retry_immediately() {
+        let window = RectI {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+        let key = CaptionObservation::new(HWND(std::ptr::dangling_mut()), window, window, 96, 0);
+        let now = Instant::now();
+        let mut throttle = DiscoveryThrottle::default();
+        assert!(throttle.allow(key, window, now));
+        for tick in 1..40 {
+            assert!(!throttle.allow(key, window, now + Duration::from_millis(tick * 50)));
+        }
+        assert!(throttle.allow(key, window, now + Duration::from_secs(2)));
+        for changed in [
+            CaptionObservation { target: 2, ..key },
+            CaptionObservation { dpi: 144, ..key },
+            CaptionObservation {
+                window_width: 1100,
+                ..key
+            },
+        ] {
+            let mut throttle = DiscoveryThrottle::default();
+            assert!(throttle.allow(key, window, now));
+            assert!(throttle.allow(changed, window, now + Duration::from_millis(50)));
+        }
+        let moved = RectI {
+            left: 10,
+            right: 1010,
+            ..window
+        };
+        assert!(throttle.allow(key, moved, now + Duration::from_secs(2)));
+    }
     #[test]
     fn meeting_row_boundary_follows_zoom_and_rejects_disagreement() {
         for dpi in [96, 120, 144, 192] {

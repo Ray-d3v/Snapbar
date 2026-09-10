@@ -585,6 +585,7 @@ struct Snapbar {
     resident: Arc<ResidentController>,
     owner: Option<WindowHandle<Snapbar>>,
     companion: Option<WindowHandle<Snapbar>>,
+    companion_ready: bool,
     last_monitor_generation: u64,
     shared_content_hint: bool,
     presenter_toolbar_id: Option<u32>,
@@ -614,6 +615,7 @@ impl Snapbar {
         presentation: OverlayPresentation,
         capture_mode: OverlayCaptureMode,
         owner: Option<WindowHandle<Snapbar>>,
+        shared: Option<(Arc<MeetingMonitor>, Arc<ResidentController>)>,
     ) -> Self {
         window.set_window_title("Snapbar");
         let follower = TeamsWindowFollower::start(window, presentation, capture_mode);
@@ -621,12 +623,6 @@ impl Snapbar {
         let geometry_notifier = follower
             .as_ref()
             .map(TeamsWindowFollower::geometry_notifier);
-        let shared = owner.and_then(|handle| handle.read(cx).ok()).map(|source| {
-            (
-                Arc::clone(&source.meeting_monitor),
-                Arc::clone(&source.resident),
-            )
-        });
         let (meeting_monitor, resident) = if let Some(shared) = shared {
             shared
         } else {
@@ -667,6 +663,7 @@ impl Snapbar {
             resident,
             owner,
             companion: None,
+            companion_ready: false,
             last_monitor_generation: u64::MAX,
             shared_content_hint: false,
             presenter_toolbar_id: None,
@@ -717,6 +714,55 @@ impl Snapbar {
         true
     }
 
+    fn sync_companion_lifetime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.owner.is_some() {
+            return;
+        }
+        let needed = demo_caption_visible(
+            self.capture_mode,
+            self.local_share_active,
+            self.presenter_toolbar_id,
+            self.quitting,
+        );
+        if !needed {
+            // Keep the HWND alive until any temporary capture-exclusion guard
+            // has been dropped. The companion sync already hides its target.
+            if self.capture_requests.active.is_some() {
+                return;
+            }
+            if let Some(companion) = self.companion.take() {
+                let _ = companion.update(cx, |_, window, _| window.remove_window());
+                crate::diagnostics::log(format_args!("demo_companion destroyed"));
+            }
+            return;
+        }
+        if self.companion.is_some() {
+            return;
+        }
+        let owner = window
+            .window_handle()
+            .downcast::<Snapbar>()
+            .expect("Snapbar window");
+        let shared = (
+            Arc::clone(&self.meeting_monitor),
+            Arc::clone(&self.resident),
+        );
+        let presentation = self.presentation;
+        let mode = self.capture_mode;
+        let options = overlay_window_options(cx);
+        match cx.open_window(options, move |window, cx| {
+            cx.new(|cx| Self::new(window, cx, presentation, mode, Some(owner), Some(shared)))
+        }) {
+            Ok(handle) => {
+                self.companion = Some(handle);
+                crate::diagnostics::log(format_args!("demo_companion created"));
+            }
+            Err(error) => {
+                crate::diagnostics::log(format_args!("demo_companion create_failed={error}"))
+            }
+        }
+    }
+
     fn sync_companion(&mut self, cx: &mut Context<Self>) {
         let Some(owner) = self.owner else {
             return;
@@ -730,11 +776,30 @@ impl Snapbar {
             source.presenter_toolbar_id,
             source.quitting,
         );
-        self.targets = if show {
+        let targets = if show {
             source.targets.clone()
         } else {
             Vec::new()
         };
+        let ready = source
+            .capture_engine
+            .as_ref()
+            .is_some_and(CaptureEngine::is_ready);
+        let changed = self.companion_ready != ready
+            || self.targets != targets
+            || self.selected_target != source.selected_target
+            || self.settings != source.settings
+            || self.capture_state != source.capture_state
+            || self.last_error != source.last_error
+            || self.demo_mode_error != source.demo_mode_error
+            || self.capture_mode != source.capture_mode
+            || match (&self.capture_engine, &source.capture_engine) {
+                (Some(a), Some(b)) => !a.shares_session_with(b),
+                (None, None) => false,
+                _ => true,
+            };
+        self.targets = targets;
+        self.companion_ready = ready;
         self.selected_target = source.selected_target;
         self.settings = source.settings;
         self.capture_engine = source.capture_engine.clone();
@@ -748,8 +813,10 @@ impl Snapbar {
             }
         }
         self.sync_follower();
-        self.sync_overlay_state();
-        cx.notify();
+        let overlay_changed = self.sync_overlay_state();
+        if changed || overlay_changed {
+            cx.notify();
+        }
     }
 
     fn current_target(&self) -> Option<&CaptureTarget> {
@@ -975,7 +1042,10 @@ impl Snapbar {
             loop {
                 cx.background_executor().timer(RESIDENT_SYNC_INTERVAL).await;
                 if this
-                    .update(cx, |this, cx| this.sync_resident_state(cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.sync_resident_state(cx);
+                        this.sync_companion_lifetime(window, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -1015,7 +1085,10 @@ impl Snapbar {
         cx.spawn_in(window, async move |this, cx| {
             while meeting_events.recv().await.is_ok() {
                 if this
-                    .update(cx, |this, cx| this.sync_resident_state(cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.sync_resident_state(cx);
+                        this.sync_companion_lifetime(window, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -2580,6 +2653,26 @@ impl Render for Snapbar {
     }
 }
 
+fn overlay_window_options(cx: &App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: None,
+        focus: false,
+        // This popup intentionally never activates. GPUI otherwise throttles
+        // inactive windows to 33.3 ms frames, which makes hover disclosure
+        // render at roughly 30 fps even on a high-refresh-rate display.
+        inactive_frame_interval: None,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Transparent,
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
 pub fn run() {
     let presentation = OverlayPresentation::from_command_line();
     let capture_mode = OverlayCaptureMode::from_command_line();
@@ -2587,34 +2680,10 @@ pub fn run() {
         "configuration presentation={presentation:?} capture_mode={capture_mode:?}"
     ));
     application().with_assets(Assets).run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
-        let options = || WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
-            focus: false,
-            // This popup intentionally never activates. GPUI otherwise throttles
-            // inactive windows to 33.3 ms frames, which makes hover disclosure
-            // render at roughly 30 fps even on a high-refresh-rate display.
-            inactive_frame_interval: None,
-            kind: WindowKind::PopUp,
-            is_movable: false,
-            is_resizable: false,
-            is_minimizable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            window_decorations: Some(WindowDecorations::Client),
-            ..Default::default()
-        };
-        let primary = cx
-            .open_window(options(), move |window, cx| {
-                cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode, None))
-            })
-            .expect("Snapbar window could not be created");
-        let companion = cx
-            .open_window(options(), move |window, cx| {
-                cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode, Some(primary)))
-            })
-            .expect("Snapbar demo window could not be created");
-        let _ = primary.update(cx, |source, _, _| source.companion = Some(companion));
+        cx.open_window(overlay_window_options(cx), move |window, cx| {
+            cx.new(|cx| Snapbar::new(window, cx, presentation, capture_mode, None, None))
+        })
+        .expect("Snapbar window could not be created");
 
         cx.activate(true);
     });
@@ -3099,6 +3168,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn closing_mid_expansion_shrinks_instead_of_carrying_opening_momentum() {
+        let presentation = OverlayPresentation::HoverIsland;
+        let opening = disclosure_spring_config(presentation, false).step(
+            gpui::SpringState {
+                position: 0.0,
+                velocity: 0.0,
+            },
+            1.0,
+            0.05,
+        );
+        let mut animation = DisclosureAnimationState::default();
+        animation.retarget(
+            disclosure_presentation_progress(opening.position, presentation),
+            presentation,
+        );
+        let config = disclosure_spring_config(presentation, true);
+        let reset = config.step(
+            gpui::SpringState {
+                position: animation.start,
+                velocity: 0.0,
+            },
+            0.0,
+            0.016,
+        );
+        let retained = config.step(opening, 0.0, 0.016);
+        eprintln!(
+            "reverse opening={} reset={} retained={}",
+            opening.position, reset.position, retained.position
+        );
+        assert!(reset.position < opening.position);
+        assert!(retained.position > opening.position);
     }
 
     #[test]

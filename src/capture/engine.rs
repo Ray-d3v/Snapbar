@@ -359,6 +359,10 @@ impl CaptureEngine {
         self.inner.shared.has_cached_frame.load(Ordering::Acquire) && !self.is_finished()
     }
 
+    pub fn shares_session_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn diagnostic_status(&self) -> String {
         let shared = &self.inner.shared;
         let Ok(state) = shared.state.try_lock() else {
@@ -1243,7 +1247,7 @@ fn detect_remote_layout(
     let current = crate::diagnostics::measure(phase, || {
         resolver
             .ok_or_else(|| anyhow!("共有範囲の監視がありません"))?
-            .verify(source_width, source_height)
+            .verify(source_width, source_height, phase)
     })?;
     crate::diagnostics::log(format_args!(
         "uia layout phase={phase} elapsed_ms={} reused={}",

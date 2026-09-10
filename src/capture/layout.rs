@@ -1,5 +1,4 @@
-//! One MTA owns UIA identities, subscriptions, and discovery. No COM object or
-//! cached UIA property value crosses to the capture/UI threads.
+//! One MTA owns UIA identities, subscriptions, and discovery.
 use super::{
     content_detector::PixelRect,
     uia::{ContentLocator, WindowGeometry},
@@ -7,15 +6,14 @@ use super::{
 use crate::shutdown::defer_cleanup;
 use anyhow::{Result, anyhow};
 use std::{
+    collections::VecDeque,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        Arc, Condvar, Mutex,
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
 const VERIFY_TIMEOUT: Duration = Duration::from_millis(1_200);
 const WATCHDOG: Duration = Duration::from_millis(750);
 
@@ -25,63 +23,124 @@ pub(super) struct RemoteLayout {
     pub(super) content_rect: PixelRect,
     pub(super) revision: u64,
 }
-
-pub(super) enum Request {
-    Verify {
-        width: u32,
-        height: u32,
-        reply: SyncSender<std::result::Result<RemoteLayout, String>>,
-    },
-    Changed,
+struct Request {
+    width: u32,
+    height: u32,
+    phase: String,
+    queued: Instant,
+    reply: SyncSender<std::result::Result<RemoteLayout, String>>,
 }
-
+#[derive(Default)]
+struct Pending {
+    capture: VecDeque<Request>,
+    frame: VecDeque<Request>,
+    structure: u64,
+    properties: u64,
+    stop: bool,
+}
+impl Pending {
+    fn next(&mut self, now: Instant) -> Option<Request> {
+        while let Some(request) = self.capture.pop_front().or_else(|| self.frame.pop_front()) {
+            if now.saturating_duration_since(request.queued) < VERIFY_TIMEOUT {
+                return Some(request);
+            }
+            crate::diagnostics::log(format_args!(
+                "layout_request phase={} expired=true queue_wait_us={}",
+                request.phase,
+                now.saturating_duration_since(request.queued).as_micros()
+            ));
+            let _ = request
+                .reply
+                .try_send(Err("共有範囲の確認要求が期限切れになりました".into()));
+        }
+        None
+    }
+}
+#[derive(Default)]
+pub(super) struct LayoutQueue {
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+impl LayoutQueue {
+    pub(super) fn changed(&self, structure: bool) {
+        let mut pending = self.pending.lock().unwrap();
+        let first = pending.structure == 0 && pending.properties == 0;
+        if structure {
+            pending.structure = pending.structure.saturating_add(1);
+        } else {
+            pending.properties = pending.properties.saturating_add(1);
+        }
+        // Notifications never occupy verification slots. Every event still
+        // invalidates the revision immediately in the UIA callback.
+        if first {
+            self.wake.notify_one();
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) struct LayoutResolver(Arc<ResolverInner>);
 struct ResolverInner {
-    requests: SyncSender<Request>,
-    stop: Arc<AtomicBool>,
+    queue: Arc<LayoutQueue>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
-
 impl LayoutResolver {
     pub(super) fn start(target: u32) -> Result<Self> {
-        // At most one frame callback and one serialized user request can wait.
-        // Events coalesce through the locator's atomic revision even if full.
-        let (requests, receiver) = mpsc::sync_channel(2);
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let events = requests.clone();
+        let queue = Arc::new(LayoutQueue::default());
+        let worker_queue = queue.clone();
         let worker = thread::Builder::new()
             .name("snapbar-capture-layout".into())
-            .spawn(move || run_resolver(target, events, receiver, worker_stop))?;
+            .spawn(move || run_resolver(target, worker_queue))?;
         Ok(Self(Arc::new(ResolverInner {
-            requests,
-            stop,
+            queue,
             worker: Mutex::new(Some(worker)),
         })))
     }
-
-    pub(super) fn verify(&self, width: u32, height: u32) -> Result<RemoteLayout> {
+    pub(super) fn verify(&self, width: u32, height: u32, phase: &str) -> Result<RemoteLayout> {
+        let queued = Instant::now();
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.0
-            .requests
-            .try_send(Request::Verify {
+        {
+            let mut pending = self.0.queue.pending.lock().unwrap();
+            if pending.stop {
+                return Err(anyhow!("共有範囲の監視が停止しました"));
+            }
+            let requests = if phase == "frame" {
+                &mut pending.frame
+            } else {
+                &mut pending.capture
+            };
+            if requests.len() >= 2 {
+                crate::diagnostics::log(format_args!(
+                    "layout_request phase={phase} queue_full=true"
+                ));
+                return Err(anyhow!(
+                    "共有範囲を更新中です。少し待って再撮影してください"
+                ));
+            }
+            requests.push_back(Request {
                 width,
                 height,
+                phase: phase.into(),
+                queued,
                 reply,
-            })
-            .map_err(|_| anyhow!("共有範囲を更新中です。少し待って再撮影してください"))?;
+            });
+            self.0.queue.wake.notify_one();
+        }
         receiver
-            .recv_timeout(VERIFY_TIMEOUT)
-            .map_err(|_| anyhow!("Teamsの共有範囲の確認が応答していません"))?
+            .recv_timeout(VERIFY_TIMEOUT.saturating_sub(queued.elapsed()))
+            .map_err(|_| {
+                crate::diagnostics::log(format_args!(
+                    "layout_request phase={phase} timeout=true elapsed_us={}",
+                    queued.elapsed().as_micros()
+                ));
+                anyhow!("Teamsの共有範囲の確認が応答していません")
+            })?
             .map_err(|error| anyhow!(error))
     }
 }
-
 impl Drop for ResolverInner {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = self.requests.try_send(Request::Changed);
+        self.queue.pending.lock().unwrap().stop = true;
+        self.queue.wake.notify_one();
         if let Some(worker) = self.worker.lock().ok().and_then(|mut value| value.take()) {
             defer_cleanup("snapbar-capture-layout-stop", move || {
                 let _ = worker.join();
@@ -89,59 +148,72 @@ impl Drop for ResolverInner {
         }
     }
 }
-
-fn run_resolver(
-    target: u32,
-    events: SyncSender<Request>,
-    receiver: Receiver<Request>,
-    stop: Arc<AtomicBool>,
-) {
+fn run_resolver(target: u32, queue: Arc<LayoutQueue>) {
     let _physical = crate::dpi::PhysicalPixels::enter();
-    let mut locator = ContentLocator::new(target, events.clone());
+    let mut locator = ContentLocator::new(target, queue.clone());
     let mut dimensions = None;
     let mut last_background = Instant::now();
-    while !stop.load(Ordering::Acquire) {
-        let request = receiver.recv_timeout(WATCHDOG);
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        match request {
-            Ok(Request::Verify {
-                width,
-                height,
-                reply,
-            }) => {
-                dimensions = Some((width, height));
-                // Retry initialization after an unavailable UIA provider, without
-                // recreating a working client on every capture.
-                if locator.is_err() {
-                    locator = ContentLocator::new(target, events.clone());
-                    if let Err(error) = &locator {
-                        let _ = reply.try_send(Err(error.to_string()));
-                        continue;
-                    }
+    loop {
+        let request = {
+            let mut pending = queue.pending.lock().unwrap();
+            loop {
+                if pending.stop {
+                    return;
                 }
-                let result = verify(target, width, height, locator.as_mut().unwrap(), false);
-                let _ = reply.try_send(result.map_err(|error| format!("{error:#}")));
+                if let Some(request) = pending.next(Instant::now()) {
+                    break Some(request);
+                }
                 if last_background.elapsed() >= WATCHDOG {
-                    let _ = verify(target, width, height, locator.as_mut().unwrap(), true);
-                    last_background = Instant::now();
+                    if pending.structure != 0 || pending.properties != 0 {
+                        crate::diagnostics::log(format_args!(
+                            "layout_events target={target} structure={} is_offscreen={}",
+                            pending.structure, pending.properties
+                        ));
+                    }
+                    pending.structure = 0;
+                    pending.properties = 0;
+                    break None;
                 }
+                let remaining = WATCHDOG.saturating_sub(last_background.elapsed());
+                pending = queue.wake.wait_timeout(pending, remaining).unwrap().0;
             }
-            Ok(Request::Changed) | Err(RecvTimeoutError::Timeout) => {
-                if let (Some((width, height)), Ok(locator)) = (dimensions, locator.as_mut()) {
-                    // Discovery and its stability delay normally happen here,
-                    // including on static Teams surfaces that emit no WGC frame.
-                    let _ = verify(target, width, height, locator, true);
-                    last_background = Instant::now();
-                }
+        };
+        if let Some(request) = request {
+            let started = Instant::now();
+            dimensions = Some((request.width, request.height));
+            if locator.is_err() {
+                locator = ContentLocator::new(target, queue.clone());
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            let result = match &mut locator {
+                Ok(locator) => verify(target, request.width, request.height, locator, false),
+                Err(error) => Err(anyhow!("{error:#}")),
+            };
+            crate::diagnostics::log(format_args!(
+                "layout_request target={target} phase={} queue_wait_us={} verify_us={} success={} expired_after_verify={}",
+                request.phase,
+                started.duration_since(request.queued).as_micros(),
+                started.elapsed().as_micros(),
+                result.is_ok(),
+                request.queued.elapsed() >= VERIFY_TIMEOUT
+            ));
+            let _ = request
+                .reply
+                .try_send(result.map_err(|error| format!("{error:#}")));
+            // Check priority queues again before any background discovery.
+        } else {
+            if let (Some((width, height)), Ok(locator)) = (dimensions, locator.as_mut()) {
+                let started = Instant::now();
+                let result = verify(target, width, height, locator, true);
+                crate::diagnostics::log(format_args!(
+                    "layout_background target={target} verify_us={} success={}",
+                    started.elapsed().as_micros(),
+                    result.is_ok()
+                ));
+            }
+            last_background = Instant::now();
         }
     }
-    // UIA subscriptions and identities are released on their owning MTA.
 }
-
 fn verify(
     target: u32,
     width: u32,
@@ -160,4 +232,44 @@ fn verify(
         content_rect,
         revision,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request(phase: &str, queued: Instant) -> Request {
+        Request {
+            width: 100,
+            height: 100,
+            phase: phase.into(),
+            queued,
+            reply: mpsc::sync_channel(1).0,
+        }
+    }
+    #[test]
+    fn event_storm_does_not_displace_capture_and_capture_precedes_frame() {
+        let queue = LayoutQueue::default();
+        for _ in 0..10_000 {
+            queue.changed(true);
+            queue.changed(false);
+        }
+        let mut pending = queue.pending.lock().unwrap();
+        let now = Instant::now();
+        pending.frame.push_back(request("frame", now));
+        pending.capture.push_back(request("preflight", now));
+        assert_eq!(pending.next(now).unwrap().phase, "preflight");
+        assert_eq!(pending.next(now).unwrap().phase, "frame");
+        assert!(pending.next(now).is_none());
+        assert_eq!((pending.structure, pending.properties), (10_000, 10_000));
+    }
+    #[test]
+    fn expired_requests_are_skipped_before_uia_work() {
+        let now = Instant::now();
+        let mut pending = Pending::default();
+        pending
+            .capture
+            .push_back(request("expired", now - VERIFY_TIMEOUT));
+        pending.frame.push_back(request("frame", now));
+        assert_eq!(pending.next(now).unwrap().phase, "frame");
+        assert!(pending.next(now).is_none());
+    }
 }

@@ -75,11 +75,13 @@ pub fn output_capture(
 fn output_capture_with<T>(
     authorization: &CaptureAuthorization,
     save: bool,
-    copy: impl FnOnce() -> Result<()>,
+    copy: impl FnMut() -> Result<()>,
     encode: impl FnOnce() -> Result<T>,
     write: impl FnOnce(T) -> Result<PathBuf>,
 ) -> Result<Option<Result<PathBuf>>> {
-    authorization.with_current(copy)?;
+    copy_authorized_with(authorization, copy, || {
+        std::thread::sleep(std::time::Duration::from_millis(30))
+    })?;
     if !save {
         return Ok(None);
     }
@@ -88,6 +90,30 @@ fn output_capture_with<T>(
         Err(error) => return Ok(Some(Err(error))),
     };
     Ok(Some(authorization.with_current(|| write(encoded))))
+}
+
+fn copy_authorized_with(
+    authorization: &CaptureAuthorization,
+    mut copy: impl FnMut() -> Result<()>,
+    mut wait: impl FnMut(),
+) -> Result<()> {
+    for attempt in 0..3 {
+        // Only the individual side effect holds the authorization lock. A
+        // revocation during backoff prevents every subsequent write attempt.
+        let result = authorization.with_current(|| Ok(copy()))?;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => {
+                crate::diagnostics::log(format_args!(
+                    "clipboard_retry attempt={} backoff_ms=30",
+                    attempt + 1
+                ));
+                wait();
+            }
+        }
+    }
+    unreachable!()
 }
 
 fn encode_capture_png(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -125,7 +151,10 @@ fn write_capture_png(encoded: &[u8]) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureAuthorization, encode_capture_png, output_capture_with};
+    use super::{
+        CaptureAuthorization, copy_authorized_with, encode_capture_png, output_capture_with,
+    };
+    use anyhow::anyhow;
     use std::sync::{
         Arc, Barrier,
         atomic::{AtomicUsize, Ordering},
@@ -162,6 +191,51 @@ mod tests {
                 .with_current(|| Ok(()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn invalidation_during_clipboard_backoff_prevents_the_next_attempt() {
+        let auth = CaptureAuthorization::new();
+        let mut calls = 0;
+        let result = copy_authorized_with(
+            &auth,
+            || {
+                calls += 1;
+                Err(anyhow!("clipboard busy"))
+            },
+            || {
+                assert!(
+                    auth.valid.try_lock().is_ok(),
+                    "backoff must release authorization"
+                );
+                auth.invalidate();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn clipboard_retry_is_bounded_and_can_recover() {
+        for success_at in [2, 3, 4] {
+            let mut calls = 0;
+            let mut waits = 0;
+            let result = copy_authorized_with(
+                &CaptureAuthorization::new(),
+                || {
+                    calls += 1;
+                    if calls == success_at {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("busy"))
+                    }
+                },
+                || waits += 1,
+            );
+            assert_eq!(result.is_ok(), success_at <= 3);
+            assert_eq!(calls, success_at.min(3));
+            assert_eq!(waits, calls - 1);
+        }
     }
 
     #[test]

@@ -246,11 +246,10 @@ fn scan_authoritative_rect(
 
 // UIA clients and selected identities are kept only on LayoutResolver's MTA.
 // Every fast-path use calls BuildUpdatedCache: cached values are NEVER evidence.
-use super::layout::Request;
+use super::layout::LayoutQueue;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
-    mpsc::SyncSender,
 };
 use std::time::Instant;
 use uiautomation::{
@@ -265,12 +264,12 @@ use uiautomation::{
 
 struct Invalidation {
     revision: Arc<AtomicU64>,
-    wake: SyncSender<Request>,
+    wake: Arc<LayoutQueue>,
 }
 impl Invalidation {
-    fn signal(&self) {
+    fn signal(&self, structure: bool) {
         self.revision.fetch_add(1, Ordering::AcqRel);
-        let _ = self.wake.try_send(Request::Changed);
+        self.wake.changed(structure);
     }
 }
 impl CustomStructureChangedEventHandler for Invalidation {
@@ -280,13 +279,13 @@ impl CustomStructureChangedEventHandler for Invalidation {
         _: StructureChangeType,
         _: Option<&[i32]>,
     ) -> uiautomation::Result<()> {
-        self.signal();
+        self.signal(true);
         Ok(())
     }
 }
 impl CustomPropertyChangedEventHandler for Invalidation {
     fn handle(&self, _: &UIElement, _: UIProperty, _: Variant) -> uiautomation::Result<()> {
-        self.signal();
+        self.signal(false);
         Ok(())
     }
 }
@@ -313,7 +312,7 @@ pub(super) struct ContentLocator {
 }
 
 impl ContentLocator {
-    pub(super) fn new(target: u32, wake: SyncSender<Request>) -> Result<Self> {
+    pub(super) fn new(target: u32, wake: Arc<LayoutQueue>) -> Result<Self> {
         let automation = crate::automation::AutomationClient::new()?;
         let root = automation.element_from_handle(Handle::from(target as isize))?;
         let request = automation.create_cache_request()?;
@@ -402,7 +401,28 @@ impl ContentLocator {
             // dropped its event. Do not continue using the old crop.
             self.revision.fetch_add(1, Ordering::AcqRel);
         }
-        self.discover(geometry)
+        crate::diagnostics::log(format_args!(
+            "layout_discovery target={} background={background} subscribed={} watchdog_due={watchdog_due} selected={} geometry_same={} revision_same={}",
+            self.target,
+            self.subscribed,
+            self.selected.is_some(),
+            self.selected
+                .as_ref()
+                .is_some_and(|old| old.geometry == geometry),
+            self.selected
+                .as_ref()
+                .is_some_and(|old| self.is_current(old.revision)),
+        ));
+        let started = Instant::now();
+        let result = self.discover(geometry);
+        crate::diagnostics::log(format_args!(
+            "layout_discovery target={} duration_us={} success={} error={:?}",
+            self.target,
+            started.elapsed().as_micros(),
+            result.is_ok(),
+            result.as_ref().err().map(ToString::to_string)
+        ));
+        result
     }
 
     fn discover(&mut self, geometry: WindowGeometry) -> Result<(PixelRect, u64)> {
