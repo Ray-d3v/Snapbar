@@ -523,6 +523,35 @@ impl CaptureEngine {
         &self,
         sequence: u64,
         current_layout: Option<RemoteLayout>,
+        copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+    ) -> Result<Option<CaptureReceipt>> {
+        self.copy_current_checked(
+            sequence,
+            current_layout,
+            |layout| {
+                let current = detect_remote_layout(
+                    self.inner.shared.layout.as_ref(),
+                    self.inner
+                        .shared
+                        .source
+                        .remote_target_id()
+                        .ok_or_else(|| anyhow!("共有対象がありません"))?,
+                    layout.geometry.image_dimensions().0,
+                    layout.geometry.image_dimensions().1,
+                    Some(layout),
+                    "output-fast",
+                )?;
+                require_matching_layout(Some(layout), current)
+            },
+            copy,
+        )
+    }
+
+    fn copy_current_checked(
+        &self,
+        sequence: u64,
+        current_layout: Option<RemoteLayout>,
+        validate: impl FnOnce(RemoteLayout) -> Result<()>,
         mut copy: impl FnMut(u32, u32, &[u8]) -> Result<()>,
     ) -> Result<Option<CaptureReceipt>> {
         if self.inner.shared.source.is_local_monitor() || current_layout.is_none() {
@@ -539,8 +568,12 @@ impl CaptureEngine {
             .as_ref()
             .is_some_and(CaptureControl::is_finished)
         {
+            crate::diagnostics::log(format_args!("fast_path_reject_reason=session_finished"));
             return Ok(None);
         }
+        // UIA can block; perform it before taking the pixel-buffer lock, then
+        // recheck the sequence, geometry and layout under that lock below.
+        validate(current_layout.expect("remote layout checked"))?;
         let state = self
             .inner
             .shared
@@ -548,6 +581,7 @@ impl CaptureEngine {
             .lock()
             .map_err(|_| anyhow!("キャプチャ状態を取得できませんでした"))?;
         let Some(cached) = state.latest.as_ref() else {
+            crate::diagnostics::log(format_args!("fast_path_reject_reason=cache_missing"));
             return Ok(None);
         };
         if cached.sequence != sequence
@@ -555,6 +589,13 @@ impl CaptureEngine {
             || cached.remote_layout != current_layout
             || state.source_size != Some((cached.source_width, cached.source_height))
         {
+            crate::diagnostics::log(format_args!(
+                "fast_path_reject_reason=metadata_changed requested_sequence={sequence} cached_sequence={} observed_sequence={} layout_same={} size_same={}",
+                cached.sequence,
+                self.inner.shared.observed_sequence.load(Ordering::Acquire),
+                cached.remote_layout == current_layout,
+                state.source_size == Some((cached.source_width, cached.source_height))
+            ));
             return Ok(None);
         }
         self.inner.shared.source.validate_remote_target()?;
@@ -1445,15 +1486,30 @@ mod tests {
             .remote_layout = Some(layout);
         let sequence = engine.current_cached_sequence().unwrap();
         let mut copies = 0;
+        assert!(
+            engine
+                .copy_current_checked(
+                    sequence,
+                    Some(layout),
+                    |_| Err(anyhow!("output evidence invalidated")),
+                    |_, _, _| panic!("invalid evidence must not write clipboard or PNG")
+                )
+                .is_err()
+        );
         // A static frame can be old in wall-clock time while still being the
         // latest observed frame. It must not require a session restart.
         assert!(
             engine
-                .copy_current_validated(sequence, Some(layout), |_, _, bytes| {
-                    assert_eq!(bytes, &[10, 20, 30, 255]);
-                    copies += 1;
-                    Ok(())
-                })
+                .copy_current_checked(
+                    sequence,
+                    Some(layout),
+                    |_| Ok(()),
+                    |_, _, bytes| {
+                        assert_eq!(bytes, &[10, 20, 30, 255]);
+                        copies += 1;
+                        Ok(())
+                    }
+                )
                 .unwrap()
                 .is_some()
         );
@@ -1466,28 +1522,58 @@ mod tests {
         };
         assert!(
             engine
-                .copy_current_validated(sequence, Some(changed), |_, _, _| panic!("changed crop"))
+                .copy_current_checked(
+                    sequence,
+                    Some(changed),
+                    |_| Ok(()),
+                    |_, _, _| panic!("changed crop")
+                )
                 .unwrap()
                 .is_none()
         );
         // This can run while UIA validates because the metadata snapshot holds
         // no mutex guard. An un-cached newer arrival invalidates the fast path.
-        engine
-            .inner
-            .shared
-            .observe_frame((1, 1), Instant::now())
-            .unwrap();
+        assert!(
+            engine
+                .copy_current_checked(
+                    sequence,
+                    Some(layout),
+                    |_| {
+                        // The live UIA check must run without the pixel mutex held.
+                        assert!(engine.inner.shared.state.try_lock().is_ok());
+                        engine
+                            .inner
+                            .shared
+                            .observe_frame((1, 1), Instant::now())
+                            .unwrap();
+                        Ok(())
+                    },
+                    |_, _, _| panic!("frame changed during output validation")
+                )
+                .unwrap()
+                .is_none()
+        );
         assert!(engine.current_cached_sequence().is_none());
         assert!(
             engine
-                .copy_current_validated(sequence, Some(layout), |_, _, _| panic!("stale frame"))
+                .copy_current_checked(
+                    sequence,
+                    Some(layout),
+                    |_| Ok(()),
+                    |_, _, _| panic!("stale frame")
+                )
                 .unwrap()
                 .is_none()
         );
         engine.stop();
         assert!(
             engine
-                .copy_current_validated(sequence, Some(layout), |_, _, _| panic!("stopped"))
+                .copy_current_checked(
+                    sequence,
+                    Some(layout),
+                    |_| Ok(()),
+                    |_, _, _| panic!("stopped")
+                )
                 .is_err()
         );
         assert_eq!(copies, 1);

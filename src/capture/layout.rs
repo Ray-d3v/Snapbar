@@ -39,6 +39,15 @@ struct Pending {
     stop: bool,
 }
 impl Pending {
+    fn poll(&mut self, now: Instant, background_due: Instant) -> Work {
+        if let Some(request) = self.next(now) {
+            Work::Request(request)
+        } else if now >= background_due {
+            Work::Background
+        } else {
+            Work::Wait(background_due.duration_since(now))
+        }
+    }
     fn next(&mut self, now: Instant) -> Option<Request> {
         while let Some(request) = self.capture.pop_front().or_else(|| self.frame.pop_front()) {
             if now.saturating_duration_since(request.queued) < VERIFY_TIMEOUT {
@@ -55,6 +64,11 @@ impl Pending {
         }
         None
     }
+}
+enum Work {
+    Request(Request),
+    Background,
+    Wait(Duration),
 }
 #[derive(Default)]
 pub(super) struct LayoutQueue {
@@ -160,21 +174,26 @@ fn run_resolver(target: u32, queue: Arc<LayoutQueue>) {
                 if pending.stop {
                     return;
                 }
-                if let Some(request) = pending.next(Instant::now()) {
-                    break Some(request);
-                }
-                if last_background.elapsed() >= WATCHDOG {
-                    if pending.structure != 0 || pending.properties != 0 {
-                        crate::diagnostics::log(format_args!(
-                            "layout_events target={target} structure={} is_offscreen={}",
-                            pending.structure, pending.properties
-                        ));
+                let background_due = locator
+                    .as_ref()
+                    .ok()
+                    .and_then(ContentLocator::audit_deadline)
+                    .unwrap_or(last_background + WATCHDOG);
+                let remaining = match pending.poll(Instant::now(), background_due) {
+                    Work::Request(request) => break Some(request),
+                    Work::Wait(remaining) => remaining,
+                    Work::Background => {
+                        if pending.structure != 0 || pending.properties != 0 {
+                            crate::diagnostics::log(format_args!(
+                                "layout_events target={target} structure={} is_offscreen={}",
+                                pending.structure, pending.properties
+                            ));
+                        }
+                        pending.structure = 0;
+                        pending.properties = 0;
+                        break None;
                     }
-                    pending.structure = 0;
-                    pending.properties = 0;
-                    break None;
-                }
-                let remaining = WATCHDOG.saturating_sub(last_background.elapsed());
+                };
                 pending = queue.wake.wait_timeout(pending, remaining).unwrap().0;
             }
         };
@@ -203,7 +222,8 @@ fn run_resolver(target: u32, queue: Arc<LayoutQueue>) {
         } else {
             if let (Some((width, height)), Ok(locator)) = (dimensions, locator.as_mut()) {
                 let started = Instant::now();
-                let result = verify(target, width, height, locator, true);
+                let result = WindowGeometry::from_hwnd_dimensions(target, width, height)
+                    .and_then(|geometry| locator.background_step(geometry));
                 crate::diagnostics::log(format_args!(
                     "layout_background target={target} verify_us={} success={}",
                     started.elapsed().as_micros(),
@@ -271,5 +291,21 @@ mod tests {
         pending.frame.push_back(request("frame", now));
         assert_eq!(pending.next(now).unwrap().phase, "frame");
         assert!(pending.next(now).is_none());
+    }
+    #[test]
+    fn audit_stability_wait_yields_to_requests_and_resumes_when_due() {
+        let now = Instant::now();
+        let resume = now + Duration::from_millis(35);
+        let mut pending = Pending::default();
+        assert!(
+            matches!(pending.poll(now, resume), Work::Wait(wait) if wait == Duration::from_millis(35))
+        );
+        pending.capture.push_back(request("preflight", now));
+        assert!(matches!(pending.poll(now, resume), Work::Request(_)));
+        // Even a due second scan must yield to a request that arrived during
+        // the first (uninterruptible) COM call.
+        pending.capture.push_back(request("output", now));
+        assert!(matches!(pending.poll(resume, resume), Work::Request(_)));
+        assert!(matches!(pending.poll(resume, resume), Work::Background));
     }
 }

@@ -28,6 +28,9 @@ pub(super) struct WindowGeometry {
 }
 
 impl WindowGeometry {
+    pub(super) fn image_dimensions(self) -> (u32, u32) {
+        (self.image_width, self.image_height)
+    }
     pub(super) fn from_hwnd_dimensions(
         target_id: u32,
         image_width: u32,
@@ -307,8 +310,17 @@ pub(super) struct ContentLocator {
     revision: Arc<AtomicU64>,
     selected: Option<LocatedContent>,
     last_discovery: Option<Instant>,
+    audit: Option<PendingAudit>,
     // Drop all UIA identities and handlers before uninitializing their apartment.
     automation: crate::automation::AutomationClient,
+}
+
+struct PendingAudit {
+    first: UIElement,
+    candidate: AuthoritativeCandidate,
+    geometry: WindowGeometry,
+    revision: u64,
+    resume: Instant,
 }
 
 impl ContentLocator {
@@ -359,11 +371,100 @@ impl ContentLocator {
             revision,
             selected: None,
             last_discovery: None,
+            audit: None,
         })
     }
 
     pub(super) fn is_current(&self, revision: u64) -> bool {
         self.revision.load(Ordering::Acquire) == revision
+    }
+
+    pub(super) fn audit_deadline(&self) -> Option<Instant> {
+        self.audit.as_ref().map(|audit| audit.resume)
+    }
+
+    // Only an unchanged periodic audit can yield with old evidence intact.
+    // A changed/ambiguous/missing candidate invalidates it before serving work.
+    pub(super) fn background_step(&mut self, geometry: WindowGeometry) -> Result<()> {
+        let result = self.advance_audit(geometry);
+        if result.is_err() {
+            self.audit = None;
+            self.selected = None;
+            self.revision.fetch_add(1, Ordering::AcqRel);
+            self.last_discovery = Some(Instant::now());
+        }
+        result
+    }
+
+    fn advance_audit(&mut self, geometry: WindowGeometry) -> Result<()> {
+        if let Some(audit) = self.audit.take() {
+            if audit.geometry != geometry || !self.is_current(audit.revision) {
+                return Err(anyhow!("定期確認中にTeamsの配置が変わりました"));
+            }
+            let started = Instant::now();
+            let next = scan_authoritative_element(&self.automation, self.target, geometry)?;
+            crate::diagnostics::log(format_args!(
+                "layout_audit stage=second scan_us={}",
+                started.elapsed().as_micros()
+            ));
+            let (element, candidate) =
+                next.ok_or_else(|| anyhow!("Teamsの共有範囲が確定していません"))?;
+            if candidate != audit.candidate
+                || !self.automation.compare_elements(&audit.first, &element)?
+                || !self.is_current(audit.revision)
+                || WindowGeometry::from_hwnd_dimensions(
+                    self.target,
+                    geometry.image_width,
+                    geometry.image_height,
+                )? != geometry
+            {
+                return Err(anyhow!("定期確認中にTeamsの共有範囲が変わりました"));
+            }
+            self.selected = Some(LocatedContent {
+                element,
+                candidate,
+                geometry,
+                revision: audit.revision,
+            });
+            self.last_discovery = Some(Instant::now());
+            return Ok(());
+        }
+        let revision = self.revision.load(Ordering::Acquire);
+        let unchanged = self.subscribed
+            && self
+                .selected
+                .as_ref()
+                .is_some_and(|old| old.geometry == geometry && old.revision == revision);
+        if !unchanged
+            || self
+                .last_discovery
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(2))
+        {
+            return self.locate(geometry, false).map(|_| ());
+        }
+        let started = Instant::now();
+        let first = scan_authoritative_element(&self.automation, self.target, geometry)?;
+        crate::diagnostics::log(format_args!(
+            "layout_audit stage=first scan_us={} yielded=true",
+            started.elapsed().as_micros()
+        ));
+        let (element, candidate) =
+            first.ok_or_else(|| anyhow!("Teamsの共有コンテンツ要素を確認できませんでした"))?;
+        let old = self.selected.as_ref().expect("unchanged selection");
+        if candidate != old.candidate
+            || !self.automation.compare_elements(&old.element, &element)?
+            || !self.is_current(revision)
+        {
+            return Err(anyhow!("定期確認中にTeamsの共有範囲が変わりました"));
+        }
+        self.audit = Some(PendingAudit {
+            first: element,
+            candidate,
+            geometry,
+            revision,
+            resume: Instant::now() + STABILITY_DELAY,
+        });
+        Ok(())
     }
 
     pub(super) fn locate(
@@ -426,6 +527,7 @@ impl ContentLocator {
     }
 
     fn discover(&mut self, geometry: WindowGeometry) -> Result<(PixelRect, u64)> {
+        self.audit = None;
         let revision = self.revision.load(Ordering::Acquire);
         let result = (|| {
             let mut first = scan_authoritative_element(&self.automation, self.target, geometry)?;
