@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod resident_recovery;
+
 use anyhow::{Context as _, Result, anyhow};
 use windows::Win32::{
     Foundation::HWND,
@@ -109,7 +111,9 @@ impl EngineInner {
             .and_then(|mut control| control.take());
         if let Some(control) = control {
             control.halt_handle().store(true, Ordering::Release);
+            let pending_stop = resident_recovery::PendingStop::new();
             defer_cleanup("snapbar-capture-stop", move || {
+                let _pending_stop = pending_stop;
                 let _ = control.stop();
             });
         }
@@ -384,10 +388,6 @@ impl CaptureEngine {
             || self.inner.control.lock().map_or(true, |control| {
                 control.as_ref().is_some_and(CaptureControl::is_finished)
             })
-    }
-
-    pub fn resident_retry_required(engine: Option<&Self>) -> bool {
-        engine.is_none_or(Self::is_finished)
     }
 
     pub fn is_local_monitor(&self) -> bool {
@@ -1413,7 +1413,7 @@ mod tests {
         }
     }
 
-    fn cached_remote_engine(target_id: u32) -> CaptureEngine {
+    pub(super) fn cached_remote_engine(target_id: u32) -> CaptureEngine {
         let rect = PixelRect::new(0, 0, 1, 1);
         CaptureEngine {
             inner: Arc::new(EngineInner {
