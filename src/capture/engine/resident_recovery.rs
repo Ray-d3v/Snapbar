@@ -58,10 +58,7 @@ impl CaptureEngine {
             return false;
         };
         let idle = now.saturating_duration_since(last_observed_at);
-        if state.latest.is_some()
-            || state.last_error.is_none()
-            || idle < RESIDENT_STALL_TIMEOUT
-        {
+        if state.latest.is_some() || state.last_error.is_none() || idle < RESIDENT_STALL_TIMEOUT {
             return false;
         }
         // Cache loss alone is not a failed WGC session. observe_frame runs for
@@ -113,18 +110,16 @@ mod tests {
         let last = Instant::now();
         let engine = failed_remote_engine(last);
         let retained = engine.clone();
-        assert!(!engine.retire_stalled_remote(
-            last + RESIDENT_STALL_TIMEOUT - Duration::from_millis(1),
-            0
-        ));
+        assert!(
+            !engine
+                .retire_stalled_remote(last + RESIDENT_STALL_TIMEOUT - Duration::from_millis(1), 0)
+        );
         assert!(!engine.is_finished());
         assert!(engine.retire_stalled_remote(last + RESIDENT_STALL_TIMEOUT, 0));
         assert!(retained.is_finished());
         assert!(!retained.is_ready());
-        let outcome = retained.copy_latest_to_clipboard(
-            &crate::capture::CaptureAuthorization::default(),
-            false,
-        );
+        let outcome = retained
+            .copy_latest_to_clipboard(&crate::capture::CaptureAuthorization::default(), false);
         assert!(outcome.result.is_err());
         assert!(outcome.replacement.is_none());
         assert!(outcome.save_result.is_none());
