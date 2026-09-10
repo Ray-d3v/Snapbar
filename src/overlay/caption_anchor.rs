@@ -227,7 +227,8 @@ impl CaptionProbe {
         ] {
             request.add_property(property).ok()?;
         }
-        let Ok(elements) = root.find_all_build_cache(TreeScope::Subtree, &condition, &request) else {
+        let Ok(elements) = root.find_all_build_cache(TreeScope::Subtree, &condition, &request)
+        else {
             crate::diagnostics::log(format_args!(
                 "caption_probe target={} reason=query_failed",
                 hwnd.0 as isize
@@ -246,18 +247,24 @@ impl CaptionProbe {
                 continue;
             }
             let offscreen = element.is_cached_offscreen().unwrap_or(true);
-            let rect = element.get_cached_bounding_rectangle().ok().map(|rect| RectI {
-                left: rect.get_left(),
-                top: rect.get_top(),
-                right: rect.get_right(),
-                bottom: rect.get_bottom(),
-            });
+            let rect = element
+                .get_cached_bounding_rectangle()
+                .ok()
+                .map(|rect| RectI {
+                    left: rect.get_left(),
+                    top: rect.get_top(),
+                    right: rect.get_right(),
+                    bottom: rect.get_bottom(),
+                });
             if let Some(role) = row_role {
                 // Only fixed semantic roles and geometry, never UI text/meeting
                 // titles. This distinguishes absent, hidden and invalid rows.
                 row_diagnostics.push((
                     role,
-                    element.get_cached_control_type().ok().map(|kind| kind as i32),
+                    element
+                        .get_cached_control_type()
+                        .ok()
+                        .map(|kind| kind as i32),
                     offscreen,
                     rect,
                 ));
@@ -454,7 +461,11 @@ mod tests {
     fn legacy_visible_caption_control_types_are_still_discovered() {
         let automation = crate::automation::AutomationClient::new().unwrap();
         let condition = caption_search_condition(&automation).unwrap();
-        for kind in [ControlType::Button, ControlType::ToolBar, ControlType::Group] {
+        for kind in [
+            ControlType::Button,
+            ControlType::ToolBar,
+            ControlType::Group,
+        ] {
             assert!(matches_condition(&condition, kind, "", false));
             assert!(!matches_condition(&condition, kind, "", true));
         }
@@ -470,17 +481,31 @@ mod tests {
             right: 300,
             bottom: 135,
         };
-        assert!(matches_condition(&condition, ControlType::Pane, "indicators", true));
+        assert!(matches_condition(
+            &condition,
+            ControlType::Pane,
+            "indicators",
+            true
+        ));
         assert_eq!(visible_probe_rect(true, Some(rect)), None);
         assert_eq!(visible_probe_rect(false, None), None);
-        assert_eq!(visible_probe_rect(false, Some(RectI { right: 10, ..rect })), None);
+        assert_eq!(
+            visible_probe_rect(false, Some(RectI { right: 10, ..rect })),
+            None
+        );
         assert_eq!(visible_probe_rect(false, Some(rect)), Some(rect));
     }
 
     #[test]
     fn a_missing_name_does_not_discard_a_known_row_identity() {
-        assert_eq!(caption_roles(Some("horizontalMiddleEnd"), None), (Some(2), None));
-        assert_eq!(caption_roles(Some("horizontalEnd"), Some("")), (Some(3), None));
+        assert_eq!(
+            caption_roles(Some("horizontalMiddleEnd"), None),
+            (Some(2), None)
+        );
+        assert_eq!(
+            caption_roles(Some("horizontalEnd"), Some("")),
+            (Some(3), None)
+        );
         assert_eq!(caption_roles(None, Some("最小化")), (None, Some(1)));
         assert_eq!(caption_roles(None, None), (None, None));
     }
@@ -503,7 +528,12 @@ mod tests {
                 caption_roles(Some(id), None).0.unwrap(),
                 visible_probe_rect(
                     false,
-                    Some(RectI { left, top: -1395, right, bottom: -1305 }),
+                    Some(RectI {
+                        left,
+                        top: -1395,
+                        right,
+                        bottom: -1305,
+                    }),
                 )
                 .unwrap(),
             )
