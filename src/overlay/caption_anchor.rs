@@ -5,9 +5,12 @@ use super::{RectI, extended_frame_bounds, get_window_rect};
 use std::time::{Duration, Instant};
 use uiautomation::{
     UIAutomation, UIElement,
+    core::UICondition,
     types::{ControlType, ElementMode, Handle, TreeScope, UIProperty},
 };
 use windows::Win32::{Foundation::HWND, UI::HiDpi::GetDpiForWindow};
+
+const MEETING_ROW_IDS: [&str; 3] = ["indicators", "horizontalMiddleEnd", "horizontalEnd"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CaptionObservation {
@@ -147,6 +150,26 @@ impl CaptionProbe {
             "caption_discovery target={} dpi={dpi}",
             hwnd.0 as isize
         ));
+        let started = Instant::now();
+        let result = self.discover(hwnd, window, frame, dpi);
+        crate::diagnostics::log(format_args!(
+            "caption_discovery_result target={} dpi={dpi} elapsed_us={} success={} rows={} buttons={}",
+            hwnd.0 as isize,
+            started.elapsed().as_micros(),
+            result.is_some(),
+            self.rows.len(),
+            self.buttons.len()
+        ));
+        result
+    }
+
+    fn discover(
+        &mut self,
+        hwnd: HWND,
+        window: RectI,
+        frame: RectI,
+        dpi: u32,
+    ) -> Option<CaptionObservation> {
         self.rows.clear();
         self.buttons.clear();
         if self.automation.is_none() {
@@ -158,37 +181,7 @@ impl CaptionProbe {
         let root = automation
             .element_from_handle(Handle::from(hwnd.0 as isize))
             .ok()?;
-        let buttons = automation
-            .create_property_condition(
-                UIProperty::ControlType,
-                (ControlType::Button as i32).into(),
-                None,
-            )
-            .ok()?;
-        let visible = automation
-            .create_property_condition(UIProperty::IsOffscreen, false.into(), None)
-            .ok()?;
-        let toolbars = automation
-            .create_property_condition(
-                UIProperty::ControlType,
-                (ControlType::ToolBar as i32).into(),
-                None,
-            )
-            .ok()?;
-        let groups = automation
-            .create_property_condition(
-                UIProperty::ControlType,
-                (ControlType::Group as i32).into(),
-                None,
-            )
-            .ok()?;
-        let types = automation
-            .create_or_condition(
-                buttons,
-                automation.create_or_condition(toolbars, groups).ok()?,
-            )
-            .ok()?;
-        let condition = automation.create_and_condition(types, visible).ok()?;
+        let condition = caption_candidate_condition(automation)?;
         let request = automation.create_cache_request().ok()?;
         request.set_tree_scope(TreeScope::Element).ok()?;
         request.set_element_mode(ElementMode::Full).ok()?;
@@ -198,6 +191,7 @@ impl CaptionProbe {
         for property in [
             UIProperty::Name,
             UIProperty::AutomationId,
+            UIProperty::ControlType,
             UIProperty::BoundingRectangle,
             UIProperty::IsOffscreen,
         ] {
@@ -208,49 +202,54 @@ impl CaptionProbe {
             .ok()?;
         let mut controls = Vec::new();
         let mut meeting_rows = Vec::new();
+        let mut diagnostic_rows = Vec::new();
         for element in elements {
-            let Ok(name) = element.get_cached_name() else {
-                continue;
-            };
-            let id = element.get_cached_automation_id().unwrap_or_default();
-            if let Some(role) = meeting_row_role(&id)
-                && !element.is_cached_offscreen().unwrap_or(true)
-                && let Ok(rect) = element.get_cached_bounding_rectangle()
+            // A row is identified by AutomationId, not its accessible name or
+            // whether this Teams layout exposes it as Group, ToolBar or Pane.
+            let id = element.get_cached_automation_id().ok();
+            let name = element.get_cached_name().ok();
+            let offscreen = element.is_cached_offscreen().ok();
+            let rect = element.get_cached_bounding_rectangle().ok().map(|rect| RectI {
+                left: rect.get_left(),
+                top: rect.get_top(),
+                right: rect.get_right(),
+                bottom: rect.get_bottom(),
+            });
+            if let Some(role) = id.as_deref().and_then(meeting_row_role)
+                && diagnostic_rows.len() < 12
             {
-                self.rows.push((role, element.clone()));
-                meeting_rows.push((
+                // Fixed role numbers, types and geometry only: no names,
+                // meeting text or arbitrary AutomationIds enter the log.
+                diagnostic_rows.push((
                     role,
-                    RectI {
-                        left: rect.get_left(),
-                        top: rect.get_top(),
-                        right: rect.get_right(),
-                        bottom: rect.get_bottom(),
-                    },
+                    element.get_cached_control_type().ok().map(|kind| kind as i32),
+                    offscreen,
+                    rect,
                 ));
             }
-            let Some(role) = caption_role(&name) else {
+            let (row_role, button_role) =
+                visible_candidate_roles(id.as_deref(), name.as_deref(), offscreen);
+            let Some(rect) = rect else {
                 continue;
             };
-            if element.is_cached_offscreen().unwrap_or(true) {
-                continue;
+            if let Some(role) = row_role {
+                self.rows.push((role, element.clone()));
+                meeting_rows.push((role, rect));
             }
-            if let Ok(rect) = element.get_cached_bounding_rectangle() {
-                self.buttons.push((role, element.clone()));
-                controls.push((
-                    role,
-                    RectI {
-                        left: rect.get_left(),
-                        top: rect.get_top(),
-                        right: rect.get_right(),
-                        bottom: rect.get_bottom(),
-                    },
-                ));
+            if let Some(role) = button_role {
+                self.buttons.push((role, element));
+                controls.push((role, rect));
             }
         }
-        // The meeting toolbar's top is the actual boundary even when Teams
-        // exposes its standard caption buttons as offscreen zero rectangles.
-        let bottom = select_meeting_row_top(frame, dpi, &meeting_rows)
-            .or_else(|| select_caption_bottom(frame, dpi, &controls))?;
+        // Discovery admission is broader, but boundary validation is unchanged:
+        // require visible, non-overlapping semantic rows with matching bounds.
+        let row_top = select_meeting_row_top(frame, dpi, &meeting_rows);
+        let button_bottom = select_caption_bottom(frame, dpi, &controls);
+        crate::diagnostics::log(format_args!(
+            "caption_candidates target={} dpi={dpi} frame={frame:?} rows={diagnostic_rows:?} buttons={controls:?} row_top={row_top:?} button_bottom={button_bottom:?}",
+            hwnd.0 as isize
+        ));
+        let bottom = row_top.or(button_bottom)?;
         // Results from a layout/DPI transition must never change the anchor.
         if get_window_rect(hwnd) != Some(window)
             || extended_frame_bounds(hwnd).unwrap_or(window) != frame
@@ -264,13 +263,66 @@ impl CaptionProbe {
     }
 }
 
-fn meeting_row_role(id: &str) -> Option<u8> {
-    match id {
-        "indicators" => Some(1),
-        "horizontalMiddleEnd" => Some(2),
-        "horizontalEnd" => Some(3),
-        _ => None,
+fn caption_candidate_condition(automation: &UIAutomation) -> Option<UICondition> {
+    let buttons = automation
+        .create_property_condition(
+            UIProperty::ControlType,
+            (ControlType::Button as i32).into(),
+            None,
+        )
+        .ok()?;
+    let toolbars = automation
+        .create_property_condition(
+            UIProperty::ControlType,
+            (ControlType::ToolBar as i32).into(),
+            None,
+        )
+        .ok()?;
+    let groups = automation
+        .create_property_condition(
+            UIProperty::ControlType,
+            (ControlType::Group as i32).into(),
+            None,
+        )
+        .ok()?;
+    let types = automation
+        .create_or_condition(
+            buttons,
+            automation.create_or_condition(toolbars, groups).ok()?,
+        )
+        .ok()?;
+    let visible = automation
+        .create_property_condition(UIProperty::IsOffscreen, false.into(), None)
+        .ok()?;
+    let mut condition: UICondition = automation.create_and_condition(types, visible).ok()?.into();
+    // Keep the existing caption-button query, but do not filter the known
+    // meeting row identities by provider ControlType. Offscreen row entries
+    // are collected for diagnostics only; visible_candidate_roles rejects them.
+    for id in MEETING_ROW_IDS {
+        let identity = automation
+            .create_property_condition(UIProperty::AutomationId, id.into(), None)
+            .ok()?;
+        condition = automation.create_or_condition(condition, identity).ok()?.into();
     }
+    Some(condition)
+}
+
+fn visible_candidate_roles(
+    id: Option<&str>,
+    name: Option<&str>,
+    offscreen: Option<bool>,
+) -> (Option<u8>, Option<u8>) {
+    if offscreen != Some(false) {
+        return (None, None);
+    }
+    (id.and_then(meeting_row_role), name.and_then(caption_role))
+}
+
+fn meeting_row_role(id: &str) -> Option<u8> {
+    MEETING_ROW_IDS
+        .iter()
+        .position(|candidate| *candidate == id)
+        .map(|index| index as u8 + 1)
 }
 
 fn select_meeting_row_top(frame: RectI, dpi: u32, rows: &[(u8, RectI)]) -> Option<i32> {
@@ -359,6 +411,98 @@ fn select_caption_bottom(frame: RectI, dpi: u32, controls: &[(u8, RectI)]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uiautomation::core::{UIAndCondition, UIOrCondition, UIPropertyCondition};
+
+    // Evaluate the actual native query tree against synthetic property values,
+    // rather than testing a second copy of the discovery predicate.
+    fn query_matches(condition: &UICondition, kind: ControlType, id: &str, offscreen: bool) -> bool {
+        if let Ok(property) = UIPropertyCondition::try_from(condition.clone()) {
+            let value = property.get_value().unwrap();
+            return match property.get_property().unwrap() {
+                UIProperty::ControlType => {
+                    let expected: i32 = value.try_into().unwrap();
+                    expected == kind as i32
+                }
+                UIProperty::AutomationId => value.get_string().unwrap() == id,
+                UIProperty::IsOffscreen => {
+                    let expected: bool = value.try_into().unwrap();
+                    expected == offscreen
+                }
+                _ => panic!("unexpected caption query property"),
+            };
+        }
+        if let Ok(and) = UIAndCondition::try_from(condition.clone()) {
+            return and
+                .get_children()
+                .unwrap()
+                .iter()
+                .all(|child| query_matches(child, kind, id, offscreen));
+        }
+        UIOrCondition::try_from(condition.clone())
+            .unwrap()
+            .get_children()
+            .unwrap()
+            .iter()
+            .any(|child| query_matches(child, kind, id, offscreen))
+    }
+
+    #[test]
+    fn cold_discovery_admits_known_rows_without_control_type_assumptions() {
+        let automation = crate::automation::AutomationClient::new().unwrap();
+        let condition = caption_candidate_condition(&automation).unwrap();
+        for id in MEETING_ROW_IDS {
+            for kind in [
+                ControlType::Button,
+                ControlType::ToolBar,
+                ControlType::Group,
+                ControlType::Pane,
+                ControlType::Custom,
+                ControlType::Text,
+                ControlType::Document,
+            ] {
+                assert!(query_matches(&condition, kind, id, false));
+            }
+        }
+        assert!(!query_matches(&condition, ControlType::Pane, "chat-toolbar", false));
+        assert!(!query_matches(&condition, ControlType::Custom, "", false));
+        assert!(query_matches(&condition, ControlType::Button, "", false));
+        assert!(!query_matches(&condition, ControlType::Button, "", true));
+    }
+
+    #[test]
+    fn known_rows_do_not_require_a_successful_name_read() {
+        for (index, id) in MEETING_ROW_IDS.into_iter().enumerate() {
+            for name in [None, Some("")] {
+                assert_eq!(
+                    visible_candidate_roles(Some(id), name, Some(false)),
+                    (Some(index as u8 + 1), None)
+                );
+            }
+        }
+        assert_eq!(
+            visible_candidate_roles(None, Some("閉じる"), Some(false)),
+            (None, Some(3))
+        );
+        assert_eq!(
+            visible_candidate_roles(Some("chat-toolbar"), None, Some(false)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn diagnostic_offscreen_rows_never_authorize_a_boundary() {
+        let automation = crate::automation::AutomationClient::new().unwrap();
+        let condition = caption_candidate_condition(&automation).unwrap();
+        for id in MEETING_ROW_IDS {
+            assert!(query_matches(&condition, ControlType::Pane, id, true));
+            for offscreen in [Some(true), None] {
+                assert_eq!(
+                    visible_candidate_roles(Some(id), Some("閉じる"), offscreen),
+                    (None, None)
+                );
+            }
+        }
+    }
 
     #[test]
     fn failed_discovery_is_throttled_but_geometry_changes_retry_immediately() {
