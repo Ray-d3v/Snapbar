@@ -127,9 +127,11 @@ mod tests {
 
     #[test]
     fn a_twenty_seven_minute_stall_does_not_need_a_click_to_be_detected() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(27 * 60));
-        assert!(engine.retire_stalled_remote(now, 0));
+        // Advance synthetic time instead of subtracting from the platform's
+        // current Instant; a newly booted CI runner need not be 27 minutes old.
+        let last = Instant::now();
+        let engine = failed_remote_engine(last);
+        assert!(engine.retire_stalled_remote(last + Duration::from_secs(27 * 60), 0));
         assert!(CaptureEngine::resident_retry_required(Some(&engine)));
     }
 
@@ -148,8 +150,9 @@ mod tests {
 
     #[test]
     fn an_arrival_after_the_stall_cancels_retirement_even_before_uia_recovers() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let engine = failed_remote_engine(last);
         engine.inner.shared.observe_frame((1, 1), now).unwrap();
         assert!(!engine.retire_stalled_remote(now, 0));
         assert!(!engine.is_finished());
@@ -157,18 +160,18 @@ mod tests {
 
     #[test]
     fn a_healthy_static_cached_frame_is_not_a_stalled_session() {
-        let now = Instant::now();
+        let last = Instant::now();
         let engine = cached_remote_engine(0);
-        engine.inner.shared.state.lock().unwrap().last_observed_at =
-            Some(now - Duration::from_secs(60 * 60));
-        assert!(!engine.retire_stalled_remote(now, 0));
+        engine.inner.shared.state.lock().unwrap().last_observed_at = Some(last);
+        assert!(!engine.retire_stalled_remote(last + Duration::from_secs(60 * 60), 0));
         assert!(engine.is_ready());
     }
 
     #[test]
     fn active_requests_and_preflight_are_not_interrupted() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let engine = failed_remote_engine(last);
         let shared = &engine.inner.shared;
         shared.preflight_in_progress.store(true, Ordering::Release);
         assert!(!engine.retire_stalled_remote(now, 0));
@@ -181,8 +184,9 @@ mod tests {
 
     #[test]
     fn a_busy_state_lock_is_skipped_instead_of_blocking_the_resident_tick() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let engine = failed_remote_engine(last);
         let state = engine.inner.shared.state.lock().unwrap();
         assert!(!engine.retire_stalled_remote(now, 0));
         drop(state);
@@ -191,8 +195,9 @@ mod tests {
 
     #[test]
     fn pending_native_cleanup_prevents_an_automatic_restart_loop() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let engine = failed_remote_engine(last);
         assert!(!engine.retire_stalled_remote(now, 1));
         assert!(!engine.is_finished());
         assert!(engine.retire_stalled_remote(now, 0));
@@ -200,8 +205,9 @@ mod tests {
 
     #[test]
     fn no_recorded_failure_or_no_observation_is_not_stall_evidence() {
-        let now = Instant::now();
-        let engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let engine = failed_remote_engine(last);
         engine.inner.shared.state.lock().unwrap().last_error = None;
         assert!(!engine.retire_stalled_remote(now, 0));
         {
@@ -214,8 +220,9 @@ mod tests {
 
     #[test]
     fn remote_stall_policy_does_not_change_local_monitor_recovery() {
-        let now = Instant::now();
-        let mut engine = failed_remote_engine(now - Duration::from_secs(60));
+        let last = Instant::now();
+        let now = last + Duration::from_secs(60);
+        let mut engine = failed_remote_engine(last);
         let inner = Arc::get_mut(&mut engine.inner).unwrap();
         Arc::get_mut(&mut inner.shared).unwrap().source =
             CaptureSource::LocalMonitor(LocalMonitorCaptureTarget {
