@@ -402,13 +402,14 @@ impl ContentLocator {
                 return Err(anyhow!("定期確認中にTeamsの配置が変わりました"));
             }
             let started = Instant::now();
-            let next = scan_authoritative_element(&self.automation, self.target, geometry)?;
+            let next = scan_authoritative_element(&self.automation, self.target, geometry);
             crate::diagnostics::log(format_args!(
-                "layout_audit stage=second scan_us={}",
-                started.elapsed().as_micros()
+                "layout_audit stage=second scan_us={} error={:?}",
+                started.elapsed().as_micros(),
+                next.as_ref().err().map(ToString::to_string)
             ));
             let (element, candidate) =
-                next.ok_or_else(|| anyhow!("Teamsの共有範囲が確定していません"))?;
+                next?.ok_or_else(|| anyhow!("Teamsの共有範囲が確定していません"))?;
             if candidate != audit.candidate
                 || !self.automation.compare_elements(&audit.first, &element)?
                 || !self.is_current(audit.revision)
@@ -443,13 +444,14 @@ impl ContentLocator {
             return self.locate(geometry, false).map(|_| ());
         }
         let started = Instant::now();
-        let first = scan_authoritative_element(&self.automation, self.target, geometry)?;
+        let first = scan_authoritative_element(&self.automation, self.target, geometry);
         crate::diagnostics::log(format_args!(
-            "layout_audit stage=first scan_us={} yielded=true",
-            started.elapsed().as_micros()
+            "layout_audit stage=first scan_us={} error={:?}",
+            started.elapsed().as_micros(),
+            first.as_ref().err().map(ToString::to_string)
         ));
         let (element, candidate) =
-            first.ok_or_else(|| anyhow!("Teamsの共有コンテンツ要素を確認できませんでした"))?;
+            first?.ok_or_else(|| anyhow!("Teamsの共有コンテンツ要素を確認できませんでした"))?;
         let old = self.selected.as_ref().expect("unchanged selection");
         if candidate != old.candidate
             || !self.automation.compare_elements(&old.element, &element)?

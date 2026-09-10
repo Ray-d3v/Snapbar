@@ -1180,10 +1180,14 @@ impl Snapbar {
             && self.capture_requests.active.is_none()
             && self.current_capture_source().is_some()
             && !ready
+            && CaptureEngine::resident_retry_required(self.capture_engine.as_ref())
             && self
                 .capture_retry_at
                 .is_none_or(|deadline| Instant::now() >= deadline)
         {
+            crate::diagnostics::log(format_args!(
+                "capture_restart reason=missing_or_finished_session"
+            ));
             self.restart_capture_engine(cx);
             changed = true;
         }

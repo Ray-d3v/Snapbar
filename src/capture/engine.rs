@@ -386,6 +386,10 @@ impl CaptureEngine {
             })
     }
 
+    pub fn resident_retry_required(engine: Option<&Self>) -> bool {
+        engine.is_none_or(Self::is_finished)
+    }
+
     pub fn is_local_monitor(&self) -> bool {
         self.inner.shared.source.is_local_monitor()
     }
@@ -693,6 +697,11 @@ impl CaptureEngine {
         // The old session cannot satisfy this request. Retire it before
         // starting its replacement, so backup UIA/crops do not compete with
         // the new session while the UI still retains the old engine handle.
+        crate::diagnostics::log(format_args!(
+            "capture_restart reason=frame_unavailable error={:?} engine={}",
+            first.as_ref().err().map(|error| format!("{error:#}")),
+            self.diagnostic_status()
+        ));
         self.stop();
         let new_engine = match restart(source) {
             Ok(engine) => engine,
@@ -1616,6 +1625,22 @@ mod tests {
             Some(0),
         );
         assert!(result.unwrap_err().to_string().contains("停止"));
+    }
+
+    #[test]
+    fn uia_cache_loss_does_not_restart_a_live_resident_session() {
+        let engine = cached_remote_engine(0);
+        engine
+            .inner
+            .shared
+            .has_cached_frame
+            .store(false, Ordering::Release);
+        engine.inner.shared.state.lock().unwrap().latest = None;
+        assert!(!engine.is_ready());
+        assert!(!CaptureEngine::resident_retry_required(Some(&engine)));
+        engine.stop();
+        assert!(CaptureEngine::resident_retry_required(Some(&engine)));
+        assert!(CaptureEngine::resident_retry_required(None));
     }
 
     #[test]

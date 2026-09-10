@@ -225,9 +225,10 @@ fn run_resolver(target: u32, queue: Arc<LayoutQueue>) {
                 let result = WindowGeometry::from_hwnd_dimensions(target, width, height)
                     .and_then(|geometry| locator.background_step(geometry));
                 crate::diagnostics::log(format_args!(
-                    "layout_background target={target} verify_us={} success={}",
+                    "layout_background target={target} verify_us={} success={} error={:?}",
                     started.elapsed().as_micros(),
-                    result.is_ok()
+                    result.is_ok(),
+                    result.as_ref().err().map(|error| format!("{error:#}"))
                 ));
             }
             last_background = Instant::now();
