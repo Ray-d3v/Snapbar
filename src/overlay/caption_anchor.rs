@@ -74,28 +74,26 @@ impl DiscoveryThrottle {
 // not additional requirements for that identity. A newly created demo window
 // must be able to discover the same rows that an existing probe can read live.
 fn caption_search_condition(automation: &UIAutomation) -> uiautomation::Result<UICondition> {
-    let mut types: UICondition = automation
-        .create_property_condition(
-            UIProperty::ControlType,
-            (ControlType::Button as i32).into(),
-            None,
-        )?
-        .into();
+    let mut types = automation.create_property_condition(
+        UIProperty::ControlType,
+        (ControlType::Button as i32).into(),
+        None,
+    )?;
     for kind in [ControlType::ToolBar, ControlType::Group] {
         let condition = automation.create_property_condition(
             UIProperty::ControlType,
             (kind as i32).into(),
             None,
         )?;
-        types = automation.create_or_condition(types, condition)?.into();
+        types = automation.create_or_condition(types, condition)?;
     }
     let visible =
         automation.create_property_condition(UIProperty::IsOffscreen, false.into(), None)?;
-    let mut condition: UICondition = automation.create_and_condition(types, visible)?.into();
+    let mut condition = automation.create_and_condition(types, visible)?;
     for id in MEETING_ROW_IDS {
         let identity =
             automation.create_property_condition(UIProperty::AutomationId, id.into(), None)?;
-        condition = automation.create_or_condition(condition, identity)?.into();
+        condition = automation.create_or_condition(condition, identity)?;
     }
     // Offscreen known rows are retrieved for diagnostics only. The consumer
     // below rejects them before retaining any geometry or live element.
