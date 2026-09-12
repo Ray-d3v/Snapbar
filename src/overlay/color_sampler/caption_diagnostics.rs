@@ -214,7 +214,10 @@ fn log_node(
         .get_cached_automation_id()
         .ok()
         .map(|id| diagnostic_id(&id));
-    let kind = element.get_cached_control_type().ok().map(|kind| kind as i32);
+    let kind = element
+        .get_cached_control_type()
+        .ok()
+        .map(|kind| kind as i32);
     let offscreen = element.is_cached_offscreen().ok();
     let rect = cached_rect(element);
     crate::diagnostics::log(format_args!(
@@ -230,8 +233,12 @@ fn collect(
     state: &mut WalkState,
 ) -> Result<(), &'static str> {
     let cache = automation.create_cache_request().map_err(|_| "cache")?;
-    cache.set_tree_scope(TreeScope::Element).map_err(|_| "cache")?;
-    cache.set_element_mode(ElementMode::Full).map_err(|_| "cache")?;
+    cache
+        .set_tree_scope(TreeScope::Element)
+        .map_err(|_| "cache")?;
+    cache
+        .set_element_mode(ElementMode::Full)
+        .map_err(|_| "cache")?;
     cache
         .set_tree_filter(automation.create_true_condition().map_err(|_| "cache")?)
         .map_err(|_| "cache")?;
@@ -249,7 +256,9 @@ fn collect(
         .element_from_handle_build_cache(Handle::from(hwnd.0 as isize), &cache)
         .map_err(|_| "root")?;
     let walker = automation.get_raw_view_walker().map_err(|_| "walker")?;
-    let mut condition = automation.create_false_condition().map_err(|_| "condition")?;
+    let mut condition = automation
+        .create_false_condition()
+        .map_err(|_| "condition")?;
     for id in ROW_IDS {
         let part = automation
             .create_property_condition(UIProperty::AutomationId, id.into(), None)
@@ -275,6 +284,9 @@ fn collect(
         "caption_tree_rows trace={trace} count={} header_bottom={header_bottom}",
         rows.len()
     ));
+    if rows.is_empty() {
+        return Err("rows_missing");
+    }
     let mut parents = Vec::new();
     let mut seen = HashSet::new();
     for row in &rows {
@@ -287,7 +299,10 @@ fn collect(
         let mut reached_root = false;
         for _ in 0..MAX_DEPTH {
             state.step()?;
-            if automation.compare_elements(&node, &root).map_err(|_| "compare")? {
+            if automation
+                .compare_elements(&node, &root)
+                .map_err(|_| "compare")?
+            {
                 reached_root = true;
                 break;
             }
@@ -405,12 +420,34 @@ mod tests {
 
     #[test]
     fn header_filter_includes_the_reported_gap_but_not_meeting_content() {
-        let frame = RectI { left: 409, top: 191, right: 2313, bottom: 1349 };
-        let banner = RectI { left: 421, top: 236, right: 2293, bottom: 288 };
+        let frame = RectI {
+            left: 409,
+            top: 191,
+            right: 2313,
+            bottom: 1349,
+        };
+        let banner = RectI {
+            left: 421,
+            top: 236,
+            right: 2293,
+            bottom: 288,
+        };
         assert!(header_intersects(frame, 375, Some(banner)));
-        assert!(!header_intersects(frame, 375, Some(RectI { top: 375, bottom: 900, ..banner })));
+        assert!(!header_intersects(
+            frame,
+            375,
+            Some(RectI {
+                top: 375,
+                bottom: 900,
+                ..banner
+            })
+        ));
         assert!(!header_intersects(frame, 375, None));
         let moved = frame.offset(-3000, -2000);
-        assert!(header_intersects(moved, -1625, Some(banner.offset(-3000, -2000))));
+        assert!(header_intersects(
+            moved,
+            -1625,
+            Some(banner.offset(-3000, -2000))
+        ));
     }
 }
