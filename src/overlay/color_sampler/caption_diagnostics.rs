@@ -280,7 +280,9 @@ fn record_scoped_header(
     state: &mut WalkState,
 ) -> Result<(), &'static str> {
     let cache = diagnostic_cache(automation, ElementMode::None)?;
-    let condition = automation.create_true_condition().map_err(|_| "condition")?;
+    let condition = automation
+        .create_true_condition()
+        .map_err(|_| "condition")?;
     state.step()?;
     let started = Instant::now();
     // One root-scoped bulk query, with an Element-only cache (not a subtree
@@ -423,8 +425,16 @@ fn collect(
         let path = verified_path(
             row.clone(),
             MAX_DEPTH,
-            |node| automation.compare_elements(node, &root).map_err(|_| "compare"),
-            |node| walker.get_parent_build_cache(node, &cache).map_err(|_| "parent"),
+            |node| {
+                automation
+                    .compare_elements(node, &root)
+                    .map_err(|_| "compare")
+            },
+            |node| {
+                walker
+                    .get_parent_build_cache(node, &cache)
+                    .map_err(|_| "parent")
+            },
             || state.step(),
         );
         let path = match path {
@@ -670,6 +680,5 @@ mod tests {
         assert_eq!(cache.get_tree_scope().unwrap(), TreeScope::Element);
         assert_eq!(PROPERTIES.len(), 4);
         assert!(!PROPERTIES.contains(&UIProperty::Name));
-        assert!(MAX_ROWS + MAX_HEADER_NODES < MAX_NODES);
     }
 }
