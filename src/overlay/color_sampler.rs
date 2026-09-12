@@ -9,6 +9,8 @@ use windows::Win32::Foundation::HWND;
 
 use crate::shutdown::defer_cleanup;
 
+mod caption_diagnostics;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ColorRequest {
     pub(super) target_id: u32,
@@ -34,12 +36,16 @@ impl ColorSampler {
         Self::start_with_factory(wake_tx, || {
             let mut readback = super::caption_readback::CaptionReadback::default();
             let mut probe = super::caption_anchor::CaptionProbe::new();
+            let mut trace = caption_diagnostics::CaptionTrace::default();
             let mut last_material = None;
             let mut last_read = Instant::now() - Duration::from_secs(1);
             let mut last_caption = None;
             let mut last_target = None;
             move |request: ColorRequest| {
                 let hwnd = HWND(request.target_id as usize as *mut c_void);
+                // Diagnostics never supplies an anchor. Probe again afterwards
+                // so a slow trace cannot make an earlier observation current.
+                trace.record_if_due(hwnd, last_caption.is_some());
                 let caption = probe.measure(hwnd);
                 if last_target != Some(request.target_id)
                     || caption != last_caption
