@@ -161,7 +161,9 @@ fn height(rect: RectI) -> i64 {
 }
 
 fn tolerance(dpi: u32) -> Option<i64> {
-    (96..=768).contains(&dpi).then_some(i64::from(dpi.div_ceil(96)))
+    (96..=768)
+        .contains(&dpi)
+        .then_some(i64::from(dpi.div_ceil(96)))
 }
 
 fn near(a: i32, b: i32, tolerance: i64) -> bool {
@@ -328,17 +330,26 @@ mod tests {
         let nodes = nodes();
         assert_eq!(select(frame(), 96, &nodes[..2]), Selection::Unavailable);
         assert_eq!(Selection::Unavailable.or_else(|| Some(45)), Some(45));
-        assert_eq!(Selection::Invalid.or_else(|| panic!("ambiguous header")), None);
+        assert_eq!(
+            Selection::Invalid.or_else(|| panic!("ambiguous header")),
+            None
+        );
     }
 
     #[test]
     fn unrelated_ids_and_control_types_are_not_header_markers() {
-        assert_eq!(role(ControlType::Button, "more-options-header"), Some(Role::More));
+        assert_eq!(
+            role(ControlType::Button, "more-options-header"),
+            Some(Role::More)
+        );
         assert_eq!(role(ControlType::MenuBar, "MenuBar"), Some(Role::Menu));
         for id in ["", "more-options-header-copy", "close", "MenuBar"] {
             assert_ne!(role(ControlType::Button, id), Some(Role::More));
         }
-        assert_ne!(role(ControlType::Text, "more-options-header"), Some(Role::More));
+        assert_ne!(
+            role(ControlType::Text, "more-options-header"),
+            Some(Role::More)
+        );
         assert_ne!(role(ControlType::Button, "MenuBar"), Some(Role::Menu));
     }
 
@@ -347,13 +358,19 @@ mod tests {
         let mut nodes = nodes();
         nodes.push(Node {
             role: Role::Container,
-            rect: RectI { bottom: 230, ..nodes[0].rect },
+            rect: RectI {
+                bottom: 230,
+                ..nodes[0].rect
+            },
         });
         assert_eq!(select(frame(), 96, &nodes), Selection::Invalid);
         nodes.pop();
         nodes.push(Node {
             role: Role::More,
-            rect: RectI { left: 3230, ..nodes[3].rect },
+            rect: RectI {
+                left: 3230,
+                ..nodes[3].rect
+            },
         });
         assert_eq!(select(frame(), 96, &nodes), Selection::Invalid);
     }
@@ -379,23 +396,30 @@ mod tests {
     #[test]
     fn current_geometry_follows_zoom_and_negative_monitor_origins() {
         let original = nodes();
-        for dpi in [96, 110, 120, 144, 168, 192, 240, 288] {
+        for dpi in [96_u32, 110, 120, 144, 168, 192, 240, 288] {
             for zoom in [0.75_f64, 1.0, 1.5, 2.0, 3.0] {
                 let scale = f64::from(dpi) / 96.0;
                 let map = |rect: RectI| RectI {
                     left: -5000 + ((rect.left - frame().left) as f64 * scale).round() as i32,
                     top: -2000 + ((rect.top - frame().top) as f64 * scale * zoom).round() as i32,
                     right: -5000 + ((rect.right - frame().left) as f64 * scale).round() as i32,
-                    bottom: -2000 + ((rect.bottom - frame().top) as f64 * scale * zoom).round() as i32,
+                    bottom: -2000
+                        + ((rect.bottom - frame().top) as f64 * scale * zoom).round() as i32,
                 };
                 // The second wrapper's border is a physical UIA rounding edge,
                 // not a Teams zoom-dependent padding value.
-                let mut scaled: Vec<_> = original.iter().map(|node| Node {
-                    role: node.role,
-                    rect: map(node.rect),
-                }).collect();
+                let mut scaled: Vec<_> = original
+                    .iter()
+                    .map(|node| Node {
+                        role: node.role,
+                        rect: map(node.rect),
+                    })
+                    .collect();
                 scaled[1].rect.bottom = scaled[0].rect.bottom + dpi.div_ceil(96) as i32;
-                assert_eq!(select(map(frame()), dpi, &scaled), Selection::Boundary(scaled[0].rect.bottom));
+                assert_eq!(
+                    select(map(frame()), dpi, &scaled),
+                    Selection::Boundary(scaled[0].rect.bottom)
+                );
             }
         }
     }
@@ -406,19 +430,40 @@ mod tests {
         for dpi in [0, 95, 769, u32::MAX] {
             assert_eq!(select(frame(), dpi, &nodes), Selection::Invalid);
         }
-        assert_eq!(select(RectI { right: 0, ..frame() }, 96, &nodes), Selection::Invalid);
+        assert_eq!(
+            select(
+                RectI {
+                    right: 0,
+                    ..frame()
+                },
+                96,
+                &nodes
+            ),
+            Selection::Invalid
+        );
         let many = vec![nodes[0]; MAX_ELEMENTS + 1];
         assert_eq!(select(frame(), 96, &many), Selection::Invalid);
-        assert!(!container_in_frame(frame(), 96, RectI {
-            left: i32::MIN, top: i32::MIN, right: i32::MAX, bottom: i32::MAX,
-        }));
+        assert!(!container_in_frame(
+            frame(),
+            96,
+            RectI {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            }
+        ));
     }
 
     #[test]
     fn current_cache_requests_only_metadata_and_no_ui_text() {
         let automation = crate::automation::AutomationClient::new().unwrap();
         let request = current_cache(&automation).unwrap();
-        let element = automation.get_root_element().unwrap().build_updated_cache(&request).unwrap();
+        let element = automation
+            .get_root_element()
+            .unwrap()
+            .build_updated_cache(&request)
+            .unwrap();
         assert!(element.get_cached_control_type().is_ok());
         assert!(element.is_cached_offscreen().is_ok());
         assert!(element.get_cached_bounding_rectangle().is_ok());
