@@ -184,8 +184,7 @@ impl CaptionProbe {
             if let Some(bottom) = header.or_else(|| {
                 select_meeting_row_top(frame, dpi, &rows)
                     .or_else(|| select_caption_bottom(frame, dpi, &buttons))
-            })
-                && get_window_rect(hwnd) == Some(window)
+            }) && get_window_rect(hwnd) == Some(window)
                 && extended_frame_bounds(hwnd).unwrap_or(window) == frame
                 && unsafe { GetDpiForWindow(hwnd) } == dpi
             {
