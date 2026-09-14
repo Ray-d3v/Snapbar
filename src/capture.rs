@@ -10,6 +10,7 @@ use std::{
 mod content_detector;
 mod engine;
 mod flash;
+pub(crate) mod flash_color;
 mod layout;
 mod local_share;
 mod output;
