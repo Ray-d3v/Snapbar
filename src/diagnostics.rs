@@ -12,19 +12,34 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) mod visual;
+
 const LIMIT: u64 = 4 * 1024 * 1024;
 thread_local! { static REQUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn next_request() -> u64 {
     NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
 }
-pub(crate) struct RequestScope(u64);
+pub(crate) fn current_request() -> u64 {
+    REQUEST.get()
+}
+pub(crate) struct RequestScope {
+    previous: u64,
+    visual: Option<visual::ScopeTrace>,
+}
 pub(crate) fn request_scope(id: u64) -> RequestScope {
-    RequestScope(REQUEST.replace(id))
+    let previous = REQUEST.replace(id);
+    RequestScope {
+        previous,
+        visual: visual::ScopeTrace::enter(id),
+    }
 }
 impl Drop for RequestScope {
     fn drop(&mut self) {
-        REQUEST.set(self.0);
+        if let Some(trace) = self.visual.take() {
+            trace.finish();
+        }
+        REQUEST.set(self.previous);
     }
 }
 pub(crate) fn measure<T, E>(stage: &str, work: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
@@ -129,6 +144,7 @@ pub(crate) fn init() -> Guard {
         dropped,
         started: Instant::now(),
     });
+    visual::init();
     log(format_args!(
         "session_start version={} pid={} arch={} os={} log_schema=1",
         env!("CARGO_PKG_VERSION"),
@@ -140,6 +156,9 @@ pub(crate) fn init() -> Guard {
         "build={} logical_processors={:?}",
         env!("SNAPBAR_BUILD_ID"),
         thread::available_parallelism()
+    ));
+    log(format_args!(
+        "visual_diagnostics schema=1 native_snapshots=request_scopes read_only=true"
     ));
     Guard
 }

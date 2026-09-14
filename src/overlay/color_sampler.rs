@@ -51,15 +51,31 @@ impl ColorSampler {
                     || caption != last_caption
                     || last_read.elapsed() >= Duration::from_millis(350)
                 {
+                    // Observe the existing read only. Capture correlation must
+                    // never change its cadence, geometry or adoption rules.
+                    let context_before = crate::diagnostics::visual::recent_capture();
+                    let read_started = Instant::now();
+                    let previous = last_material;
                     last_material = super::sample_titlebar_color(
                         hwnd,
                         request.caption_height,
                         &mut readback,
                         caption,
                     );
+                    let read_us = read_started.elapsed().as_micros();
                     last_read = Instant::now();
                     last_caption = caption;
                     last_target = Some(request.target_id);
+                    let context_after = crate::diagnostics::visual::recent_capture();
+                    if previous != last_material
+                        || context_before.is_some()
+                        || context_after.is_some()
+                    {
+                        crate::diagnostics::log(format_args!(
+                            "visual_color_sample target={} capture_before={context_before:?} capture_after={context_after:?} caption_height={} caption={caption:?} previous={previous:?} sampled={last_material:?} read_us={read_us} fresh=true adoption=not_observed",
+                            request.target_id, request.caption_height
+                        ));
+                    }
                 }
                 let material = last_material;
                 (material, caption)
@@ -157,6 +173,13 @@ impl ColorSampler {
         match self.result_rx.try_recv() {
             Ok(result) => {
                 self.busy = false;
+                if let Some(request) = crate::diagnostics::visual::recent_capture() {
+                    // Receipt by the follower is not proof of adoption or of
+                    // the pixels displayed by DWM. Preserve that distinction.
+                    crate::diagnostics::log(format_args!(
+                        "visual_color_received capture_request={request} result={result:?} adoption=not_observed"
+                    ));
+                }
                 Some(result)
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
