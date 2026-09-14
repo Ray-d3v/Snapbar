@@ -1,6 +1,6 @@
-//! Teams may draw a shorter custom caption than DWM's native button rectangle.
-//! Prefer a consistent, semantically identified UIA caption-button row. No pixel
-//! or monitor-resolution heuristics determine the vertical attachment.
+//! Teams may draw a custom caption independently of its meeting toolbar.
+//! Prefer a root-scoped header with corroborating semantic controls; retain
+//! caption-row fallbacks when that header is unavailable. No pixel crop tables.
 use super::{RectI, extended_frame_bounds, get_window_rect};
 use std::time::{Duration, Instant};
 use uiautomation::{
@@ -9,6 +9,8 @@ use uiautomation::{
     types::{ControlType, ElementMode, Handle, TreeScope, UIProperty},
 };
 use windows::Win32::{Foundation::HWND, UI::HiDpi::GetDpiForWindow};
+
+mod header;
 
 const MEETING_ROW_IDS: [&str; 3] = ["indicators", "horizontalMiddleEnd", "horizontalEnd"];
 
@@ -70,16 +72,21 @@ impl DiscoveryThrottle {
     }
 }
 
-// A known meeting-row AutomationId is the identity; ControlType and Name are
-// not additional requirements for that identity. A newly created demo window
-// must be able to discover the same rows that an existing probe can read live.
+// Include header containers in the existing root-scoped bulk read, rather than
+// adding a second whole-tree walk. A generic Pane is only a candidate, never
+// sufficient header identity; header::HeaderProbe requires two semantic controls.
 fn caption_search_condition(automation: &UIAutomation) -> uiautomation::Result<UICondition> {
     let mut types = automation.create_property_condition(
         UIProperty::ControlType,
         (ControlType::Button as i32).into(),
         None,
     )?;
-    for kind in [ControlType::ToolBar, ControlType::Group] {
+    for kind in [
+        ControlType::ToolBar,
+        ControlType::Group,
+        ControlType::Pane,
+        ControlType::MenuBar,
+    ] {
         let condition = automation.create_property_condition(
             UIProperty::ControlType,
             (kind as i32).into(),
@@ -111,6 +118,7 @@ fn visible_probe_rect(offscreen: bool, rect: Option<RectI>) -> Option<RectI> {
 pub(super) struct CaptionProbe {
     rows: Vec<(u8, UIElement)>,
     buttons: Vec<(u8, UIElement)>,
+    header: header::HeaderProbe,
     discovery: DiscoveryThrottle,
     automation: Option<UIAutomation>,
     last: Option<(CaptionObservation, Instant)>,
@@ -120,6 +128,7 @@ impl CaptionProbe {
         Self {
             rows: Vec::new(),
             buttons: Vec::new(),
+            header: header::HeaderProbe::default(),
             discovery: DiscoveryThrottle::default(),
             automation: None,
             last: None,
@@ -171,8 +180,11 @@ impl CaptionProbe {
                     ))
                 })
                 .collect();
-            if let Some(bottom) = select_meeting_row_top(frame, dpi, &rows)
-                .or_else(|| select_caption_bottom(frame, dpi, &buttons))
+            let header = self.header.current(frame, dpi);
+            if let Some(bottom) = header.or_else(|| {
+                select_meeting_row_top(frame, dpi, &rows)
+                    .or_else(|| select_caption_bottom(frame, dpi, &buttons))
+            })
                 && get_window_rect(hwnd) == Some(window)
                 && extended_frame_bounds(hwnd).unwrap_or(window) == frame
                 && unsafe { GetDpiForWindow(hwnd) } == dpi
@@ -190,6 +202,7 @@ impl CaptionProbe {
         ));
         self.rows.clear();
         self.buttons.clear();
+        self.header.clear();
         if self.automation.is_none() {
             self.automation = UIAutomation::new()
                 .or_else(|_| UIAutomation::new_direct())
@@ -209,6 +222,7 @@ impl CaptionProbe {
             ));
             return None;
         };
+        self.header.prepare(automation);
         let condition = caption_search_condition(automation).ok()?;
         let request = automation.create_cache_request().ok()?;
         request.set_tree_scope(TreeScope::Element).ok()?;
@@ -238,6 +252,7 @@ impl CaptionProbe {
         let mut meeting_rows = Vec::new();
         let mut row_diagnostics = Vec::new();
         for element in elements {
+            self.header.add_cached(&element, frame, dpi);
             let id = element.get_cached_automation_id().ok();
             let name = element.get_cached_name().ok();
             let (row_role, button_role) = caption_roles(id.as_deref(), name.as_deref());
@@ -279,15 +294,21 @@ impl CaptionProbe {
                 controls.push((role, rect));
             }
         }
-        // The meeting toolbar's top is the actual boundary even when Teams
-        // exposes its standard caption buttons as offscreen zero rectangles.
-        let bottom = select_meeting_row_top(frame, dpi, &meeting_rows)
-            .or_else(|| select_caption_bottom(frame, dpi, &controls));
+        // A notification can move the meeting toolbar without changing Teams
+        // zoom. Prefer the actual header band, not that displaced row's top.
+        let header = self.header.cached(frame, dpi);
+        let bottom = header.or_else(|| {
+            select_meeting_row_top(frame, dpi, &meeting_rows)
+                .or_else(|| select_caption_bottom(frame, dpi, &controls))
+        });
+        if header == header::Selection::Unavailable {
+            self.header.clear();
+        }
         let geometry_same = get_window_rect(hwnd) == Some(window)
             && extended_frame_bounds(hwnd).unwrap_or(window) == frame
             && unsafe { GetDpiForWindow(hwnd) } == dpi;
         crate::diagnostics::log(format_args!(
-            "caption_probe target={} dpi={dpi} elements={count} rows={row_diagnostics:?} buttons={controls:?} bottom={bottom:?} geometry_same={geometry_same}",
+            "caption_probe target={} dpi={dpi} elements={count} rows={row_diagnostics:?} buttons={controls:?} header={header:?} bottom={bottom:?} geometry_same={geometry_same}",
             hwnd.0 as isize
         ));
         // Results from a layout/DPI transition must never change the anchor.
@@ -445,13 +466,29 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_panes_and_partial_ids_do_not_broaden_discovery() {
+    fn unrelated_custom_controls_and_partial_ids_do_not_authorize_rows() {
         let automation = crate::automation::AutomationClient::new().unwrap();
         let condition = caption_search_condition(&automation).unwrap();
         for id in ["", "chat-toolbar", "horizontalEnd-copy", "other-indicators"] {
-            for kind in [ControlType::Pane, ControlType::Custom, ControlType::Text] {
+            for kind in [ControlType::Custom, ControlType::Text] {
                 assert!(!matches_condition(&condition, kind, id, false));
             }
+            assert_eq!(meeting_row_role(id), None);
+        }
+    }
+
+    #[test]
+    fn header_candidates_are_in_the_same_visible_bulk_query() {
+        let automation = crate::automation::AutomationClient::new().unwrap();
+        let condition = caption_search_condition(&automation).unwrap();
+        for (kind, id) in [
+            (ControlType::Pane, ""),
+            (ControlType::MenuBar, "MenuBar"),
+            (ControlType::Button, "more-options-header"),
+        ] {
+            assert!(matches_condition(&condition, kind, id, false));
+            assert!(!matches_condition(&condition, kind, id, true));
+            assert_eq!(meeting_row_role(id), None);
         }
     }
 
