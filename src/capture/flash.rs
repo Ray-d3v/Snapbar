@@ -24,7 +24,11 @@ use windows::{
     core::w,
 };
 
-use super::{ScreenRect, content_detector::PixelRect};
+use super::{
+    ScreenRect,
+    content_detector::PixelRect,
+    flash_color::{FLASH_COLOR_GATE, FlashColorGuard},
+};
 use crate::window_z_order::sync_window_above_target;
 
 const SS_WHITERECT_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0000_0006);
@@ -320,7 +324,13 @@ fn create_flash_surface(request: FlashRequest) -> windows::core::Result<Option<F
             None,
         )?
     };
-    let window = FlashWindow(hwnd, request.capture_request);
+    // The window is still hidden. Start the epoch before the first possible
+    // show and keep it active through all early-return and destruction paths.
+    let window = FlashWindow(
+        hwnd,
+        request.capture_request,
+        Some(FLASH_COLOR_GATE.begin()),
+    );
 
     unsafe {
         let affinity_result = SetWindowDisplayAffinity(hwnd, request.display_affinity);
@@ -417,17 +427,24 @@ fn position_flash_window(
     }
 }
 
-struct FlashWindow(HWND, u64);
+struct FlashWindow(HWND, u64, Option<FlashColorGuard<'static>>);
 
 impl Drop for FlashWindow {
     fn drop(&mut self) {
         let result = unsafe { DestroyWindow(self.0) };
+        let removed = result.is_ok() || !unsafe { IsWindow(Some(self.0)).as_bool() };
+        if removed && let Some(guard) = self.2.as_mut() {
+            guard.mark_removed();
+        }
+        // The guard drops after this native owner. DWM synchronization is done
+        // by the color worker, never here or under the capture coordinator lock.
         crate::diagnostics::log(format_args!(
-            "flash_destroyed capture_request={} hwnd={} success={} error_code={:?}",
+            "flash_destroyed capture_request={} hwnd={} success={} error_code={:?} color_reads_blocked={}",
             self.1,
             self.0.0 as isize,
             result.is_ok(),
-            result.err().map(|error| error.code().0)
+            result.err().map(|error| error.code().0),
+            !removed
         ));
     }
 }
@@ -478,6 +495,7 @@ mod tests {
             }
             .unwrap(),
             0,
+            None,
         )
     }
 

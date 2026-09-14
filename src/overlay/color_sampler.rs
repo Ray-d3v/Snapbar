@@ -5,11 +5,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::{Foundation::HWND, Graphics::Dwm::DwmFlush};
 
-use crate::shutdown::defer_cleanup;
+use crate::{
+    capture::flash_color::{FLASH_COLOR_GATE, FlashColorEpoch, FlashColorGate},
+    shutdown::defer_cleanup,
+};
 
 mod caption_diagnostics;
+
+const COLOR_READ_INTERVAL: Duration = Duration::from_millis(350);
 
 fn caption_diagnostics_requested(argument: &OsStr) -> bool {
     argument == "--caption-diagnostics"
@@ -28,6 +33,78 @@ pub(super) struct ColorSample {
     pub(super) caption: Option<super::caption_anchor::CaptionObservation>,
 }
 
+#[derive(Default)]
+struct MaterialCache {
+    key: Option<(
+        ColorRequest,
+        Option<super::caption_anchor::CaptionObservation>,
+    )>,
+    material: Option<super::TitlebarMaterial>,
+    epoch: Option<FlashColorEpoch>,
+    last_read: Option<Instant>,
+}
+
+impl MaterialCache {
+    fn sample(
+        &mut self,
+        key: (
+            ColorRequest,
+            Option<super::caption_anchor::CaptionObservation>,
+        ),
+        gate: &FlashColorGate,
+        synchronize: impl FnOnce() -> bool,
+        read: impl FnOnce() -> Option<super::TitlebarMaterial>,
+    ) -> Option<super::TitlebarMaterial> {
+        if self.key != Some(key) {
+            // A retained color is valid only for this target, caption height
+            // and observed geometry. Never relabel an old target's material.
+            *self = Self {
+                key: Some(key),
+                ..Self::default()
+            };
+        }
+        let Some(epoch) = gate.idle_epoch() else {
+            return self.material;
+        };
+        let epoch_changed = self.epoch != Some(epoch);
+        if !epoch_changed
+            && self
+                .last_read
+                .is_some_and(|last| last.elapsed() < COLOR_READ_INTERVAL)
+        {
+            return self.material;
+        }
+        // DestroyWindow completing does not by itself flush composed pixels.
+        // Only this existing color worker waits for DWM, once per accepted
+        // post-flash epoch. The UI, flash and capture workers never wait here.
+        if epoch_changed && epoch.follows_flash() && !synchronize() {
+            crate::diagnostics::log(format_args!(
+                "visual_color_rejected target={} reason=composition_sync_failed",
+                key.0.target_id
+            ));
+            return self.material;
+        }
+        if gate.idle_epoch() != Some(epoch) {
+            return self.material;
+        }
+        let sampled = read();
+        // Covers a flash that starts AND ends during readback, not just one
+        // still visible at the end. Rejected pixels never enter this cache or
+        // the result queue. No gate lock is held across DWM/GDI/UIA calls.
+        if gate.idle_epoch() != Some(epoch) {
+            crate::diagnostics::log(format_args!(
+                "visual_color_rejected target={} reason=flash_overlap",
+                key.0.target_id
+            ));
+            return self.material;
+        }
+        self.material = sampled;
+        self.epoch = Some(epoch);
+        self.last_read = Some(Instant::now());
+        self.material
+    }
+}
+
 pub(super) struct ColorSampler {
     request_tx: Option<SyncSender<ColorRequest>>,
     result_rx: Receiver<ColorSample>,
@@ -40,44 +117,40 @@ impl ColorSampler {
         Self::start_with_factory(wake_tx, || {
             let mut readback = super::caption_readback::CaptionReadback::default();
             let mut probe = super::caption_anchor::CaptionProbe::new();
-            let mut last_material = None;
-            let mut last_read = Instant::now() - Duration::from_secs(1);
-            let mut last_caption = None;
-            let mut last_target = None;
+            let mut cache = MaterialCache::default();
             let sample = move |request: ColorRequest| {
                 let hwnd = HWND(request.target_id as usize as *mut c_void);
+                // Zoom/geometry measurement continues while color reads are
+                // suspended; a flash must not reset titlebar sizing to default.
                 let caption = probe.measure(hwnd);
-                if last_target != Some(request.target_id)
-                    || caption != last_caption
-                    || last_read.elapsed() >= Duration::from_millis(350)
-                {
-                    // Observe the existing read only. Capture correlation must
-                    // never change its cadence, geometry or adoption rules.
-                    let context_before = crate::diagnostics::visual::recent_capture();
-                    let read_started = Instant::now();
-                    let previous = last_material;
-                    last_material = super::sample_titlebar_color(
-                        hwnd,
-                        request.caption_height,
-                        &mut readback,
-                        caption,
-                    );
-                    let read_us = read_started.elapsed().as_micros();
-                    last_read = Instant::now();
-                    last_caption = caption;
-                    last_target = Some(request.target_id);
-                    let context_after = crate::diagnostics::visual::recent_capture();
-                    if previous != last_material
-                        || context_before.is_some()
-                        || context_after.is_some()
-                    {
-                        crate::diagnostics::log(format_args!(
-                            "visual_color_sample target={} capture_before={context_before:?} capture_after={context_after:?} caption_height={} caption={caption:?} previous={previous:?} sampled={last_material:?} read_us={read_us} fresh=true adoption=not_observed",
-                            request.target_id, request.caption_height
-                        ));
-                    }
-                }
-                let material = last_material;
+                let previous = cache.material;
+                let material = cache.sample(
+                    (request, caption),
+                    &FLASH_COLOR_GATE,
+                    || unsafe { DwmFlush().is_ok() },
+                    || {
+                        let context_before = crate::diagnostics::visual::recent_capture();
+                        let read_started = Instant::now();
+                        let sampled = super::sample_titlebar_color(
+                            hwnd,
+                            request.caption_height,
+                            &mut readback,
+                            caption,
+                        );
+                        let read_us = read_started.elapsed().as_micros();
+                        let context_after = crate::diagnostics::visual::recent_capture();
+                        if previous != sampled
+                            || context_before.is_some()
+                            || context_after.is_some()
+                        {
+                            crate::diagnostics::log(format_args!(
+                                "visual_color_sample target={} capture_before={context_before:?} capture_after={context_after:?} caption_height={} caption={caption:?} previous={previous:?} sampled={sampled:?} read_us={read_us} fresh=true adoption=not_observed",
+                                request.target_id, request.caption_height
+                            ));
+                        }
+                        sampled
+                    },
+                );
                 (material, caption)
             };
             // Routine logging stays enabled. The much heavier diagnostic tree
@@ -202,7 +275,7 @@ impl Drop for ColorSampler {
 mod tests {
     use std::{sync::mpsc, thread, time::Duration};
 
-    use super::{ColorRequest, ColorSampler};
+    use super::{ColorRequest, ColorSampler, FlashColorGate, MaterialCache};
 
     const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -345,5 +418,220 @@ mod tests {
             .recv_timeout(TIMEOUT)
             .expect("sample should finish");
         caller.join().expect("caller should finish");
+    }
+
+    fn material(surface: u32) -> super::super::TitlebarMaterial {
+        super::super::TitlebarMaterial {
+            surface,
+            separator: surface,
+            separator_offset: 0,
+            separator_thickness: 1,
+        }
+    }
+
+    fn seeded_cache(gate: &FlashColorGate) -> MaterialCache {
+        let mut cache = MaterialCache::default();
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                gate,
+                || true,
+                || Some(material(0x0a0a0a))
+            ),
+            Some(material(0x0a0a0a))
+        );
+        cache
+    }
+
+    fn completed_flash(gate: &FlashColorGate) {
+        let mut flash = gate.begin();
+        flash.mark_removed();
+        drop(flash);
+    }
+
+    #[test]
+    fn active_flash_keeps_the_last_material_without_reading_or_waiting() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        let mut flash = gate.begin();
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || panic!("active flash must not wait for DWM"),
+                || panic!("active flash must not read pixels"),
+            ),
+            Some(material(0x0a0a0a))
+        );
+        flash.mark_removed();
+    }
+
+    #[test]
+    fn a_complete_flash_during_readback_never_enters_the_material_cache() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        cache.last_read = None;
+        let before = cache.epoch;
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || {
+                    completed_flash(&gate);
+                    Some(material(0xd4d4d4))
+                },
+            ),
+            Some(material(0x0a0a0a))
+        );
+        assert_eq!(cache.epoch, before);
+        assert!(cache.last_read.is_none());
+    }
+
+    #[test]
+    fn a_flash_starting_during_readback_is_rejected_while_still_active() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        cache.last_read = None;
+        let mut flash = None;
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || {
+                    flash = Some(gate.begin());
+                    Some(material(0xb3b3b3))
+                },
+            ),
+            Some(material(0x0a0a0a))
+        );
+        flash.as_mut().unwrap().mark_removed();
+    }
+
+    #[test]
+    fn post_flash_refresh_bypasses_the_color_interval_but_flushes_only_once() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        // Synthetic future timestamp makes the cache unambiguously not due.
+        cache.last_read = Some(std::time::Instant::now() + TIMEOUT);
+        completed_flash(&gate);
+        let flushed = std::cell::Cell::new(false);
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || {
+                    flushed.set(true);
+                    true
+                },
+                || {
+                    assert!(flushed.get());
+                    Some(material(0x202020))
+                },
+            ),
+            Some(material(0x202020))
+        );
+        cache.last_read = Some(std::time::Instant::now() + TIMEOUT);
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || panic!("same epoch must not repeatedly flush"),
+                || panic!("same epoch must retain normal read cadence"),
+            ),
+            Some(material(0x202020))
+        );
+    }
+
+    #[test]
+    fn failed_composition_sync_retains_color_and_can_retry() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        completed_flash(&gate);
+        let before = cache.epoch;
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || false,
+                || panic!("unflushed pixels must not be read"),
+            ),
+            Some(material(0x0a0a0a))
+        );
+        assert_eq!(cache.epoch, before);
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || Some(material(0x303030))
+            ),
+            Some(material(0x303030))
+        );
+    }
+
+    #[test]
+    fn a_new_flash_during_composition_sync_prevents_the_pixel_read() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        completed_flash(&gate);
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || {
+                    completed_flash(&gate);
+                    true
+                },
+                || panic!("epoch changed while waiting for DWM"),
+            ),
+            Some(material(0x0a0a0a))
+        );
+    }
+
+    #[test]
+    fn changed_target_or_caption_size_does_not_inherit_the_retained_color() {
+        for next in [
+            ColorRequest {
+                target_id: 19,
+                ..request()
+            },
+            ColorRequest {
+                caption_height: 45,
+                ..request()
+            },
+        ] {
+            let gate = FlashColorGate::new();
+            let mut cache = seeded_cache(&gate);
+            let mut flash = gate.begin();
+            assert!(
+                cache
+                    .sample(
+                        (next, None),
+                        &gate,
+                        || panic!("active"),
+                        || panic!("active"),
+                    )
+                    .is_none()
+            );
+            flash.mark_removed();
+        }
+    }
+
+    #[test]
+    fn real_light_theme_colors_are_not_rejected_by_a_white_threshold() {
+        let gate = FlashColorGate::new();
+        let mut cache = seeded_cache(&gate);
+        cache.last_read = None;
+        assert_eq!(
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || Some(material(0xffffff))
+            ),
+            Some(material(0xffffff))
+        );
     }
 }
