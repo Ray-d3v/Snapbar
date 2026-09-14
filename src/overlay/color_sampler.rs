@@ -88,7 +88,10 @@ impl ColorSampler {
         })
     }
 
-    fn start_with_factory<F, After, Factory>(wake_tx: SyncSender<()>, factory: Factory) -> Option<Self>
+    fn start_with_factory<F, After, Factory>(
+        wake_tx: SyncSender<()>,
+        factory: Factory,
+    ) -> Option<Self>
     where
         Factory: FnOnce() -> (F, After) + Send + 'static,
         F: FnMut(
@@ -190,10 +193,17 @@ mod tests {
     #[test]
     fn detailed_diagnostics_require_the_exact_explicit_flag() {
         use std::ffi::OsStr;
-        for argument in ["", "Snapbar.exe", "--demo-mode", "--caption-diagnostics=false"] {
+        for argument in [
+            "",
+            "Snapbar.exe",
+            "--demo-mode",
+            "--caption-diagnostics=false",
+        ] {
             assert!(!super::caption_diagnostics_requested(OsStr::new(argument)));
         }
-        assert!(super::caption_diagnostics_requested(OsStr::new("--caption-diagnostics")));
+        assert!(super::caption_diagnostics_requested(OsStr::new(
+            "--caption-diagnostics"
+        )));
     }
 
     #[test]
@@ -213,7 +223,8 @@ mod tests {
                     }
                 },
             )
-        }).unwrap();
+        })
+        .unwrap();
         assert!(sampler.request(request()));
         entered_rx.recv_timeout(TIMEOUT).unwrap();
         wake_rx.recv_timeout(TIMEOUT).unwrap();
