@@ -16,10 +16,9 @@ use windows::{
         UI::{
             HiDpi::GetDpiForWindow,
             WindowsAndMessaging::{
-                EnumThreadWindows, GA_ROOT, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor,
-                GetClientRect, GetCursorPos, GetWindow, GetWindowDisplayAffinity,
-                GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-                IsWindowVisible, WindowFromPoint,
+                EnumThreadWindows, GA_ROOT, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor, GetClientRect,
+                GetCursorPos, GetWindow, GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect,
+                GetWindowThreadProcessId, IsWindow, IsWindowVisible, WindowFromPoint,
             },
         },
     },
@@ -222,7 +221,8 @@ fn snapshot(phase: &str, request: u64, scope: u64) {
     }
     super::log(format_args!(
         "visual_scope_end phase={phase} capture_request={request} scope={scope} inspected={inspected} budget_limited={} elapsed_us={}",
-        inspected != handles.count, started.elapsed().as_micros()
+        inspected != handles.count,
+        started.elapsed().as_micros()
     ));
 }
 
