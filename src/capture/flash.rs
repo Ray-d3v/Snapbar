@@ -37,6 +37,7 @@ struct FlashRequest {
     rect: ScreenRect,
     target_window_id: Option<u32>,
     display_affinity: WINDOW_DISPLAY_AFFINITY,
+    capture_request: u64,
 }
 
 struct FlashState {
@@ -62,6 +63,7 @@ impl Drop for FlashSuspension {
             state.suspended = false;
             state.suspend_ack = false;
             self.coordinator.wake.notify_all();
+            crate::diagnostics::log(format_args!("flash_resume"));
         }
     }
 }
@@ -93,6 +95,11 @@ pub fn show_capture_flash(
     target_window_id: Option<u32>,
     display_affinity: WINDOW_DISPLAY_AFFINITY,
 ) {
+    let capture_request = crate::diagnostics::current_request();
+    crate::diagnostics::log(format_args!(
+        "flash_request capture_request={capture_request} rect={rect:?} target={target_window_id:?} affinity={}",
+        display_affinity.0
+    ));
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -105,13 +112,19 @@ pub fn show_capture_flash(
                 rect,
                 target_window_id,
                 display_affinity,
+                capture_request,
             });
             coordinator.wake.notify_all();
         }
+        crate::diagnostics::log(format_args!(
+            "flash_queue capture_request={capture_request} queued={}",
+            !state.suspended
+        ));
     }
 }
 
 pub fn suspend_capture_flash() -> anyhow::Result<FlashSuspension> {
+    let started = Instant::now();
     let coordinator =
         coordinator().ok_or_else(|| anyhow::anyhow!("フラッシュ worker を起動できませんでした"))?;
     let deadline = Instant::now() + SUSPEND_TIMEOUT;
@@ -146,6 +159,10 @@ pub fn suspend_capture_flash() -> anyhow::Result<FlashSuspension> {
         }
     }
     drop(state);
+    crate::diagnostics::log(format_args!(
+        "flash_suspended elapsed_us={}",
+        started.elapsed().as_micros()
+    ));
     Ok(FlashSuspension { coordinator })
 }
 
@@ -245,7 +262,15 @@ where
         };
         if let Some(request) = request {
             drop(active.take());
-            active = create_surface(request).ok().flatten();
+            let result = create_surface(request);
+            if let Err(error) = &result {
+                crate::diagnostics::log(format_args!(
+                    "flash_create_failed capture_request={} error_code={}",
+                    request.capture_request,
+                    error.code().0
+                ));
+            }
+            active = result.ok().flatten();
         }
         let Some(surface) = active.as_mut() else {
             continue;
@@ -269,6 +294,10 @@ fn create_flash_surface(request: FlashRequest) -> windows::core::Result<Option<F
         .target_window_id
         .map(|id| HWND(id as usize as *mut c_void));
     if !flash_target_is_visible(target_hwnd) {
+        crate::diagnostics::log(format_args!(
+            "flash_skipped capture_request={} reason=target_not_visible",
+            request.capture_request
+        ));
         return Ok(None);
     }
     let module = unsafe { GetModuleHandleW(None)? };
@@ -291,14 +320,33 @@ fn create_flash_surface(request: FlashRequest) -> windows::core::Result<Option<F
             None,
         )?
     };
-    let window = FlashWindow(hwnd);
+    let window = FlashWindow(hwnd, request.capture_request);
 
     unsafe {
-        let _ = SetWindowDisplayAffinity(hwnd, request.display_affinity);
+        let affinity_result = SetWindowDisplayAffinity(hwnd, request.display_affinity);
+        crate::diagnostics::log(format_args!(
+            "flash_affinity capture_request={} hwnd={} requested={} success={} error_code={:?}",
+            request.capture_request,
+            hwnd.0 as isize,
+            request.display_affinity.0,
+            affinity_result.is_ok(),
+            affinity_result.err().map(|error| error.code().0)
+        ));
         SetLayeredWindowAttributes(hwnd, COLORREF(0), FLASH_ALPHAS[0], LWA_ALPHA)?;
         position_flash_window(hwnd, target_hwnd, request.rect)?;
-        let _ = UpdateWindow(hwnd);
+        let updated = UpdateWindow(hwnd);
+        crate::diagnostics::log(format_args!(
+            "flash_shown capture_request={} hwnd={} rect={:?} target={:?} alpha={} update_window={}",
+            request.capture_request,
+            hwnd.0 as isize,
+            request.rect,
+            request.target_window_id,
+            FLASH_ALPHAS[0],
+            updated.as_bool()
+        ));
     }
+    crate::diagnostics::visual::window_snapshot("flash_shown", request.capture_request, hwnd);
+    crate::diagnostics::visual::capture_windows("flash_shown", request.capture_request);
     Ok(Some(FlashSurface {
         window,
         target: target_hwnd,
@@ -320,11 +368,27 @@ impl FlashSurface {
         let alpha = FLASH_ALPHAS[self.next_alpha];
         self.next_alpha += 1;
         if let Some(target) = self.target {
-            if sync_window_above_target(self.window.0, target).is_err() {
+            if let Err(error) = sync_window_above_target(self.window.0, target) {
+                crate::diagnostics::log(format_args!(
+                    "flash_z_order_failed capture_request={} hwnd={} error_code={}",
+                    self.window.1,
+                    self.window.0.0 as isize,
+                    error.code().0
+                ));
                 return false;
             }
         }
-        unsafe { SetLayeredWindowAttributes(self.window.0, COLORREF(0), alpha, LWA_ALPHA).is_ok() }
+        let result = unsafe {
+            SetLayeredWindowAttributes(self.window.0, COLORREF(0), alpha, LWA_ALPHA)
+        };
+        crate::diagnostics::log(format_args!(
+            "flash_alpha capture_request={} hwnd={} alpha={alpha} success={} error_code={:?}",
+            self.window.1,
+            self.window.0.0 as isize,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.code().0)
+        ));
+        result.is_ok()
     }
 }
 
@@ -354,11 +418,18 @@ fn position_flash_window(
     }
 }
 
-struct FlashWindow(HWND);
+struct FlashWindow(HWND, u64);
 
 impl Drop for FlashWindow {
     fn drop(&mut self) {
-        let _ = unsafe { DestroyWindow(self.0) };
+        let result = unsafe { DestroyWindow(self.0) };
+        crate::diagnostics::log(format_args!(
+            "flash_destroyed capture_request={} hwnd={} success={} error_code={:?}",
+            self.1,
+            self.0.0 as isize,
+            result.is_ok(),
+            result.err().map(|error| error.code().0)
+        ));
     }
 }
 
@@ -407,6 +478,7 @@ mod tests {
                 )
             }
             .unwrap(),
+            0,
         )
     }
 
@@ -485,6 +557,7 @@ mod tests {
             },
             target_window_id: None,
             display_affinity: WINDOW_DISPLAY_AFFINITY(0),
+            capture_request: 0,
         }
     }
 
@@ -497,6 +570,20 @@ mod tests {
             }),
             wake: Condvar::new(),
         })
+    }
+
+    #[test]
+    fn diagnostic_request_identity_does_not_change_flash_geometry_or_visibility() {
+        let request = FlashRequest {
+            capture_request: 37,
+            ..zero_area_request()
+        };
+        let surface = create_flash_surface(request).unwrap().unwrap();
+        assert_eq!(surface.window.1, 37);
+        assert_eq!(surface.next_alpha, 1);
+        assert!(surface.target.is_none());
+        assert_eq!(FLASH_ALPHAS, [210, 210, 176, 136, 94, 56, 24, 0]);
+        assert_eq!(FLASH_STEP, Duration::from_millis(28));
     }
 
     #[test]
