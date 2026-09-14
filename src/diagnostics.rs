@@ -334,7 +334,7 @@ mod tests {
         paths.sort();
         let path = paths.last().unwrap();
         eprintln!("viewer path={path:?}");
-        let snapshot = export_log(&path).unwrap();
+        let snapshot = export_log(path).unwrap();
         open_log_file(&snapshot).unwrap();
     }
 
