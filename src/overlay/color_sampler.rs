@@ -1,5 +1,5 @@
 use std::{
-    ffi::c_void,
+    ffi::{OsStr, c_void},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -10,6 +10,10 @@ use windows::Win32::Foundation::HWND;
 use crate::shutdown::defer_cleanup;
 
 mod caption_diagnostics;
+
+fn caption_diagnostics_requested(argument: &OsStr) -> bool {
+    argument == "--caption-diagnostics"
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ColorRequest {
@@ -36,16 +40,12 @@ impl ColorSampler {
         Self::start_with_factory(wake_tx, || {
             let mut readback = super::caption_readback::CaptionReadback::default();
             let mut probe = super::caption_anchor::CaptionProbe::new();
-            let mut trace = caption_diagnostics::CaptionTrace::default();
             let mut last_material = None;
             let mut last_read = Instant::now() - Duration::from_secs(1);
             let mut last_caption = None;
             let mut last_target = None;
-            move |request: ColorRequest| {
+            let sample = move |request: ColorRequest| {
                 let hwnd = HWND(request.target_id as usize as *mut c_void);
-                // Diagnostics never supplies an anchor. Probe again afterwards
-                // so a slow trace cannot make an earlier observation current.
-                trace.record_if_due(hwnd, last_caption.is_some());
                 let caption = probe.measure(hwnd);
                 if last_target != Some(request.target_id)
                     || caption != last_caption
@@ -63,7 +63,18 @@ impl ColorSampler {
                 }
                 let material = last_material;
                 (material, caption)
-            }
+            };
+            // Routine logging stays enabled. The much heavier diagnostic tree
+            // is explicitly opt-in and never precedes publication of a sample.
+            let trace_enabled = std::env::args_os().any(|arg| caption_diagnostics_requested(&arg));
+            let mut trace = caption_diagnostics::CaptionTrace::default();
+            let after_publish = move |request: ColorRequest, ready: bool| {
+                if trace_enabled {
+                    let hwnd = HWND(request.target_id as usize as *mut c_void);
+                    trace.record_if_due(hwnd, ready);
+                }
+            };
+            (sample, after_publish)
         })
     }
 
@@ -72,18 +83,21 @@ impl ColorSampler {
         wake_tx: SyncSender<()>,
         mut sample: impl FnMut(ColorRequest) -> Option<super::TitlebarMaterial> + Send + 'static,
     ) -> Option<Self> {
-        Self::start_with_factory(wake_tx, move || move |request| (sample(request), None))
+        Self::start_with_factory(wake_tx, move || {
+            (move |request| (sample(request), None), |_, _| {})
+        })
     }
 
-    fn start_with_factory<F, Factory>(wake_tx: SyncSender<()>, factory: Factory) -> Option<Self>
+    fn start_with_factory<F, After, Factory>(wake_tx: SyncSender<()>, factory: Factory) -> Option<Self>
     where
-        Factory: FnOnce() -> F + Send + 'static,
+        Factory: FnOnce() -> (F, After) + Send + 'static,
         F: FnMut(
                 ColorRequest,
             ) -> (
                 Option<super::TitlebarMaterial>,
                 Option<super::caption_anchor::CaptionObservation>,
             ) + 'static,
+        After: FnMut(ColorRequest, bool) + 'static,
     {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -91,7 +105,7 @@ impl ColorSampler {
             .name("snapbar-titlebar-color".to_string())
             .spawn(move || {
                 let _physical = crate::dpi::PhysicalPixels::enter();
-                let mut sample = factory();
+                let (mut sample, mut after_publish) = factory();
                 while let Ok(request) = request_rx.recv() {
                     let (material, caption) = sample(request);
                     if result_tx
@@ -103,6 +117,10 @@ impl ColorSampler {
                         .is_ok()
                     {
                         let _ = wake_tx.try_send(());
+                        // The follower can resize/redraw while an explicitly
+                        // requested trace runs. The next sample always probes
+                        // current geometry again; trace output is never reused.
+                        after_publish(request, caption.is_some());
                     }
                 }
             })
@@ -167,6 +185,45 @@ mod tests {
             target_id: 7,
             caption_height: 32,
         }
+    }
+
+    #[test]
+    fn detailed_diagnostics_require_the_exact_explicit_flag() {
+        use std::ffi::OsStr;
+        for argument in ["", "Snapbar.exe", "--demo-mode", "--caption-diagnostics=false"] {
+            assert!(!super::caption_diagnostics_requested(OsStr::new(argument)));
+        }
+        assert!(super::caption_diagnostics_requested(OsStr::new("--caption-diagnostics")));
+    }
+
+    #[test]
+    fn result_and_wake_are_published_before_a_blocked_optional_diagnostic() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut sampler = ColorSampler::start_with_factory(wake_tx, move || {
+            let mut first = true;
+            (
+                |_| (None, None),
+                move |_, _| {
+                    if first {
+                        first = false;
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(TIMEOUT).unwrap();
+                    }
+                },
+            )
+        }).unwrap();
+        assert!(sampler.request(request()));
+        entered_rx.recv_timeout(TIMEOUT).unwrap();
+        wake_rx.recv_timeout(TIMEOUT).unwrap();
+        assert_eq!(sampler.try_take_result().unwrap().request, request());
+        // At most one follow-up request can queue while the diagnostic runs.
+        assert!(sampler.request(request()));
+        assert!(!sampler.request(request()));
+        release_tx.send(()).unwrap();
+        wake_rx.recv_timeout(TIMEOUT).unwrap();
+        assert!(sampler.try_take_result().is_some());
     }
 
     #[test]
