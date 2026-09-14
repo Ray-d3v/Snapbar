@@ -378,9 +378,8 @@ impl FlashSurface {
                 return false;
             }
         }
-        let result = unsafe {
-            SetLayeredWindowAttributes(self.window.0, COLORREF(0), alpha, LWA_ALPHA)
-        };
+        let result =
+            unsafe { SetLayeredWindowAttributes(self.window.0, COLORREF(0), alpha, LWA_ALPHA) };
         crate::diagnostics::log(format_args!(
             "flash_alpha capture_request={} hwnd={} alpha={alpha} success={} error_code={:?}",
             self.window.1,
