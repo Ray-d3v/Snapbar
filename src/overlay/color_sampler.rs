@@ -35,7 +35,10 @@ pub(super) struct ColorSample {
 
 #[derive(Default)]
 struct MaterialCache {
-    key: Option<(ColorRequest, Option<super::caption_anchor::CaptionObservation>)>,
+    key: Option<(
+        ColorRequest,
+        Option<super::caption_anchor::CaptionObservation>,
+    )>,
     material: Option<super::TitlebarMaterial>,
     epoch: Option<FlashColorEpoch>,
     last_read: Option<Instant>,
@@ -44,7 +47,10 @@ struct MaterialCache {
 impl MaterialCache {
     fn sample(
         &mut self,
-        key: (ColorRequest, Option<super::caption_anchor::CaptionObservation>),
+        key: (
+            ColorRequest,
+            Option<super::caption_anchor::CaptionObservation>,
+        ),
         gate: &FlashColorGate,
         synchronize: impl FnOnce() -> bool,
         read: impl FnOnce() -> Option<super::TitlebarMaterial>,
@@ -426,7 +432,12 @@ mod tests {
     fn seeded_cache(gate: &FlashColorGate) -> MaterialCache {
         let mut cache = MaterialCache::default();
         assert_eq!(
-            cache.sample((request(), None), gate, || true, || Some(material(0x0a0a0a))),
+            cache.sample(
+                (request(), None),
+                gate,
+                || true,
+                || Some(material(0x0a0a0a))
+            ),
             Some(material(0x0a0a0a))
         );
         cache
@@ -550,7 +561,12 @@ mod tests {
         );
         assert_eq!(cache.epoch, before);
         assert_eq!(
-            cache.sample((request(), None), &gate, || true, || Some(material(0x303030))),
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || Some(material(0x303030))
+            ),
             Some(material(0x303030))
         );
     }
@@ -609,7 +625,12 @@ mod tests {
         let mut cache = seeded_cache(&gate);
         cache.last_read = None;
         assert_eq!(
-            cache.sample((request(), None), &gate, || true, || Some(material(0xffffff))),
+            cache.sample(
+                (request(), None),
+                &gate,
+                || true,
+                || Some(material(0xffffff))
+            ),
             Some(material(0xffffff))
         );
     }

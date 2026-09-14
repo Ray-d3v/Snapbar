@@ -326,7 +326,11 @@ fn create_flash_surface(request: FlashRequest) -> windows::core::Result<Option<F
     };
     // The window is still hidden. Start the epoch before the first possible
     // show and keep it active through all early-return and destruction paths.
-    let window = FlashWindow(hwnd, request.capture_request, Some(FLASH_COLOR_GATE.begin()));
+    let window = FlashWindow(
+        hwnd,
+        request.capture_request,
+        Some(FLASH_COLOR_GATE.begin()),
+    );
 
     unsafe {
         let affinity_result = SetWindowDisplayAffinity(hwnd, request.display_affinity);
